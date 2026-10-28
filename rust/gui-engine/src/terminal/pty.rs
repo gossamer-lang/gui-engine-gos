@@ -303,17 +303,22 @@ impl Pty {
             // SAFETY: the unreaped child still owns this process id.
             unsafe { libc::kill(self.pid as i32, libc::SIGKILL) };
         }
-        for thread in [&mut self.reader, &mut self.writer, &mut self.waiter] {
+        for thread in [&mut self.reader, &mut self.writer] {
             if let Some(thread) = thread.take() {
                 let _ = thread.join();
             }
         }
-        let reaped = match self.child.take() {
+        // An exiting program's last close of the terminal waits for its unread
+        // output to drain while the master is open (macOS), so the master is
+        // released before waiting for the exit.
+        self.master = None;
+        if let Some(thread) = self.waiter.take() {
+            let _ = thread.join();
+        }
+        match self.child.take() {
             Some(mut child) => child.wait().map(|_| ()).map_err(|e| e.to_string()),
             None => Ok(()),
-        };
-        self.master = None;
-        reaped
+        }
     }
 }
 

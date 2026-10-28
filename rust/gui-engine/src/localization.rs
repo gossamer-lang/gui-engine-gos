@@ -581,221 +581,227 @@ mod pseudo_tests {
 
     #[test]
     fn changing_language_rebuilds_windows_dialogs_numbers_and_direction() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let _defer = scopeguard::guard((), |_| {
-            install(&Catalog {
-                locale: "en".to_string(),
-                messages: vec![],
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
             });
-        });
-        let view = |_m: &i64| {
-            Widget::column(
-                &[
-                    Widget::label(&tr("Pseudo journey")),
-                    Widget::spin_box("amount", 1234.5, 0.0, 10000.0, 0.5, 1),
-                ],
-                8,
+            let _defer = scopeguard::guard((), |_| {
+                install(&Catalog {
+                    locale: "en".to_string(),
+                    messages: vec![],
+                });
+            });
+            let view = |_m: &i64| {
+                Widget::column(
+                    &[
+                        Widget::label(&tr("Pseudo journey")),
+                        Widget::spin_box("amount", 1234.5, 0.0, 10000.0, 0.5, 1),
+                    ],
+                    8,
+                )
+                .padding(8)
+            };
+            let mut s = crate::application(
+                "Languages",
+                "dev.gossamer.gui-language-test",
+                || 0,
+                |m: i64, _msg: UiMsg| m,
+                view,
             )
-            .padding(8)
-        };
-        let mut s = crate::application(
-            "Languages",
-            "dev.gossamer.gui-language-test",
-            || 0,
-            |m: i64, _msg: UiMsg| m,
-            view,
-        )
-        .size(640, 480)
-        .start()
-        .unwrap();
-        crate::perform(Effect::OpenDialog(request::prompt(
-            "ask", "Name", "Name", "",
-        )));
-        s.flush().unwrap();
-        let before = s.semantics(0).dump();
-        assert!(
-            before.contains("label \"Pseudo journey\"")
-                && before.contains("button \"Cancel\"")
-                && before.contains("1,234.5"),
-            "{}",
-            before
-        );
-        crate::perform(Effect::SetLocale(german()));
-        s.flush().unwrap();
-        let after = s.semantics(0).dump();
-        assert!(
-            after.contains("label \"Pseudo-Reise\"")
-                && after.contains("button \"Abbrechen\"")
-                && after.contains("button \"Schlie\u{00DF}en\""),
-            "{}",
-            after
-        );
-        assert!(after.contains("1.234,5"), "{}", after);
-        assert!(!s.windows[0].theme.rtl);
-        crate::perform(Effect::SetLocale(Catalog {
-            locale: "ar".to_string(),
-            messages: vec![],
-        }));
-        s.flush().unwrap();
-        assert!(s.windows[0].theme.rtl);
-        assert!(s.dialog_ids() == vec!["ask"], "{:?}", s.dialog_ids());
-        s.shutdown()
+            .size(640, 480)
+            .start()
+            .unwrap();
+            crate::perform(Effect::OpenDialog(request::prompt(
+                "ask", "Name", "Name", "",
+            )));
+            s.flush().unwrap();
+            let before = s.semantics(0).dump();
+            assert!(
+                before.contains("label \"Pseudo journey\"")
+                    && before.contains("button \"Cancel\"")
+                    && before.contains("1,234.5"),
+                "{}",
+                before
+            );
+            crate::perform(Effect::SetLocale(german()));
+            s.flush().unwrap();
+            let after = s.semantics(0).dump();
+            assert!(
+                after.contains("label \"Pseudo-Reise\"")
+                    && after.contains("button \"Abbrechen\"")
+                    && after.contains("button \"Schlie\u{00DF}en\""),
+                "{}",
+                after
+            );
+            assert!(after.contains("1.234,5"), "{}", after);
+            assert!(!s.windows[0].theme.rtl);
+            crate::perform(Effect::SetLocale(Catalog {
+                locale: "ar".to_string(),
+                messages: vec![],
+            }));
+            s.flush().unwrap();
+            assert!(s.windows[0].theme.rtl);
+            assert!(s.dialog_ids() == vec!["ask"], "{:?}", s.dialog_ids());
+            s.shutdown()
+        })
     }
 
     #[test]
     fn every_built_in_widget_string_passes_through_the_catalog() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        install(&Catalog {
-            locale: PSEUDO_LOCALE.to_string(),
-            messages: vec![],
-        });
-        let _defer = scopeguard::guard((), |_| {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
             install(&Catalog {
-                locale: "en".to_string(),
+                locale: PSEUDO_LOCALE.to_string(),
                 messages: vec![],
             });
-        });
-        let mut s = crate::application(
-            &tr("Strings"),
-            "dev.gossamer.gui-pseudo-test",
-            || 0,
-            |m: i64, _msg: UiMsg| m,
-            gallery,
-        )
-        .size(900, 1400)
-        .start()
-        .unwrap();
-        let mut found: Vec<String> = vec![];
-        untranslated(&s.semantics(0), &["gone".to_string()], &mut found);
-        s.shutdown();
-        assert!(found.is_empty(), "{}", found.join("\n"))
+            let _defer = scopeguard::guard((), |_| {
+                install(&Catalog {
+                    locale: "en".to_string(),
+                    messages: vec![],
+                });
+            });
+            let mut s = crate::application(
+                &tr("Strings"),
+                "dev.gossamer.gui-pseudo-test",
+                || 0,
+                |m: i64, _msg: UiMsg| m,
+                gallery,
+            )
+            .size(900, 1400)
+            .start()
+            .unwrap();
+            let mut found: Vec<String> = vec![];
+            untranslated(&s.semantics(0), &["gone".to_string()], &mut found);
+            s.shutdown();
+            assert!(found.is_empty(), "{}", found.join("\n"))
+        })
     }
 
     #[test]
     fn every_built_in_dialog_string_passes_through_the_catalog() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        fs::create_dir_all(config.clone()).unwrap();
-        install(&Catalog {
-            locale: PSEUDO_LOCALE.to_string(),
-            messages: vec![],
-        });
-        let _defer = scopeguard::guard((), |_| {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            fs::create_dir_all(config.clone()).unwrap();
             install(&Catalog {
-                locale: "en".to_string(),
+                locale: PSEUDO_LOCALE.to_string(),
                 messages: vec![],
             });
-        });
-        // File browsers open in the working folder: its path and entries are data.
-        let mut data: Vec<String> = vec![];
-        for folder in [
-            fs::canonicalize(&config)
-                .unwrap()
-                .to_string_lossy()
-                .into_owned(),
-            env::current_dir().unwrap().to_string_lossy().into_owned(),
-        ] {
-            let mut at = folder.clone();
-            while !at.is_empty() && at != "/" {
-                let name = paths::file_name(&at).unwrap_or_else(|| at.clone());
-                data.push(format!("{name}, current folder"));
-                data.push(name);
-                at = paths::parent(&at).unwrap_or_default();
+            let _defer = scopeguard::guard((), |_| {
+                install(&Catalog {
+                    locale: "en".to_string(),
+                    messages: vec![],
+                });
+            });
+            // File browsers open in the working folder: its path and entries are data.
+            let mut data: Vec<String> = vec![];
+            for folder in [
+                fs::canonicalize(&config)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                env::current_dir().unwrap().to_string_lossy().into_owned(),
+            ] {
+                let mut at = folder.clone();
+                while !at.is_empty() && at != "/" {
+                    let name = paths::file_name(&at).unwrap_or_else(|| at.clone());
+                    data.push(format!("{name}, current folder"));
+                    data.push(name);
+                    at = paths::parent(&at).unwrap_or_default();
+                }
+                data.push(folder.clone());
+                for e in paths::read_dir(&folder).unwrap_or_default() {
+                    data.push(e.name)
+                }
             }
-            data.push(folder.clone());
-            for e in paths::read_dir(&folder).unwrap_or_default() {
-                data.push(e.name)
+            let field = request::PreferenceField {
+                key: "count".to_string(),
+                label: tr("Count"),
+                kind: request::PreferenceKind::Number(1.0, 10.0),
+                value: "2".to_string(),
+                default: "3".to_string(),
+                help: tr("How many"),
+            };
+            let requests = vec![
+                request::info("info", &tr("Title"), &tr("Text")),
+                request::warning("warning", &tr("Title"), &tr("Text")),
+                request::error("error", &tr("Title"), &tr("Text"), &tr("Detail"), true),
+                request::confirm("confirm", &tr("Title"), &tr("Text"), &tr("Accept"), true),
+                request::confirm_overwrite("overwrite", "notes.txt"),
+                request::confirm_delete("delete", "notes.txt"),
+                request::confirm_unsaved("unsaved", "notes.txt"),
+                request::prompt("prompt", &tr("Title"), &tr("Label"), ""),
+                request::go_to_line("line", 40, ""),
+                request::color(
+                    "color",
+                    &tr("Title"),
+                    crate::style::color::Color::rgb(10, 20, 30),
+                ),
+                request::font("font", &tr("Title"), "DejaVu Sans|Regular|14"),
+                request::date(
+                    "date",
+                    &tr("Title"),
+                    "2026-10-20",
+                    request::DateMode::DateTime,
+                    "",
+                    "",
+                ),
+                request::preferences(
+                    "prefs",
+                    &tr("Title"),
+                    &[request::PreferencePage {
+                        key: "main".to_string(),
+                        title: tr("Main"),
+                        fields: vec![field.clone()],
+                    }],
+                ),
+                request::wizard(
+                    "wizard",
+                    &tr("Title"),
+                    &[request::WizardPage {
+                        key: "one".to_string(),
+                        title: tr("One"),
+                        description: tr("First"),
+                        fields: vec![field],
+                        skip_if: "".to_string(),
+                    }],
+                ),
+                request::about("about", &tr("Name"), "1.0", &tr("Description")),
+                request::toolkit_file(request::open_file("open", &tr("Title"), &[])),
+                request::toolkit_file(request::save_file("save", &tr("Title"), "notes.txt", &[])),
+            ];
+            let mut s = crate::application(
+                &tr("Strings"),
+                "dev.gossamer.gui-pseudo-test",
+                || 0,
+                |m: i64, _msg: UiMsg| m,
+                view,
+            )
+            .size(900, 760)
+            .start()
+            .unwrap();
+            let mut found: Vec<String> = vec![];
+            for req in requests {
+                let id = req.id();
+                crate::perform(Effect::OpenDialog(req));
+                s.flush().unwrap();
+                let mut here = vec![];
+                untranslated(&s.semantics(0), &data, &mut here);
+                for h in here {
+                    found.push(format!("{}: {}", id, h))
+                }
+                s.close_dialog(&id, &crate::dialogs::Outcome::Cancelled);
+                s.flush().unwrap()
             }
-        }
-        let field = request::PreferenceField {
-            key: "count".to_string(),
-            label: tr("Count"),
-            kind: request::PreferenceKind::Number(1.0, 10.0),
-            value: "2".to_string(),
-            default: "3".to_string(),
-            help: tr("How many"),
-        };
-        let requests = vec![
-            request::info("info", &tr("Title"), &tr("Text")),
-            request::warning("warning", &tr("Title"), &tr("Text")),
-            request::error("error", &tr("Title"), &tr("Text"), &tr("Detail"), true),
-            request::confirm("confirm", &tr("Title"), &tr("Text"), &tr("Accept"), true),
-            request::confirm_overwrite("overwrite", "notes.txt"),
-            request::confirm_delete("delete", "notes.txt"),
-            request::confirm_unsaved("unsaved", "notes.txt"),
-            request::prompt("prompt", &tr("Title"), &tr("Label"), ""),
-            request::go_to_line("line", 40, ""),
-            request::color(
-                "color",
-                &tr("Title"),
-                crate::style::color::Color::rgb(10, 20, 30),
-            ),
-            request::font("font", &tr("Title"), "DejaVu Sans|Regular|14"),
-            request::date(
-                "date",
-                &tr("Title"),
-                "2026-10-20",
-                request::DateMode::DateTime,
-                "",
-                "",
-            ),
-            request::preferences(
-                "prefs",
-                &tr("Title"),
-                &[request::PreferencePage {
-                    key: "main".to_string(),
-                    title: tr("Main"),
-                    fields: vec![field.clone()],
-                }],
-            ),
-            request::wizard(
-                "wizard",
-                &tr("Title"),
-                &[request::WizardPage {
-                    key: "one".to_string(),
-                    title: tr("One"),
-                    description: tr("First"),
-                    fields: vec![field],
-                    skip_if: "".to_string(),
-                }],
-            ),
-            request::about("about", &tr("Name"), "1.0", &tr("Description")),
-            request::toolkit_file(request::open_file("open", &tr("Title"), &[])),
-            request::toolkit_file(request::save_file("save", &tr("Title"), "notes.txt", &[])),
-        ];
-        let mut s = crate::application(
-            &tr("Strings"),
-            "dev.gossamer.gui-pseudo-test",
-            || 0,
-            |m: i64, _msg: UiMsg| m,
-            view,
-        )
-        .size(900, 760)
-        .start()
-        .unwrap();
-        let mut found: Vec<String> = vec![];
-        for req in requests {
-            let id = req.id();
-            crate::perform(Effect::OpenDialog(req));
-            s.flush().unwrap();
-            let mut here = vec![];
-            untranslated(&s.semantics(0), &data, &mut here);
-            for h in here {
-                found.push(format!("{}: {}", id, h))
-            }
-            s.close_dialog(&id, &crate::dialogs::Outcome::Cancelled);
-            s.flush().unwrap()
-        }
-        s.shutdown();
-        assert!(found.is_empty(), "{}", found.join("\n"))
+            s.shutdown();
+            assert!(found.is_empty(), "{}", found.join("\n"))
+        })
     }
 }
 

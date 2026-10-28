@@ -887,8 +887,12 @@ pub fn update(
                 return (next, outcome, fx);
             }
             let mut conflict = String::new();
+            // The capture answers a label; reserved shortcuts are spellings.
             if let DialogRequest::Shortcut { reserved, .. } = &next.request
-                && reserved.contains(value)
+                && reserved.iter().any(|r| {
+                    r == value
+                        || crate::input::Shortcut::parse(r).is_some_and(|s| s.label() == *value)
+                })
             {
                 conflict = crate::localization::message(
                     "shortcut",
@@ -1014,7 +1018,7 @@ pub fn request_cancel(inst: Instance) -> (Instance, Option<Outcome>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Instance, announcement, dialog_role, finish_action, ordered, update};
+    use super::{Instance, announcement, dialog_role, finish_action, is_windows, ordered, update};
     use crate::accessibility::Role;
 
     use crate::dialogs::request;
@@ -1275,7 +1279,7 @@ mod tests {
     }
 
     #[test]
-    fn destructive_buttons_lead_and_accept_trails() {
+    fn destructive_buttons_lead_and_accept_follows_the_platform_order() {
         let order = ordered(&[
             DialogAction::new("save", "Save", crate::dialogs::request::ButtonRole::Accept),
             DialogAction::new(
@@ -1289,7 +1293,11 @@ mod tests {
                 crate::dialogs::request::ButtonRole::Reject,
             ),
         ]);
-        assert_eq!(order[0].id, "discard");
-        assert_eq!(order[2].id, "save")
+        let ids = order.iter().map(|a| a.id.as_str()).collect::<Vec<_>>();
+        if is_windows() {
+            assert_eq!(ids, ["discard", "save", "cancel"]);
+        } else {
+            assert_eq!(ids, ["discard", "cancel", "save"]);
+        }
     }
 }

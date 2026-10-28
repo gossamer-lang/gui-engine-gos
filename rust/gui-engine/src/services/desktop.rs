@@ -126,34 +126,36 @@ mod tests {
 
     #[test]
     fn memory_mode_records_notifications_in_order() {
-        let app = windowing::init(
-            "desktop test",
-            &windowing::InitOptions {
-                driver: "offscreen".to_string(),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        let _defer = scopeguard::guard((), |_| {
-            app.finalize();
-        });
-        use_memory(true);
-        let _defer = scopeguard::guard((), |_| {
-            use_memory(false);
-        });
-        let (tx, rx) = std::sync::mpsc::channel();
-        let first = tx.clone();
-        notify(&app, "Saved", "notes.txt", Urgency::Low, move |r| {
-            first.send(r.is_ok()).unwrap()
-        });
-        notify(
-            &app,
-            "Build failed",
-            "3 errors",
-            Urgency::Critical,
-            move |r| tx.send(r.is_ok()).unwrap(),
-        );
-        assert_eq!(rx.iter().collect::<Vec<_>>(), vec![true, true]);
-        assert_eq!(sent(), vec!["Saved: notes.txt", "Build failed: 3 errors"])
+        crate::testing::on_ui_thread(|| {
+            let app = windowing::init(
+                "desktop test",
+                &windowing::InitOptions {
+                    driver: "offscreen".to_string(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let _defer = scopeguard::guard((), |_| {
+                app.finalize();
+            });
+            use_memory(true);
+            let _defer = scopeguard::guard((), |_| {
+                use_memory(false);
+            });
+            let (tx, rx) = std::sync::mpsc::channel();
+            let first = tx.clone();
+            notify(&app, "Saved", "notes.txt", Urgency::Low, move |r| {
+                first.send(r.is_ok()).unwrap()
+            });
+            notify(
+                &app,
+                "Build failed",
+                "3 errors",
+                Urgency::Critical,
+                move |r| tx.send(r.is_ok()).unwrap(),
+            );
+            assert_eq!(rx.iter().collect::<Vec<_>>(), vec![true, true]);
+            assert_eq!(sent(), vec!["Saved: notes.txt", "Build failed: 3 errors"])
+        })
     }
 }

@@ -294,64 +294,68 @@ mod tests {
 
     #[test]
     fn the_inspector_shows_geometry_focus_theme_commands_and_semantics() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = crate::application(
-            "Inspected",
-            "dev.gossamer.gui-inspector-test",
-            || 0,
-            |m: i64, msg: UiMsg| {
-                if msg == UiMsg::Click("go".to_string()) {
-                    m + 1
-                } else {
-                    m
-                }
-            },
-            view,
-        )
-        .size(900, 600)
-        .start()
-        .unwrap();
-        assert!(s.focus("name").unwrap());
-        let keys = Mods {
-            ctrl: true,
-            shift: true,
-            ..Mods::default()
-        };
-        s.press(Key::I, keys).unwrap();
-        let dump = s.semantics(0).dump();
-        for heading in [
-            "Window",
-            "Layout invalidation",
-            "Theme",
-            "Hierarchy",
-            "Focus chain",
-            "Commands",
-            "Accessibility",
-            "Recent events",
-        ] {
-            assert!(
-                dump.contains(&format!("\"{}\"", heading)),
-                "missing {}: {}",
-                heading,
-                dump
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::application(
+                "Inspected",
+                "dev.gossamer.gui-inspector-test",
+                || 0,
+                |m: i64, msg: UiMsg| {
+                    if msg == UiMsg::Click("go".to_string()) {
+                        m + 1
+                    } else {
+                        m
+                    }
+                },
+                view,
             )
-        }
-        assert!(dump.contains("focus: name"), "{}", dump);
-        assert!(dump.contains("inspector toggled"), "{}", dump);
-        assert!(dump.contains("Button #go  "), "{}", dump);
-        assert!(dump.contains("go > name"), "{}", dump);
-        assert!(dump.contains("gui.inspector  Toggle Inspector"), "{}", dump);
-        assert!(dump.contains("textfield"), "{}", dump);
-        // Input reaches the application's widgets beside the panel.
-        assert!(s.click("go").unwrap());
-        assert!(
-            s.semantics(0).dump().contains("clicks 1"),
-            "{}",
-            s.semantics(0).dump()
-        );
-        s.shutdown()
+            .size(900, 600)
+            .start()
+            .unwrap();
+            assert!(s.focus("name").unwrap());
+            let mac = crate::input::platform_is_macos();
+            let keys = Mods {
+                ctrl: !mac,
+                gui: mac,
+                shift: true,
+                ..Mods::default()
+            };
+            s.press(Key::I, keys).unwrap();
+            let dump = s.semantics(0).dump();
+            for heading in [
+                "Window",
+                "Layout invalidation",
+                "Theme",
+                "Hierarchy",
+                "Focus chain",
+                "Commands",
+                "Accessibility",
+                "Recent events",
+            ] {
+                assert!(
+                    dump.contains(&format!("\"{}\"", heading)),
+                    "missing {}: {}",
+                    heading,
+                    dump
+                )
+            }
+            assert!(dump.contains("focus: name"), "{}", dump);
+            assert!(dump.contains("inspector toggled"), "{}", dump);
+            assert!(dump.contains("Button #go  "), "{}", dump);
+            assert!(dump.contains("go > name"), "{}", dump);
+            assert!(dump.contains("gui.inspector  Toggle Inspector"), "{}", dump);
+            assert!(dump.contains("textfield"), "{}", dump);
+            // Input reaches the application's widgets beside the panel.
+            assert!(s.click("go").unwrap());
+            assert!(
+                s.semantics(0).dump().contains("clicks 1"),
+                "{}",
+                s.semantics(0).dump()
+            );
+            s.shutdown()
+        })
     }
 }

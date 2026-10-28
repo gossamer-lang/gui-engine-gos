@@ -349,8 +349,14 @@ pub fn label_event(l: &Label, node: &Node, ev: &Event, st: &mut StateStore, cx: 
                 cx.consume()
             } else if *key == Key::Left || *key == Key::Right {
                 let dir = if *key == Key::Left { -1 } else { 1 };
-                // With the primary modifier the caret moves by words, in logical order.
-                if primary {
+                // With the word modifier (Option on macOS, Ctrl elsewhere) the
+                // caret moves by words, in logical order.
+                let word = if crate::input::platform_is_macos() {
+                    mods.alt
+                } else {
+                    mods.ctrl
+                };
+                if word {
                     s.step(if cx.theme.rtl { -dir } else { dir }, true, mods.shift)
                 } else {
                     s.visual_step(&tl, dir, mods.shift)
@@ -855,35 +861,37 @@ mod tests {
 
     #[test]
     fn a_link_opens_only_on_a_release_over_where_it_was_pressed() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = crate::application(
-            "Links",
-            "dev.gossamer.gui-link-test",
-            Vec::new,
-            link_update,
-            |m: &Vec<String>| link_view(m),
-        )
-        .size(420, 260)
-        .start()
-        .unwrap();
-        let r = s.rect_of("docs").unwrap();
-        let x = r.center_x();
-        let y = r.center_y();
-        s.press_pointer(x, y + 120).unwrap();
-        s.release_pointer(x, y).unwrap();
-        s.press_pointer(x, y).unwrap();
-        s.move_pointer(x, y + 120, true).unwrap();
-        s.release_pointer(x, y + 120).unwrap();
-        s.click_at(x, y).unwrap();
-        assert!(
-            s.semantics(0).dump().contains("log docs\""),
-            "{}",
-            s.semantics(0).dump()
-        );
-        s.shutdown()
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::application(
+                "Links",
+                "dev.gossamer.gui-link-test",
+                Vec::new,
+                link_update,
+                |m: &Vec<String>| link_view(m),
+            )
+            .size(420, 260)
+            .start()
+            .unwrap();
+            let r = s.rect_of("docs").unwrap();
+            let x = r.center_x();
+            let y = r.center_y();
+            s.press_pointer(x, y + 120).unwrap();
+            s.release_pointer(x, y).unwrap();
+            s.press_pointer(x, y).unwrap();
+            s.move_pointer(x, y + 120, true).unwrap();
+            s.release_pointer(x, y + 120).unwrap();
+            s.click_at(x, y).unwrap();
+            assert!(
+                s.semantics(0).dump().contains("log docs\""),
+                "{}",
+                s.semantics(0).dump()
+            );
+            s.shutdown()
+        })
     }
 
     fn select_view(_m: &i64) -> crate::widgets::Widget {
@@ -910,58 +918,60 @@ mod tests {
 
     #[test]
     fn a_selectable_label_selects_by_keyboard_and_copies() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        crate::services::clipboard::use_memory(true);
-        let mut s = crate::application(
-            "Select",
-            "dev.gossamer.gui-select-label-test",
-            || 0,
-            |m: i64, _msg: crate::widgets::cx::UiMsg| m,
-            select_view,
-        )
-        .size(420, 200)
-        .start()
-        .unwrap();
-        assert!(s.focus("quote").unwrap());
-        let mut word = windowing::Mods {
-            shift: true,
-            ..windowing::Mods::default()
-        };
-        if crate::input::platform_is_macos() {
-            word.gui = true
-        } else {
-            word.ctrl = true
-        };
-        s.press(Key::Home, windowing::Mods::default()).unwrap();
-        s.press(Key::Right, word).unwrap();
-        assert_eq!(copied(&mut s), "Hello");
-        s.press(
-            Key::End,
-            windowing::Mods {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            crate::services::clipboard::use_memory(true);
+            let mut s = crate::application(
+                "Select",
+                "dev.gossamer.gui-select-label-test",
+                || 0,
+                |m: i64, _msg: crate::widgets::cx::UiMsg| m,
+                select_view,
+            )
+            .size(420, 200)
+            .start()
+            .unwrap();
+            assert!(s.focus("quote").unwrap());
+            let mut word = windowing::Mods {
                 shift: true,
                 ..windowing::Mods::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(copied(&mut s), "Hello brave new world");
-        s.press(Key::Home, windowing::Mods::default()).unwrap();
-        s.press(
-            Key::Right,
-            windowing::Mods {
-                shift: true,
-                ..windowing::Mods::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(copied(&mut s), "H");
-        // A double click inside the first word selects it.
-        let r = s.rect_of("quote").unwrap();
-        s.click_at(r.x + 6, r.center_y()).unwrap();
-        s.click_at(r.x + 6, r.center_y()).unwrap();
-        assert_eq!(copied(&mut s), "Hello");
-        s.shutdown()
+            };
+            if crate::input::platform_is_macos() {
+                word.alt = true
+            } else {
+                word.ctrl = true
+            };
+            s.press(Key::Home, windowing::Mods::default()).unwrap();
+            s.press(Key::Right, word).unwrap();
+            assert_eq!(copied(&mut s), "Hello");
+            s.press(
+                Key::End,
+                windowing::Mods {
+                    shift: true,
+                    ..windowing::Mods::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(copied(&mut s), "Hello brave new world");
+            s.press(Key::Home, windowing::Mods::default()).unwrap();
+            s.press(
+                Key::Right,
+                windowing::Mods {
+                    shift: true,
+                    ..windowing::Mods::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(copied(&mut s), "H");
+            // A double click inside the first word selects it.
+            let r = s.rect_of("quote").unwrap();
+            s.click_at(r.x + 6, r.center_y()).unwrap();
+            s.click_at(r.x + 6, r.center_y()).unwrap();
+            assert_eq!(copied(&mut s), "Hello");
+            s.shutdown()
+        })
     }
 }

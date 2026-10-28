@@ -1408,128 +1408,136 @@ mod session_tests {
 
     #[test]
     fn a_button_activates_only_on_a_release_over_where_it_was_pressed() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = start(Model::default());
-        let (bx, by) = centre(&s, "go");
-        let (lx, ly) = centre(&s, "agree");
-        // Pressed and released over the button: one click.
-        assert!(s.click("go").unwrap());
-        // Pressed, dragged off and released elsewhere: cancelled.
-        s.press_pointer(bx, by).unwrap();
-        s.move_pointer(bx, by + 200, true).unwrap();
-        s.release_pointer(bx, by + 200).unwrap();
-        // Pressed elsewhere and released over the button: nothing.
-        let (px, py) = centre(&s, "size");
-        s.press_pointer(px, py + 200).unwrap();
-        s.release_pointer(bx, by).unwrap();
-        s.press_pointer(lx, ly + 300).unwrap();
-        s.release_pointer(bx, by).unwrap();
-        assert_eq!(log(&s), "click go");
-        s.shutdown()
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = start(Model::default());
+            let (bx, by) = centre(&s, "go");
+            let (lx, ly) = centre(&s, "agree");
+            // Pressed and released over the button: one click.
+            assert!(s.click("go").unwrap());
+            // Pressed, dragged off and released elsewhere: cancelled.
+            s.press_pointer(bx, by).unwrap();
+            s.move_pointer(bx, by + 200, true).unwrap();
+            s.release_pointer(bx, by + 200).unwrap();
+            // Pressed elsewhere and released over the button: nothing.
+            let (px, py) = centre(&s, "size");
+            s.press_pointer(px, py + 200).unwrap();
+            s.release_pointer(bx, by).unwrap();
+            s.press_pointer(lx, ly + 300).unwrap();
+            s.release_pointer(bx, by).unwrap();
+            assert_eq!(log(&s), "click go");
+            s.shutdown()
+        })
     }
 
     #[test]
     fn keys_activate_a_button_once_and_focus_loss_cancels_space() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = start(Model::default());
-        assert!(s.focus("go").unwrap());
-        // Enter activates on the press and ignores auto-repeat.
-        s.hold_key(Key::Return, Mods::default(), false).unwrap();
-        s.hold_key(Key::Return, Mods::default(), true).unwrap();
-        s.release_key(Key::Return, Mods::default()).unwrap();
-        // Space activates on release.
-        s.hold_key(Key::Space, Mods::default(), false).unwrap();
-        assert_eq!(log(&s), "click go");
-        s.release_key(Key::Space, Mods::default()).unwrap();
-        // Space held while focus moves away is cancelled.
-        s.hold_key(Key::Space, Mods::default(), false).unwrap();
-        assert!(s.focus("agree").unwrap());
-        s.release_key(Key::Space, Mods::default()).unwrap();
-        assert_eq!(log(&s), "click go; click go");
-        s.shutdown()
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = start(Model::default());
+            assert!(s.focus("go").unwrap());
+            // Enter activates on the press and ignores auto-repeat.
+            s.hold_key(Key::Return, Mods::default(), false).unwrap();
+            s.hold_key(Key::Return, Mods::default(), true).unwrap();
+            s.release_key(Key::Return, Mods::default()).unwrap();
+            // Space activates on release.
+            s.hold_key(Key::Space, Mods::default(), false).unwrap();
+            assert_eq!(log(&s), "click go");
+            s.release_key(Key::Space, Mods::default()).unwrap();
+            // Space held while focus moves away is cancelled.
+            s.hold_key(Key::Space, Mods::default(), false).unwrap();
+            assert!(s.focus("agree").unwrap());
+            s.release_key(Key::Space, Mods::default()).unwrap();
+            assert_eq!(log(&s), "click go; click go");
+            s.shutdown()
+        })
     }
 
     #[test]
     fn checkboxes_change_on_release_and_tri_state_cycles_through_mixed() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = start(Model::default());
-        assert!(s.focus("agree").unwrap());
-        s.hold_key(Key::Space, Mods::default(), false).unwrap();
-        assert_eq!(log(&s), "");
-        s.release_key(Key::Space, Mods::default()).unwrap();
-        let (ax, ay) = centre(&s, "agree");
-        s.press_pointer(ax, ay).unwrap();
-        s.release_pointer(ax, ay + 300).unwrap();
-        assert!(s.click("all").unwrap());
-        assert!(s.click("all").unwrap());
-        assert!(s.click("all").unwrap());
-        assert_eq!(
-            log(&s),
-            "toggle agree true; check all Checked; check all Mixed; check all Unchecked"
-        );
-        let dump = s.semantics(0).dump();
-        assert!(
-            dump.contains("checkbox \"Agree\" [checked]")
-                && dump.contains("checkbox \"Select all\" [focused]"),
-            "{}",
-            dump
-        );
-        // The model's Mixed shows as the mixed state.
-        assert!(s.click("all").unwrap());
-        assert!(s.click("all").unwrap());
-        assert!(
-            s.semantics(0)
-                .dump()
-                .contains("checkbox \"Select all\" [focused mixed]"),
-            "{}",
-            s.semantics(0).dump()
-        );
-        s.shutdown()
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = start(Model::default());
+            assert!(s.focus("agree").unwrap());
+            s.hold_key(Key::Space, Mods::default(), false).unwrap();
+            assert_eq!(log(&s), "");
+            s.release_key(Key::Space, Mods::default()).unwrap();
+            let (ax, ay) = centre(&s, "agree");
+            s.press_pointer(ax, ay).unwrap();
+            s.release_pointer(ax, ay + 300).unwrap();
+            assert!(s.click("all").unwrap());
+            assert!(s.click("all").unwrap());
+            assert!(s.click("all").unwrap());
+            assert_eq!(
+                log(&s),
+                "toggle agree true; check all Checked; check all Mixed; check all Unchecked"
+            );
+            let dump = s.semantics(0).dump();
+            assert!(
+                dump.contains("checkbox \"Agree\" [checked]")
+                    && dump.contains("checkbox \"Select all\" [focused]"),
+                "{}",
+                dump
+            );
+            // The model's Mixed shows as the mixed state.
+            assert!(s.click("all").unwrap());
+            assert!(s.click("all").unwrap());
+            assert!(
+                s.semantics(0)
+                    .dump()
+                    .contains("checkbox \"Select all\" [focused mixed]"),
+                "{}",
+                s.semantics(0).dump()
+            );
+            s.shutdown()
+        })
     }
 
     #[test]
     fn radios_choose_once_on_release_and_skip_disabled_options() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = start(Model {
-            size: "m".to_string(),
-            ..Model::default()
-        });
-        let r = s.rect_of("size").unwrap();
-        // Rows are stacked; the first is Small.
-        let row = r.height / 4;
-        let sx = r.x + 20;
-        let sy = r.y + row / 2;
-        // Released off the option: cancelled. Released on it: chosen.
-        s.press_pointer(sx, sy).unwrap();
-        s.release_pointer(sx, sy + 300).unwrap();
-        s.press_pointer(sx, sy).unwrap();
-        assert_eq!(log(&s), "");
-        s.release_pointer(sx, sy).unwrap();
-        // Choosing the selected option again reports nothing.
-        s.click_at(sx, sy).unwrap();
-        // Arrows skip the disabled Large and wrap.
-        assert!(s.focus("size").unwrap());
-        s.press(Key::Down, Mods::default()).unwrap();
-        s.press(Key::Down, Mods::default()).unwrap();
-        s.press(Key::Down, Mods::default()).unwrap();
-        s.press(Key::Up, Mods::default()).unwrap();
-        assert_eq!(
-            log(&s),
-            "choose size s; choose size m; choose size xl; choose size s; choose size xl"
-        );
-        s.shutdown()
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = start(Model {
+                size: "m".to_string(),
+                ..Model::default()
+            });
+            let r = s.rect_of("size").unwrap();
+            // Rows are stacked; the first is Small.
+            let row = r.height / 4;
+            let sx = r.x + 20;
+            let sy = r.y + row / 2;
+            // Released off the option: cancelled. Released on it: chosen.
+            s.press_pointer(sx, sy).unwrap();
+            s.release_pointer(sx, sy + 300).unwrap();
+            s.press_pointer(sx, sy).unwrap();
+            assert_eq!(log(&s), "");
+            s.release_pointer(sx, sy).unwrap();
+            // Choosing the selected option again reports nothing.
+            s.click_at(sx, sy).unwrap();
+            // Arrows skip the disabled Large and wrap.
+            assert!(s.focus("size").unwrap());
+            s.press(Key::Down, Mods::default()).unwrap();
+            s.press(Key::Down, Mods::default()).unwrap();
+            s.press(Key::Down, Mods::default()).unwrap();
+            s.press(Key::Up, Mods::default()).unwrap();
+            assert_eq!(
+                log(&s),
+                "choose size s; choose size m; choose size xl; choose size s; choose size xl"
+            );
+            s.shutdown()
+        })
     }
 
     fn menu_view(m: &Model) -> Widget {
@@ -1560,104 +1568,108 @@ mod session_tests {
 
     #[test]
     fn menu_and_split_buttons_open_their_menus_and_run_items() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = crate::application(
-            "Menus",
-            "dev.gossamer.gui-menu-button-test",
-            Model::default,
-            menu_update,
-            menu_view,
-        )
-        .size(420, 360)
-        .start()
-        .unwrap();
-        // A menu button opens on press; a second press on it closes the menu.
-        assert!(s.click("file").unwrap());
-        assert_eq!(
-            s.popup_owners()
-                .iter()
-                .map(|p| p.0.clone())
-                .collect::<Vec<_>>(),
-            vec!["file"]
-        );
-        assert!(
-            s.semantics(0)
-                .dump()
-                .contains("button \"File\" [focused expanded]"),
-            "{}",
-            s.semantics(0).dump()
-        );
-        assert!(s.click("file").unwrap());
-        assert!(s.popup_owners().is_empty(), "{:?}", s.popup_owners());
-        // From the keyboard it opens on Enter with the first item highlighted.
-        s.press(Key::Return, Mods::default()).unwrap();
-        s.press(Key::Return, Mods::default()).unwrap();
-        assert!(s.popup_owners().is_empty(), "{:?}", s.popup_owners());
-        // A split button's main part clicks; Down opens its menu.
-        let r = s.rect_of("save").unwrap();
-        s.click_at(r.x + r.width / 3, r.center_y()).unwrap();
-        assert!(s.popup_owners().is_empty(), "{:?}", s.popup_owners());
-        s.press(Key::Down, Mods::default()).unwrap();
-        s.press(Key::Down, Mods::default()).unwrap();
-        s.press(Key::Return, Mods::default()).unwrap();
-        // Its arrow part opens the menu without clicking.
-        s.click_at(r.x + r.width - 6, r.center_y()).unwrap();
-        assert_eq!(
-            s.popup_owners()
-                .iter()
-                .map(|p| p.0.clone())
-                .collect::<Vec<_>>(),
-            vec!["save"]
-        );
-        s.press(Key::Escape, Mods::default()).unwrap();
-        // Assistive technology opens it through the "More" button.
-        assert!(
-            s.semantics(0)
-                .dump()
-                .contains("button \"More Save options\" [collapsed]"),
-            "{}",
-            s.semantics(0).dump()
-        );
-        s.accessible_action("save", "save#menu", "press", "")
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::application(
+                "Menus",
+                "dev.gossamer.gui-menu-button-test",
+                Model::default,
+                menu_update,
+                menu_view,
+            )
+            .size(420, 360)
+            .start()
             .unwrap();
-        assert_eq!(
-            s.popup_owners()
-                .iter()
-                .map(|p| p.0.clone())
-                .collect::<Vec<_>>(),
-            vec!["save"]
-        );
-        assert!(
-            s.semantics(0).dump().contains("menuitem \"Export\""),
-            "{}",
-            s.semantics(0).dump()
-        );
-        assert_eq!(log(&s), "command doc.export; click save; command doc.print");
-        s.shutdown()
+            // A menu button opens on press; a second press on it closes the menu.
+            assert!(s.click("file").unwrap());
+            assert_eq!(
+                s.popup_owners()
+                    .iter()
+                    .map(|p| p.0.clone())
+                    .collect::<Vec<_>>(),
+                vec!["file"]
+            );
+            assert!(
+                s.semantics(0)
+                    .dump()
+                    .contains("button \"File\" [focused expanded]"),
+                "{}",
+                s.semantics(0).dump()
+            );
+            assert!(s.click("file").unwrap());
+            assert!(s.popup_owners().is_empty(), "{:?}", s.popup_owners());
+            // From the keyboard it opens on Enter with the first item highlighted.
+            s.press(Key::Return, Mods::default()).unwrap();
+            s.press(Key::Return, Mods::default()).unwrap();
+            assert!(s.popup_owners().is_empty(), "{:?}", s.popup_owners());
+            // A split button's main part clicks; Down opens its menu.
+            let r = s.rect_of("save").unwrap();
+            s.click_at(r.x + r.width / 3, r.center_y()).unwrap();
+            assert!(s.popup_owners().is_empty(), "{:?}", s.popup_owners());
+            s.press(Key::Down, Mods::default()).unwrap();
+            s.press(Key::Down, Mods::default()).unwrap();
+            s.press(Key::Return, Mods::default()).unwrap();
+            // Its arrow part opens the menu without clicking.
+            s.click_at(r.x + r.width - 6, r.center_y()).unwrap();
+            assert_eq!(
+                s.popup_owners()
+                    .iter()
+                    .map(|p| p.0.clone())
+                    .collect::<Vec<_>>(),
+                vec!["save"]
+            );
+            s.press(Key::Escape, Mods::default()).unwrap();
+            // Assistive technology opens it through the "More" button.
+            assert!(
+                s.semantics(0)
+                    .dump()
+                    .contains("button \"More Save options\" [collapsed]"),
+                "{}",
+                s.semantics(0).dump()
+            );
+            s.accessible_action("save", "save#menu", "press", "")
+                .unwrap();
+            assert_eq!(
+                s.popup_owners()
+                    .iter()
+                    .map(|p| p.0.clone())
+                    .collect::<Vec<_>>(),
+                vec!["save"]
+            );
+            assert!(
+                s.semantics(0).dump().contains("menuitem \"Export\""),
+                "{}",
+                s.semantics(0).dump()
+            );
+            assert_eq!(log(&s), "command doc.export; click save; command doc.print");
+            s.shutdown()
+        })
     }
 
     #[test]
     fn a_segment_already_chosen_reports_nothing() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = start(Model {
-            view: "list".to_string(),
-            ..Model::default()
-        });
-        let r = s.rect_of("view").unwrap();
-        let ly = r.center_y();
-        s.click_at(r.x + r.width / 4, ly).unwrap();
-        s.click_at(r.x + r.width * 3 / 4, ly).unwrap();
-        s.press_pointer(r.x + r.width / 4, ly).unwrap();
-        s.release_pointer(r.x + r.width / 4, ly + 300).unwrap();
-        assert!(s.focus("view").unwrap());
-        s.press(Key::Right, Mods::default()).unwrap();
-        assert_eq!(log(&s), "choose view grid; choose view list");
-        s.shutdown()
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = start(Model {
+                view: "list".to_string(),
+                ..Model::default()
+            });
+            let r = s.rect_of("view").unwrap();
+            let ly = r.center_y();
+            s.click_at(r.x + r.width / 4, ly).unwrap();
+            s.click_at(r.x + r.width * 3 / 4, ly).unwrap();
+            s.press_pointer(r.x + r.width / 4, ly).unwrap();
+            s.release_pointer(r.x + r.width / 4, ly + 300).unwrap();
+            assert!(s.focus("view").unwrap());
+            s.press(Key::Right, Mods::default()).unwrap();
+            assert_eq!(log(&s), "choose view grid; choose view list");
+            s.shutdown()
+        })
     }
 }

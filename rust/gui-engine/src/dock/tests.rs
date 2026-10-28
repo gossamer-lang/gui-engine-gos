@@ -319,101 +319,103 @@ mod session {
 
     #[test]
     fn dragged_tabs_dock_by_zone_and_panes_keep_state_across_windows_of_different_scales() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = crate::app::start("Dock", "dev.gossamer.gui-dock-test").unwrap();
-        let layout = Rc::new(RefCell::new(Layout::new(&names(&[
-            "editor", "notes", "log",
-        ]))));
-        let (model, shown) = (layout.clone(), layout.clone());
-        let text = Rc::new(RefCell::new("draft".to_string()));
-        let (typed, value) = (text.clone(), text.clone());
-        s.set_shell(
-            move |m| {
-                if let UiMsg::Text(id, t) = &m
-                    && id == "editor-input"
-                {
-                    *typed.borrow_mut() = t.clone();
-                }
-                for change in model.borrow_mut().handle("dock", &m) {
-                    if let Change::Opened(f) = change {
-                        crate::app::effects::perform(crate::app::effects::Effect::OpenWindow {
-                            key: f.window,
-                            title: "Pane".into(),
-                            width: 420,
-                            height: 300,
-                        });
-                    } else if let Change::Closed(window) = change {
-                        crate::app::effects::perform(crate::app::effects::Effect::CloseWindow(
-                            window,
-                        ));
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::app::start("Dock", "dev.gossamer.gui-dock-test").unwrap();
+            let layout = Rc::new(RefCell::new(Layout::new(&names(&[
+                "editor", "notes", "log",
+            ]))));
+            let (model, shown) = (layout.clone(), layout.clone());
+            let text = Rc::new(RefCell::new("draft".to_string()));
+            let (typed, value) = (text.clone(), text.clone());
+            s.set_shell(
+                move |m| {
+                    if let UiMsg::Text(id, t) = &m
+                        && id == "editor-input"
+                    {
+                        *typed.borrow_mut() = t.clone();
                     }
+                    for change in model.borrow_mut().handle("dock", &m) {
+                        if let Change::Opened(f) = change {
+                            crate::app::effects::perform(crate::app::effects::Effect::OpenWindow {
+                                key: f.window,
+                                title: "Pane".into(),
+                                width: 420,
+                                height: 300,
+                            });
+                        } else if let Change::Closed(window) = change {
+                            crate::app::effects::perform(crate::app::effects::Effect::CloseWindow(
+                                window,
+                            ));
+                        }
+                    }
+                },
+                move |key| {
+                    let window = if key == "main" { "" } else { key };
+                    view(&shown.borrow(), "dock", window, &panes(&value.borrow()))
+                },
+                Vec::new,
+            );
+            s.open_window("main", "Dock", 900, 600).unwrap();
+            s.step().unwrap();
+            // Dragging "log" to the right quarter of its own group docks it there.
+            let ((tx, ty), group) = tab_center(&s, 0, "dock:group:1", "log");
+            let to = (group.x + group.width - 20, group.y + group.height / 2);
+            s.drag(tx, ty, to.0, to.1).unwrap();
+            let right = layout.borrow().group_of("log").unwrap();
+            assert_ne!(right, 1);
+            assert!(matches!(
+                layout.borrow().root,
+                Node::Split {
+                    axis: Axis::Horizontal,
+                    ..
                 }
-            },
-            move |key| {
-                let window = if key == "main" { "" } else { key };
-                view(&shown.borrow(), "dock", window, &panes(&value.borrow()))
-            },
-            Vec::new,
-        );
-        s.open_window("main", "Dock", 900, 600).unwrap();
-        s.step().unwrap();
-        // Dragging "log" to the right quarter of its own group docks it there.
-        let ((tx, ty), group) = tab_center(&s, 0, "dock:group:1", "log");
-        let to = (group.x + group.width - 20, group.y + group.height / 2);
-        s.drag(tx, ty, to.0, to.1).unwrap();
-        let right = layout.borrow().group_of("log").unwrap();
-        assert_ne!(right, 1);
-        assert!(matches!(
-            layout.borrow().root,
-            Node::Split {
-                axis: Axis::Horizontal,
-                ..
-            }
-        ));
-        // Dragging "notes" into the middle of that group joins its tabs.
-        let ((tx, ty), _) = tab_center(&s, 0, "dock:group:1", "notes");
-        let (_, target) = tab_center(&s, 0, &group_strip("dock", right), "log");
-        let middle = (target.x + target.width / 2, target.y + target.height / 2);
-        s.drag(tx, ty, middle.0, middle.1).unwrap();
-        assert_eq!(layout.borrow().group_of("notes"), Some(right));
-        // The editor's caret survives moving to a window at twice the scale.
-        assert!(s.focus("editor-input").unwrap());
-        s.press(windowing::Key::End, windowing::Mods::default())
+            ));
+            // Dragging "notes" into the middle of that group joins its tabs.
+            let ((tx, ty), _) = tab_center(&s, 0, "dock:group:1", "notes");
+            let (_, target) = tab_center(&s, 0, &group_strip("dock", right), "log");
+            let middle = (target.x + target.width / 2, target.y + target.height / 2);
+            s.drag(tx, ty, middle.0, middle.1).unwrap();
+            assert_eq!(layout.borrow().group_of("notes"), Some(right));
+            // The editor's caret survives moving to a window at twice the scale.
+            assert!(s.focus("editor-input").unwrap());
+            s.press(windowing::Key::End, windowing::Mods::default())
+                .unwrap();
+            s.type_text(" kept").unwrap();
+            let caret = s.windows[0].states.edit("editor-input").caret;
+            assert_eq!(*text.borrow(), "draft kept");
+            s.emit(&UiMsg::TabAction(
+                group_strip("dock", 1),
+                "editor".into(),
+                "detach".into(),
+            ));
+            s.flush().unwrap();
+            let floating = layout.borrow().floating[0].window.clone();
+            let w = s.windows.iter().position(|w| w.key == floating).unwrap();
+            let native = s.windows[w].native;
+            s.handle(&windowing::Event::ScaleChanged {
+                window: native.id(),
+                scale: s.windows[0].theme.scale * 2.0,
+            })
             .unwrap();
-        s.type_text(" kept").unwrap();
-        let caret = s.windows[0].states.edit("editor-input").caret;
-        assert_eq!(*text.borrow(), "draft kept");
-        s.emit(&UiMsg::TabAction(
-            group_strip("dock", 1),
-            "editor".into(),
-            "detach".into(),
-        ));
-        s.flush().unwrap();
-        let floating = layout.borrow().floating[0].window.clone();
-        let w = s.windows.iter().position(|w| w.key == floating).unwrap();
-        let native = s.windows[w].native;
-        s.handle(&windowing::Event::ScaleChanged {
-            window: native.id(),
-            scale: s.windows[0].theme.scale * 2.0,
+            s.step().unwrap();
+            assert_eq!(s.windows[w].theme.scale, s.windows[0].theme.scale * 2.0);
+            assert_eq!(s.windows[w].states.edit("editor-input").caret, caret);
+            assert_eq!(
+                s.windows[w].states.edit("editor-input").text.to_string(),
+                "draft kept"
+            );
+            // Closing the floating window returns the pane, still with its caret.
+            s.emit(&UiMsg::CloseRequested(floating.clone()));
+            s.flush().unwrap();
+            assert!(layout.borrow().floating.is_empty());
+            assert!(s.windows.iter().all(|w| w.key != floating));
+            assert_eq!(s.windows[0].states.edit("editor-input").caret, caret);
+            assert_eq!(layout.borrow().panes().len(), 3);
+            s.shutdown();
         })
-        .unwrap();
-        s.step().unwrap();
-        assert_eq!(s.windows[w].theme.scale, s.windows[0].theme.scale * 2.0);
-        assert_eq!(s.windows[w].states.edit("editor-input").caret, caret);
-        assert_eq!(
-            s.windows[w].states.edit("editor-input").text.to_string(),
-            "draft kept"
-        );
-        // Closing the floating window returns the pane, still with its caret.
-        s.emit(&UiMsg::CloseRequested(floating.clone()));
-        s.flush().unwrap();
-        assert!(layout.borrow().floating.is_empty());
-        assert!(s.windows.iter().all(|w| w.key != floating));
-        assert_eq!(s.windows[0].states.edit("editor-input").caret, caret);
-        assert_eq!(layout.borrow().panes().len(), 3);
-        s.shutdown();
     }
 }

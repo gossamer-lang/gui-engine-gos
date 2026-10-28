@@ -309,6 +309,11 @@ const FOLLOW_DESKTOP_PREFERENCES: bool = true;
 
 /// Starts the toolkit: one windowing session for the process.
 pub fn start(name: &str, app_id: &str) -> Result<Session, errors::Error> {
+    #[cfg(test)]
+    assert!(
+        crate::testing::is_ui_thread(),
+        "a session under test runs inside crate::testing::on_ui_thread"
+    );
     let options = windowing::InitOptions {
         app_id: app_id.to_string(),
         driver: VIDEO_DRIVER.to_string(),
@@ -5370,59 +5375,61 @@ mod popup_tests {
 
     #[test]
     fn an_open_context_menu_is_in_the_semantic_tree() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = crate::application(
-            "Popups",
-            "dev.gossamer.gui-popup-test",
-            || 0,
-            |m: i64, _msg: UiMsg| m,
-            view,
-        )
-        .size(420, 320)
-        .start()
-        .unwrap();
-        assert!(s.focus("target").unwrap());
-        assert!(
-            !s.semantics(0).dump().contains("menuitem"),
-            "{}",
-            s.semantics(0).dump()
-        );
-        s.press(
-            Key::F10,
-            Mods {
-                shift: true,
-                ..Mods::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            s.popup_owners()
-                .iter()
-                .map(|p| p.0.clone())
-                .collect::<Vec<_>>(),
-            vec!["ctx"]
-        );
-        let dump = s.semantics(0).dump();
-        assert!(
-            dump.contains("menu\n") || dump.contains("menu ["),
-            "{}",
-            dump
-        );
-        assert!(
-            dump.contains("menuitem \"Copy\"") && dump.contains("menuitem \"Paste\""),
-            "{}",
-            dump
-        );
-        s.press(Key::Escape, Mods::default()).unwrap();
-        assert!(
-            !s.semantics(0).dump().contains("menuitem"),
-            "{}",
-            s.semantics(0).dump()
-        );
-        s.shutdown()
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::application(
+                "Popups",
+                "dev.gossamer.gui-popup-test",
+                || 0,
+                |m: i64, _msg: UiMsg| m,
+                view,
+            )
+            .size(420, 320)
+            .start()
+            .unwrap();
+            assert!(s.focus("target").unwrap());
+            assert!(
+                !s.semantics(0).dump().contains("menuitem"),
+                "{}",
+                s.semantics(0).dump()
+            );
+            s.press(
+                Key::F10,
+                Mods {
+                    shift: true,
+                    ..Mods::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                s.popup_owners()
+                    .iter()
+                    .map(|p| p.0.clone())
+                    .collect::<Vec<_>>(),
+                vec!["ctx"]
+            );
+            let dump = s.semantics(0).dump();
+            assert!(
+                dump.contains("menu\n") || dump.contains("menu ["),
+                "{}",
+                dump
+            );
+            assert!(
+                dump.contains("menuitem \"Copy\"") && dump.contains("menuitem \"Paste\""),
+                "{}",
+                dump
+            );
+            s.press(Key::Escape, Mods::default()).unwrap();
+            assert!(
+                !s.semantics(0).dump().contains("menuitem"),
+                "{}",
+                s.semantics(0).dump()
+            );
+            s.shutdown()
+        })
     }
 }
 
@@ -5494,272 +5501,281 @@ mod dialog_scope_tests {
 
     #[test]
     fn shortcut_dialog_captures_ctrl_home_and_keeps_actions_visible_and_clickable() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = crate::application(
-            "Shortcuts",
-            "dev.gossamer.gui-shortcut-test",
-            Log::default,
-            log_update,
-            log_view,
-        )
-        .size(300, 120)
-        .windows(tools_view)
-        .start()
-        .unwrap();
-        s.open_window("settings", "Settings", 480, 270).unwrap();
-        s.set_focus(1, "tool");
-        let req = request::DialogRequest::Shortcut {
-            id: "capture".to_string(),
-            title: "Launch shortcut".to_string(),
-            initial: "Ctrl+Space".to_string(),
-            reserved: vec!["Ctrl+Q".to_string()],
-        };
-        let inject = |s: &mut crate::Session, key, mods| {
-            let d = s.windows.len() - 1;
-            s.inject(&windowing::Event::KeyDown {
-                window: s.windows[d].native.id(),
-                key,
-                scancode: windowing::Scancode::Unknown,
-                mods,
-                repeat: false,
-            })
-            .unwrap();
-        };
-        let click = |s: &mut crate::Session, part: &str| {
-            let d = s.windows.len() as i64 - 1;
-            let path = s.path_in_layers(d, &format!("dlg:capture:{part}"));
-            let target = path.last().unwrap();
-            let x = target.x + target.node.rect.width / 2;
-            let y = target.y + target.node.rect.height / 2;
-            for parent in &path {
-                let rect = crate::geometry::Rect::new(
-                    parent.x,
-                    parent.y,
-                    parent.node.rect.width,
-                    parent.node.rect.height,
-                );
-                assert!(
-                    rect.contains(x, y),
-                    "{part} outside hit-test ancestor: {rect:?}"
-                );
-            }
-            s.pointer_down(d, x, y, windowing::MouseButton::Left, 1, Mods::default());
-            s.pointer_up(d, x, y, windowing::MouseButton::Left, Mods::default());
-            s.flush().unwrap();
-        };
-        s.open_dialog_in(1, &req);
-        s.flush().unwrap();
-        assert_eq!(s.windows.len(), 3);
-        let d = 2;
-        assert_eq!(s.windows[d].owner, "settings");
-        assert_eq!(s.windows[d].focus, "dlg:capture:capture");
-        s.windows[d].native.set_size(480, 340).unwrap();
-        s.windows[d].native.sync().unwrap();
-        s.invalidate(d as i64, "test minimum shortcut size");
-        s.flush().unwrap();
-        for part in ["capture", "action:clear", "action:ok", "action:cancel"] {
-            let path = s.path_in_layers(d as i64, &format!("dlg:capture:{part}"));
-            let target = path.last().unwrap();
-            assert!(target.x >= 0 && target.y >= 0);
-            assert!(target.x + target.node.rect.width <= s.windows[d].node.rect.width);
-            assert!(target.y + target.node.rect.height <= s.windows[d].node.rect.height);
-            if let Widget::Button(button) = &target.widget {
-                let width = crate::text::layout::measure(
-                    &button.label,
-                    &target.theme.font(crate::style::TextRole::Body),
-                )
-                .0;
-                assert!(
-                    width <= target.node.rect.width as f64,
-                    "button label overflows {part}"
-                );
-            }
-        }
-        let ctrl = Mods {
-            ctrl: true,
-            ..Mods::default()
-        };
-        inject(&mut s, Key::LeftCtrl, ctrl);
-        assert_eq!(s.windows[d].dialogs[0].text, "Ctrl+Space");
-        inject(&mut s, Key::Home, ctrl);
-        assert_eq!(s.windows[d].dialogs[0].text, "Ctrl+Home");
-        if let Ok(path) = env::var("FEATHER_SHORTCUT_SCREENSHOT") {
-            fs::write(
-                path,
-                crate::render::to_png(&s.capture_window(d as i64).unwrap()),
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::application(
+                "Shortcuts",
+                "dev.gossamer.gui-shortcut-test",
+                Log::default,
+                log_update,
+                log_view,
             )
+            .size(300, 120)
+            .windows(tools_view)
+            .start()
             .unwrap();
-        }
-        click(&mut s, "action:ok");
-        assert_eq!(s.windows.len(), 2);
-        assert!(
-            s.semantics(0).dump().contains("Ctrl+Home"),
-            "{}",
-            s.semantics(0).dump()
-        );
-        s.open_dialog_in(1, &req);
-        s.flush().unwrap();
-        inject(&mut s, Key::Q, ctrl);
-        assert!(!s.windows[d].dialogs[0].error.is_empty());
-        click(&mut s, "action:ok");
-        assert_eq!(
-            s.windows.len(),
-            3,
-            "a conflicting shortcut must not be saved"
-        );
-        click(&mut s, "action:clear");
-        assert!(s.windows[d].dialogs[0].text.is_empty());
-        assert!(s.windows[d].dialogs[0].error.is_empty());
-        click(&mut s, "capture");
-        inject(&mut s, Key::Home, ctrl);
-        inject(&mut s, Key::Return, Mods::default());
-        assert_eq!(
-            s.windows.len(),
-            2,
-            "Enter should save the recorded shortcut"
-        );
-        s.open_dialog_in(1, &req);
-        s.flush().unwrap();
-        inject(&mut s, Key::Escape, Mods::default());
-        assert_eq!(s.windows.len(), 2);
-        assert!(s.semantics(0).dump().contains("Cancelled"));
-        s.shutdown();
+            s.open_window("settings", "Settings", 480, 270).unwrap();
+            s.set_focus(1, "tool");
+            let req = request::DialogRequest::Shortcut {
+                id: "capture".to_string(),
+                title: "Launch shortcut".to_string(),
+                initial: "Ctrl+Space".to_string(),
+                reserved: vec!["Ctrl+Q".to_string()],
+            };
+            let inject = |s: &mut crate::Session, key, mods| {
+                let d = s.windows.len() - 1;
+                s.inject(&windowing::Event::KeyDown {
+                    window: s.windows[d].native.id(),
+                    key,
+                    scancode: windowing::Scancode::Unknown,
+                    mods,
+                    repeat: false,
+                })
+                .unwrap();
+            };
+            let click = |s: &mut crate::Session, part: &str| {
+                let d = s.windows.len() as i64 - 1;
+                let path = s.path_in_layers(d, &format!("dlg:capture:{part}"));
+                let target = path.last().unwrap();
+                let x = target.x + target.node.rect.width / 2;
+                let y = target.y + target.node.rect.height / 2;
+                for parent in &path {
+                    let rect = crate::geometry::Rect::new(
+                        parent.x,
+                        parent.y,
+                        parent.node.rect.width,
+                        parent.node.rect.height,
+                    );
+                    assert!(
+                        rect.contains(x, y),
+                        "{part} outside hit-test ancestor: {rect:?}"
+                    );
+                }
+                s.pointer_down(d, x, y, windowing::MouseButton::Left, 1, Mods::default());
+                s.pointer_up(d, x, y, windowing::MouseButton::Left, Mods::default());
+                s.flush().unwrap();
+            };
+            s.open_dialog_in(1, &req);
+            s.flush().unwrap();
+            assert_eq!(s.windows.len(), 3);
+            let d = 2;
+            assert_eq!(s.windows[d].owner, "settings");
+            assert_eq!(s.windows[d].focus, "dlg:capture:capture");
+            s.windows[d].native.set_size(480, 340).unwrap();
+            s.windows[d].native.sync().unwrap();
+            s.invalidate(d as i64, "test minimum shortcut size");
+            s.flush().unwrap();
+            for part in ["capture", "action:clear", "action:ok", "action:cancel"] {
+                let path = s.path_in_layers(d as i64, &format!("dlg:capture:{part}"));
+                let target = path.last().unwrap();
+                assert!(target.x >= 0 && target.y >= 0);
+                assert!(target.x + target.node.rect.width <= s.windows[d].node.rect.width);
+                assert!(target.y + target.node.rect.height <= s.windows[d].node.rect.height);
+                if let Widget::Button(button) = &target.widget {
+                    let width = crate::text::layout::measure(
+                        &button.label,
+                        &target.theme.font(crate::style::TextRole::Body),
+                    )
+                    .0;
+                    assert!(
+                        width <= target.node.rect.width as f64,
+                        "button label overflows {part}"
+                    );
+                }
+            }
+            let ctrl = Mods {
+                ctrl: true,
+                ..Mods::default()
+            };
+            inject(&mut s, Key::LeftCtrl, ctrl);
+            assert_eq!(s.windows[d].dialogs[0].text, "Ctrl+Space");
+            inject(&mut s, Key::Home, ctrl);
+            let ctrl_home = crate::input::Shortcut::parse("Ctrl+Home").unwrap().label();
+            assert_eq!(s.windows[d].dialogs[0].text, ctrl_home);
+            if let Ok(path) = env::var("FEATHER_SHORTCUT_SCREENSHOT") {
+                fs::write(
+                    path,
+                    crate::render::to_png(&s.capture_window(d as i64).unwrap()),
+                )
+                .unwrap();
+            }
+            click(&mut s, "action:ok");
+            assert_eq!(s.windows.len(), 2);
+            assert!(
+                s.semantics(0).dump().contains(&ctrl_home),
+                "{}",
+                s.semantics(0).dump()
+            );
+            s.open_dialog_in(1, &req);
+            s.flush().unwrap();
+            inject(&mut s, Key::Q, ctrl);
+            assert!(!s.windows[d].dialogs[0].error.is_empty());
+            click(&mut s, "action:ok");
+            assert_eq!(
+                s.windows.len(),
+                3,
+                "a conflicting shortcut must not be saved"
+            );
+            click(&mut s, "action:clear");
+            assert!(s.windows[d].dialogs[0].text.is_empty());
+            assert!(s.windows[d].dialogs[0].error.is_empty());
+            click(&mut s, "capture");
+            inject(&mut s, Key::Home, ctrl);
+            inject(&mut s, Key::Return, Mods::default());
+            assert_eq!(
+                s.windows.len(),
+                2,
+                "Enter should save the recorded shortcut"
+            );
+            s.open_dialog_in(1, &req);
+            s.flush().unwrap();
+            inject(&mut s, Key::Escape, Mods::default());
+            assert_eq!(s.windows.len(), 2);
+            assert!(s.semantics(0).dump().contains("Cancelled"));
+            s.shutdown();
+        })
     }
 
     #[test]
     fn escape_cancels_a_dialog_whose_focused_field_has_a_selection() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = crate::application(
-            "Escape",
-            "dev.gossamer.gui-escape-test",
-            Log::default,
-            log_update,
-            log_view,
-        )
-        .size(640, 520)
-        .start()
-        .unwrap();
-        for req in [
-            request::color(
-                "color",
-                "Choose a color",
-                crate::style::color::Color::rgb(30, 120, 200),
-            ),
-            request::prompt("rename", "Rename", "New name", "Meeting notes.txt"),
-        ] {
-            let id = req.id();
-            crate::perform(Effect::OpenDialog(req));
-            s.flush().unwrap();
-            assert_eq!(s.dialog_ids(), vec![id.clone()]);
-            let all = if crate::input::platform_is_macos() {
-                Mods {
-                    gui: true,
-                    ..Mods::default()
-                }
-            } else {
-                Mods {
-                    ctrl: true,
-                    ..Mods::default()
-                }
-            };
-            s.press(Key::A, all).unwrap();
-            s.press(Key::Escape, Mods::default()).unwrap();
-            s.flush().unwrap();
-            assert!(s.dialog_ids().is_empty(), "{id} stayed open");
-        }
-        s.shutdown()
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::application(
+                "Escape",
+                "dev.gossamer.gui-escape-test",
+                Log::default,
+                log_update,
+                log_view,
+            )
+            .size(640, 520)
+            .start()
+            .unwrap();
+            for req in [
+                request::color(
+                    "color",
+                    "Choose a color",
+                    crate::style::color::Color::rgb(30, 120, 200),
+                ),
+                request::prompt("rename", "Rename", "New name", "Meeting notes.txt"),
+            ] {
+                let id = req.id();
+                crate::perform(Effect::OpenDialog(req));
+                s.flush().unwrap();
+                assert_eq!(s.dialog_ids(), vec![id.clone()]);
+                let all = if crate::input::platform_is_macos() {
+                    Mods {
+                        gui: true,
+                        ..Mods::default()
+                    }
+                } else {
+                    Mods {
+                        ctrl: true,
+                        ..Mods::default()
+                    }
+                };
+                s.press(Key::A, all).unwrap();
+                s.press(Key::Escape, Mods::default()).unwrap();
+                s.flush().unwrap();
+                assert!(s.dialog_ids().is_empty(), "{id} stayed open");
+            }
+            s.shutdown()
+        })
     }
 
     #[test]
     fn file_dialogs_open_in_a_window_of_their_own_sized_for_browsing() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = crate::application(
-            "Small",
-            "dev.gossamer.gui-file-window-test",
-            Log::default,
-            log_update,
-            log_view,
-        )
-        .size(300, 120)
-        .start()
-        .unwrap();
-        // Automatic choosers use the toolkit's own browser without a desktop.
-        for req in [
-            request::open_file("open", "Open", &[]),
-            request::toolkit_file(request::select_folder("folder", "Choose Folder")),
-        ] {
-            let id = req.id();
-            crate::perform(Effect::OpenDialog(req));
-            s.flush().unwrap();
-            assert_eq!(s.windows.len(), 2, "{id}");
-            let d = &s.windows[1];
-            assert_eq!(d.owner, "main");
-            let (width, height) = super::FILE_DIALOG_SIZE;
-            let theme = &d.theme;
-            assert!(
-                d.node.rect.width >= theme.px(width) - 1,
-                "{:?}",
-                d.node.rect
-            );
-            assert!(
-                d.node.rect.height >= theme.px(height) - 1,
-                "{:?}",
-                d.node.rect
-            );
-            // The dialog fills its window, which the small window could not hold.
-            assert_eq!(d.dialogs[0].node.rect.size(), d.node.rect.size());
-            assert!(d.node.rect.width > s.windows[0].node.rect.width);
-            assert!(s.blocked(0));
-            assert_eq!(s.dialog_ids(), vec![id.clone()]);
-            s.press(Key::Escape, Mods::default()).unwrap();
-            s.flush().unwrap();
-            assert_eq!(s.windows.len(), 1, "{id}");
-            assert!(!s.blocked(0));
-            assert!(s.dialog_ids().is_empty());
-        }
-        s.shutdown()
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::application(
+                "Small",
+                "dev.gossamer.gui-file-window-test",
+                Log::default,
+                log_update,
+                log_view,
+            )
+            .size(300, 120)
+            .start()
+            .unwrap();
+            // Automatic choosers use the toolkit's own browser without a desktop.
+            for req in [
+                request::open_file("open", "Open", &[]),
+                request::toolkit_file(request::select_folder("folder", "Choose Folder")),
+            ] {
+                let id = req.id();
+                crate::perform(Effect::OpenDialog(req));
+                s.flush().unwrap();
+                assert_eq!(s.windows.len(), 2, "{id}");
+                let d = &s.windows[1];
+                assert_eq!(d.owner, "main");
+                let (width, height) = super::FILE_DIALOG_SIZE;
+                let theme = &d.theme;
+                assert!(
+                    d.node.rect.width >= theme.px(width) - 1,
+                    "{:?}",
+                    d.node.rect
+                );
+                assert!(
+                    d.node.rect.height >= theme.px(height) - 1,
+                    "{:?}",
+                    d.node.rect
+                );
+                // The dialog fills its window, which the small window could not hold.
+                assert_eq!(d.dialogs[0].node.rect.size(), d.node.rect.size());
+                assert!(d.node.rect.width > s.windows[0].node.rect.width);
+                assert!(s.blocked(0));
+                assert_eq!(s.dialog_ids(), vec![id.clone()]);
+                s.press(Key::Escape, Mods::default()).unwrap();
+                s.flush().unwrap();
+                assert_eq!(s.windows.len(), 1, "{id}");
+                assert!(!s.blocked(0));
+                assert!(s.dialog_ids().is_empty());
+            }
+            s.shutdown()
+        })
     }
 
     #[test]
     fn theme_tokens_reach_every_window_and_outlast_a_theme_change() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = crate::application(
-            "Scopes",
-            "dev.gossamer.gui-dialog-scope-test",
-            Log::default,
-            log_update,
-            log_view,
-        )
-        .size(640, 480)
-        .start()
-        .unwrap();
-        let mut tokens = crate::style::ThemeTokens::standard();
-        tokens.shape.radius = 11;
-        tokens.motion.caret_blink = 700;
-        crate::perform(Effect::SetThemeTokens(tokens.clone()));
-        crate::perform(Effect::SetTheme(crate::style::ThemeKind::Dark));
-        s.flush().unwrap();
-        assert!(s.windows[0].theme.is_dark());
-        assert_eq!(s.windows[0].theme.tokens(), tokens);
-        assert!(s.focus("name").unwrap());
-        assert!(
-            s.timers
-                .iter()
-                .any(|t| t.tag == "gui:caret" && t.repeat == 700)
-        );
-        s.shutdown()
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::application(
+                "Scopes",
+                "dev.gossamer.gui-dialog-scope-test",
+                Log::default,
+                log_update,
+                log_view,
+            )
+            .size(640, 480)
+            .start()
+            .unwrap();
+            let mut tokens = crate::style::ThemeTokens::standard();
+            tokens.shape.radius = 11;
+            tokens.motion.caret_blink = 700;
+            crate::perform(Effect::SetThemeTokens(tokens.clone()));
+            crate::perform(Effect::SetTheme(crate::style::ThemeKind::Dark));
+            s.flush().unwrap();
+            assert!(s.windows[0].theme.is_dark());
+            assert_eq!(s.windows[0].theme.tokens(), tokens);
+            assert!(s.focus("name").unwrap());
+            assert!(
+                s.timers
+                    .iter()
+                    .any(|t| t.tag == "gui:caret" && t.repeat == 700)
+            );
+            s.shutdown()
+        })
     }
 
     fn prefs(
@@ -5861,70 +5877,74 @@ mod dialog_scope_tests {
 
     #[test]
     fn a_listing_worker_answers_through_the_mailbox_without_holding_up_the_session() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let folder = paths::join(&config, "listed");
-        fs::create_dir_all(paths::join(&folder, "inner")).unwrap();
-        let mut s = crate::application(
-            "Scopes",
-            "dev.gossamer.gui-dialog-scope-test",
-            Log::default,
-            log_update,
-            log_view,
-        )
-        .size(640, 480)
-        .start()
-        .unwrap();
-        s.jobs = Some(crate::services::jobs::Worker::new(s.mailbox()).unwrap());
-        crate::perform(Effect::ListDirectory(
-            crate::services::listing::ListRequest::new("probe", 7, &folder),
-        ));
-        s.flush().unwrap();
-        let mut steps = 0;
-        while !events(&s).contains("probe#7=1") && steps < 200 {
-            let _ = s.step().unwrap();
-            steps += 1;
-        }
-        s.jobs = None;
-        assert!(events(&s).contains("probe#7=1"), "{}", events(&s));
-        s.shutdown()
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let folder = paths::join(&config, "listed");
+            fs::create_dir_all(paths::join(&folder, "inner")).unwrap();
+            let mut s = crate::application(
+                "Scopes",
+                "dev.gossamer.gui-dialog-scope-test",
+                Log::default,
+                log_update,
+                log_view,
+            )
+            .size(640, 480)
+            .start()
+            .unwrap();
+            s.jobs = Some(crate::services::jobs::Worker::new(s.mailbox()).unwrap());
+            crate::perform(Effect::ListDirectory(
+                crate::services::listing::ListRequest::new("probe", 7, &folder),
+            ));
+            s.flush().unwrap();
+            let mut steps = 0;
+            while !events(&s).contains("probe#7=1") && steps < 200 {
+                let _ = s.step().unwrap();
+                steps += 1;
+            }
+            s.jobs = None;
+            assert!(events(&s).contains("probe#7=1"), "{}", events(&s));
+            s.shutdown()
+        })
     }
 
     #[test]
     fn jobs_asked_for_before_the_loop_wait_for_its_worker() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let folder = paths::join(&config, "held");
-        fs::create_dir_all(paths::join(&folder, "inner")).unwrap();
-        let mut s = crate::application(
-            "Scopes",
-            "dev.gossamer.gui-dialog-scope-test",
-            Log::default,
-            log_update,
-            log_view,
-        )
-        .size(640, 480)
-        .start()
-        .unwrap();
-        s.hold_jobs_for_run();
-        crate::perform(Effect::ListDirectory(
-            crate::services::listing::ListRequest::new("probe", 8, &folder),
-        ));
-        s.flush().unwrap();
-        assert!(!events(&s).contains("probe#8"), "{}", events(&s));
-        s.attach_worker(crate::services::jobs::Worker::new(s.mailbox()).unwrap());
-        let mut steps = 0;
-        while !events(&s).contains("probe#8=1") && steps < 200 {
-            let _ = s.step().unwrap();
-            steps += 1;
-        }
-        s.jobs = None;
-        assert!(events(&s).contains("probe#8=1"), "{}", events(&s));
-        s.shutdown()
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let folder = paths::join(&config, "held");
+            fs::create_dir_all(paths::join(&folder, "inner")).unwrap();
+            let mut s = crate::application(
+                "Scopes",
+                "dev.gossamer.gui-dialog-scope-test",
+                Log::default,
+                log_update,
+                log_view,
+            )
+            .size(640, 480)
+            .start()
+            .unwrap();
+            s.hold_jobs_for_run();
+            crate::perform(Effect::ListDirectory(
+                crate::services::listing::ListRequest::new("probe", 8, &folder),
+            ));
+            s.flush().unwrap();
+            assert!(!events(&s).contains("probe#8"), "{}", events(&s));
+            s.attach_worker(crate::services::jobs::Worker::new(s.mailbox()).unwrap());
+            let mut steps = 0;
+            while !events(&s).contains("probe#8=1") && steps < 200 {
+                let _ = s.step().unwrap();
+                steps += 1;
+            }
+            s.jobs = None;
+            assert!(events(&s).contains("probe#8=1"), "{}", events(&s));
+            s.shutdown()
+        })
     }
 
     fn wizard() -> crate::dialogs::request::DialogRequest {
@@ -5957,228 +5977,236 @@ mod dialog_scope_tests {
 
     #[test]
     fn a_checked_wizard_waits_for_the_application_and_recovers_from_a_failure() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = crate::application(
-            "Scopes",
-            "dev.gossamer.gui-dialog-scope-test",
-            Log::default,
-            log_update,
-            log_view,
-        )
-        .size(800, 640)
-        .start()
-        .unwrap();
-        crate::perform(Effect::OpenDialog(wizard()));
-        s.flush().unwrap();
-        assert!(s.click("dlg:setup:action:next").unwrap());
-        assert!(events(&s).ends_with("check setup#1 next"), "{}", events(&s));
-        let dump = s.semantics(0).dump();
-        assert!(
-            dump.contains("Checking")
-                && dump.contains("button \"Stop\"")
-                && !dump.contains("button \"Next\""),
-            "{}",
-            dump
-        );
-        // A failure is shown and the page stays for another try.
-        crate::perform(Effect::DialogChecked(
-            "setup".to_string(),
-            1,
-            "That name is taken".to_string(),
-        ));
-        s.flush().unwrap();
-        assert!(
-            s.semantics(0).dump().contains("That name is taken"),
-            "{}",
-            s.semantics(0).dump()
-        );
-        assert!(s.click("dlg:setup:action:next").unwrap());
-        assert!(s.click("dlg:setup:action:stop").unwrap());
-        assert!(
-            events(&s).ends_with("check setup#2 next; stopped setup#2"),
-            "{}",
-            events(&s)
-        );
-        // An answer to the stopped check changes nothing.
-        crate::perform(Effect::DialogChecked(
-            "setup".to_string(),
-            2,
-            "".to_string(),
-        ));
-        s.flush().unwrap();
-        assert!(
-            s.semantics(0).dump().contains("button \"Next\""),
-            "{}",
-            s.semantics(0).dump()
-        );
-        assert!(s.click("dlg:setup:action:next").unwrap());
-        crate::perform(Effect::DialogChecked(
-            "setup".to_string(),
-            3,
-            "".to_string(),
-        ));
-        s.flush().unwrap();
-        assert!(
-            s.semantics(0).dump().contains("button \"Finish\""),
-            "{}",
-            s.semantics(0).dump()
-        );
-        assert!(s.click("dlg:setup:action:finish").unwrap());
-        assert!(
-            events(&s).ends_with("check setup#4 finish"),
-            "{}",
-            events(&s)
-        );
-        crate::perform(Effect::DialogChecked(
-            "setup".to_string(),
-            4,
-            "".to_string(),
-        ));
-        s.flush().unwrap();
-        assert!(s.dialog_ids().is_empty(), "{:?}", s.dialog_ids());
-        assert!(events(&s).contains("setup=Values"), "{}", events(&s));
-        s.shutdown()
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::application(
+                "Scopes",
+                "dev.gossamer.gui-dialog-scope-test",
+                Log::default,
+                log_update,
+                log_view,
+            )
+            .size(800, 640)
+            .start()
+            .unwrap();
+            crate::perform(Effect::OpenDialog(wizard()));
+            s.flush().unwrap();
+            assert!(s.click("dlg:setup:action:next").unwrap());
+            assert!(events(&s).ends_with("check setup#1 next"), "{}", events(&s));
+            let dump = s.semantics(0).dump();
+            assert!(
+                dump.contains("Checking")
+                    && dump.contains("button \"Stop\"")
+                    && !dump.contains("button \"Next\""),
+                "{}",
+                dump
+            );
+            // A failure is shown and the page stays for another try.
+            crate::perform(Effect::DialogChecked(
+                "setup".to_string(),
+                1,
+                "That name is taken".to_string(),
+            ));
+            s.flush().unwrap();
+            assert!(
+                s.semantics(0).dump().contains("That name is taken"),
+                "{}",
+                s.semantics(0).dump()
+            );
+            assert!(s.click("dlg:setup:action:next").unwrap());
+            assert!(s.click("dlg:setup:action:stop").unwrap());
+            assert!(
+                events(&s).ends_with("check setup#2 next; stopped setup#2"),
+                "{}",
+                events(&s)
+            );
+            // An answer to the stopped check changes nothing.
+            crate::perform(Effect::DialogChecked(
+                "setup".to_string(),
+                2,
+                "".to_string(),
+            ));
+            s.flush().unwrap();
+            assert!(
+                s.semantics(0).dump().contains("button \"Next\""),
+                "{}",
+                s.semantics(0).dump()
+            );
+            assert!(s.click("dlg:setup:action:next").unwrap());
+            crate::perform(Effect::DialogChecked(
+                "setup".to_string(),
+                3,
+                "".to_string(),
+            ));
+            s.flush().unwrap();
+            assert!(
+                s.semantics(0).dump().contains("button \"Finish\""),
+                "{}",
+                s.semantics(0).dump()
+            );
+            assert!(s.click("dlg:setup:action:finish").unwrap());
+            assert!(
+                events(&s).ends_with("check setup#4 finish"),
+                "{}",
+                events(&s)
+            );
+            crate::perform(Effect::DialogChecked(
+                "setup".to_string(),
+                4,
+                "".to_string(),
+            ));
+            s.flush().unwrap();
+            assert!(s.dialog_ids().is_empty(), "{:?}", s.dialog_ids());
+            assert!(events(&s).contains("setup=Values"), "{}", events(&s));
+            s.shutdown()
+        })
     }
 
     #[test]
     fn sessions_under_test_run_without_a_display() {
-        let mut s = super::start("Headless", "dev.gossamer.gui-headless-test").unwrap();
-        let driver = windowing::video_driver();
-        s.shutdown();
-        if env::var("SDL_VIDEO_DRIVER").is_err() {
-            assert_eq!(driver, "offscreen")
-        } else {
-            assert!(!driver.is_empty())
-        }
+        crate::testing::on_ui_thread(|| {
+            let mut s = super::start("Headless", "dev.gossamer.gui-headless-test").unwrap();
+            let driver = windowing::video_driver();
+            s.shutdown();
+            if env::var("SDL_VIDEO_DRIVER").is_err() {
+                assert_eq!(driver, "offscreen")
+            } else {
+                assert!(!driver.is_empty())
+            }
+        })
     }
 
     #[test]
     fn a_modeless_dialog_leaves_its_window_usable_and_f6_moves_between_them() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = crate::application(
-            "Scopes",
-            "dev.gossamer.gui-dialog-scope-test",
-            Log::default,
-            log_update,
-            log_view,
-        )
-        .size(640, 480)
-        .start()
-        .unwrap();
-        assert!(s.focus("name").unwrap());
-        crate::perform(Effect::OpenDialogWith(
-            "".to_string(),
-            request::prompt("find", "Find", "Text", ""),
-            Modality::Modeless,
-        ));
-        s.flush().unwrap();
-        let inside = s.focused();
-        assert!(inside.starts_with("dlg:find:"), "{}", inside);
-        let dump = s.semantics(0).dump();
-        assert!(
-            dump.contains("dialog \"Find\"") && !dump.contains("[modal]"),
-            "{}",
-            dump
-        );
-        // The window's controls still take the pointer and the keyboard.
-        assert!(s.click("go").unwrap());
-        assert_eq!(s.focused(), "go");
-        // Escape outside the dialog leaves it open; F6 returns to it.
-        s.press(Key::Escape, Mods::default()).unwrap();
-        assert_eq!(s.dialog_ids(), vec!["find"]);
-        s.press(Key::F6, Mods::default()).unwrap();
-        assert_eq!(s.focused(), inside);
-        s.press(Key::F6, Mods::default()).unwrap();
-        assert_eq!(s.focused(), "go");
-        s.press(
-            Key::F6,
-            Mods {
-                shift: true,
-                ..Mods::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(s.focused(), inside);
-        // Escape inside closes it, and focus returns to where it opened from.
-        s.press(Key::Escape, Mods::default()).unwrap();
-        assert!(s.dialog_ids().is_empty(), "{:?}", s.dialog_ids());
-        assert_eq!(s.focused(), "name");
-        s.press(Key::F6, Mods::default()).unwrap();
-        assert_eq!(s.focused(), "name");
-        s.shutdown()
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::application(
+                "Scopes",
+                "dev.gossamer.gui-dialog-scope-test",
+                Log::default,
+                log_update,
+                log_view,
+            )
+            .size(640, 480)
+            .start()
+            .unwrap();
+            assert!(s.focus("name").unwrap());
+            crate::perform(Effect::OpenDialogWith(
+                "".to_string(),
+                request::prompt("find", "Find", "Text", ""),
+                Modality::Modeless,
+            ));
+            s.flush().unwrap();
+            let inside = s.focused();
+            assert!(inside.starts_with("dlg:find:"), "{}", inside);
+            let dump = s.semantics(0).dump();
+            assert!(
+                dump.contains("dialog \"Find\"") && !dump.contains("[modal]"),
+                "{}",
+                dump
+            );
+            // The window's controls still take the pointer and the keyboard.
+            assert!(s.click("go").unwrap());
+            assert_eq!(s.focused(), "go");
+            // Escape outside the dialog leaves it open; F6 returns to it.
+            s.press(Key::Escape, Mods::default()).unwrap();
+            assert_eq!(s.dialog_ids(), vec!["find"]);
+            s.press(Key::F6, Mods::default()).unwrap();
+            assert_eq!(s.focused(), inside);
+            s.press(Key::F6, Mods::default()).unwrap();
+            assert_eq!(s.focused(), "go");
+            s.press(
+                Key::F6,
+                Mods {
+                    shift: true,
+                    ..Mods::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(s.focused(), inside);
+            // Escape inside closes it, and focus returns to where it opened from.
+            s.press(Key::Escape, Mods::default()).unwrap();
+            assert!(s.dialog_ids().is_empty(), "{:?}", s.dialog_ids());
+            assert_eq!(s.focused(), "name");
+            s.press(Key::F6, Mods::default()).unwrap();
+            assert_eq!(s.focused(), "name");
+            s.shutdown()
+        })
     }
 
     #[test]
     fn a_window_modal_dialog_blocks_its_window_and_an_application_modal_one_every_window() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = crate::application(
-            "Scopes",
-            "dev.gossamer.gui-dialog-scope-test",
-            Log::default,
-            log_update,
-            log_view,
-        )
-        .windows(tools_view)
-        .size(640, 480)
-        .start()
-        .unwrap();
-        crate::perform(Effect::OpenDialog(request::info(
-            "note",
-            "Note",
-            "Window modal",
-        )));
-        s.flush().unwrap();
-        assert!(
-            !s.click("go").unwrap() || !events(&s).contains("go"),
-            "{}",
-            events(&s)
-        );
-        assert!(
-            s.semantics(0).dump().contains("[modal]"),
-            "{}",
-            s.semantics(0).dump()
-        );
-        s.close_dialog("note", &Outcome::Cancelled);
-        s.flush().unwrap();
-        crate::perform(Effect::OpenWindow {
-            key: "tools".to_string(),
-            title: "Tools".to_string(),
-            width: 200,
-            height: 120,
-        });
-        crate::perform(Effect::OpenDialogWith(
-            "tools".to_string(),
-            request::confirm(
-                "ask",
-                "Replace file?",
-                "A file with this name already exists.",
-                "Replace",
-                true,
-            ),
-            Modality::Application,
-        ));
-        s.flush().unwrap();
-        // Nothing in the main window reacts while the tools window asks.
-        let before = events(&s);
-        let _ = s.click("go").unwrap();
-        let focused = s.focused();
-        s.press(Key::Tab, Mods::default()).unwrap();
-        assert_eq!(events(&s), before);
-        assert_eq!(s.focused(), focused);
-        s.close_dialog("ask", &Outcome::Cancelled);
-        s.flush().unwrap();
-        assert!(s.click("go").unwrap());
-        assert!(events(&s).ends_with("go"), "{}", events(&s));
-        s.shutdown()
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::application(
+                "Scopes",
+                "dev.gossamer.gui-dialog-scope-test",
+                Log::default,
+                log_update,
+                log_view,
+            )
+            .windows(tools_view)
+            .size(640, 480)
+            .start()
+            .unwrap();
+            crate::perform(Effect::OpenDialog(request::info(
+                "note",
+                "Note",
+                "Window modal",
+            )));
+            s.flush().unwrap();
+            assert!(
+                !s.click("go").unwrap() || !events(&s).contains("go"),
+                "{}",
+                events(&s)
+            );
+            assert!(
+                s.semantics(0).dump().contains("[modal]"),
+                "{}",
+                s.semantics(0).dump()
+            );
+            s.close_dialog("note", &Outcome::Cancelled);
+            s.flush().unwrap();
+            crate::perform(Effect::OpenWindow {
+                key: "tools".to_string(),
+                title: "Tools".to_string(),
+                width: 200,
+                height: 120,
+            });
+            crate::perform(Effect::OpenDialogWith(
+                "tools".to_string(),
+                request::confirm(
+                    "ask",
+                    "Replace file?",
+                    "A file with this name already exists.",
+                    "Replace",
+                    true,
+                ),
+                Modality::Application,
+            ));
+            s.flush().unwrap();
+            // Nothing in the main window reacts while the tools window asks.
+            let before = events(&s);
+            let _ = s.click("go").unwrap();
+            let focused = s.focused();
+            s.press(Key::Tab, Mods::default()).unwrap();
+            assert_eq!(events(&s), before);
+            assert_eq!(s.focused(), focused);
+            s.close_dialog("ask", &Outcome::Cancelled);
+            s.flush().unwrap();
+            assert!(s.click("go").unwrap());
+            assert!(events(&s).ends_with("go"), "{}", events(&s));
+            s.shutdown()
+        })
     }
 }
 
@@ -6222,208 +6250,216 @@ mod growth_tests {
 
     #[test]
     fn a_window_shows_only_once_it_has_its_final_size_and_first_frame() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = crate::app::start("Shown", "dev.gossamer.gui-shown-test").unwrap();
-        s.set_shell(|_m| (), |_k| view(""), std::vec::Vec::new);
-        s.prepare_window("main", "Shown", 300, 120).unwrap();
-        let win = s.windows[0].native;
-        assert!(!win.is_visible());
-        let scale = s.windows[0].theme.scale;
-        let (pw, ph) = win.pixel_size();
-        assert_eq!(
-            (pw, ph),
-            (
-                (300.0 * scale).round() as i64,
-                (120.0 * scale).round() as i64
-            )
-        );
-        s.show_window("main").unwrap();
-        assert!(win.is_visible());
-        assert_eq!(s.windows[0].node.rect.width, pw);
-        s.shutdown()
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::app::start("Shown", "dev.gossamer.gui-shown-test").unwrap();
+            s.set_shell(|_m| (), |_k| view(""), std::vec::Vec::new);
+            s.prepare_window("main", "Shown", 300, 120).unwrap();
+            let win = s.windows[0].native;
+            assert!(!win.is_visible());
+            let scale = s.windows[0].theme.scale;
+            let (pw, ph) = win.pixel_size();
+            assert_eq!(
+                (pw, ph),
+                (
+                    (300.0 * scale).round() as i64,
+                    (120.0 * scale).round() as i64
+                )
+            );
+            s.show_window("main").unwrap();
+            assert!(win.is_visible());
+            assert_eq!(s.windows[0].node.rect.width, pw);
+            s.shutdown()
+        })
     }
 
     #[test]
     fn a_dismissible_window_closes_on_escape_over_its_popup_and_when_it_loses_focus() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = crate::application(
-            "Run",
-            "dev.gossamer.gui-dismiss-test",
-            String::new,
-            update,
-            |m: &String| view(m),
-        )
-        .size(400, 52)
-        .frameless()
-        .dismissible()
-        .focus("run")
-        .start()
-        .unwrap();
-        s.type_text("a").unwrap();
-        s.flush().unwrap();
-        assert!(!s.popup_owners().is_empty());
-        s.press(Key::Escape, Mods::default()).unwrap();
-        assert!(!s.step().unwrap());
-        s.shutdown();
-        let mut t = crate::application(
-            "Run",
-            "dev.gossamer.gui-dismiss-test",
-            String::new,
-            update,
-            |m: &String| view(m),
-        )
-        .size(400, 52)
-        .dismissible()
-        .focus("run")
-        .start()
-        .unwrap();
-        // Losing focus it never had keeps it; losing it after having it closes it.
-        t.set_active(false).unwrap();
-        assert_eq!(t.windows.len(), 1);
-        t.set_active(true).unwrap();
-        t.set_active(false).unwrap();
-        assert!(!t.step().unwrap());
-        t.shutdown()
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::application(
+                "Run",
+                "dev.gossamer.gui-dismiss-test",
+                String::new,
+                update,
+                |m: &String| view(m),
+            )
+            .size(400, 52)
+            .frameless()
+            .dismissible()
+            .focus("run")
+            .start()
+            .unwrap();
+            s.type_text("a").unwrap();
+            s.flush().unwrap();
+            assert!(!s.popup_owners().is_empty());
+            s.press(Key::Escape, Mods::default()).unwrap();
+            assert!(!s.step().unwrap());
+            s.shutdown();
+            let mut t = crate::application(
+                "Run",
+                "dev.gossamer.gui-dismiss-test",
+                String::new,
+                update,
+                |m: &String| view(m),
+            )
+            .size(400, 52)
+            .dismissible()
+            .focus("run")
+            .start()
+            .unwrap();
+            // Losing focus it never had keeps it; losing it after having it closes it.
+            t.set_active(false).unwrap();
+            assert_eq!(t.windows.len(), 1);
+            t.set_active(true).unwrap();
+            t.set_active(false).unwrap();
+            assert!(!t.step().unwrap());
+            t.shutdown()
+        })
     }
 
     #[test]
     fn loading_completion_keeps_the_previous_height_until_new_results_arrive() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = crate::application(
-            "Run",
-            "dev.gossamer.gui-completion-height-test",
-            String::new,
-            update,
-            |m: &String| {
-                let mut input = TextInput::new("run", m, "Run", InputKind::Line);
-                input.completion = Some(Completion::asynchronous(0));
-                Widget::input(&input).padding(8).align(0.0, 0.0)
-            },
-        )
-        .size(400, 52)
-        .grows_for_popups()
-        .focus("run")
-        .start()
-        .unwrap();
-        assert_eq!(
-            s.windows[0].node.rect.height,
-            height(&s),
-            "initial growth must relayout the first frame"
-        );
-        s.type_text("a").unwrap();
-        s.advance(1).unwrap();
-        let request = s.windows[0].states.choice("run#completion").request;
-        let items = Widget::items(&[
-            ("a".to_string(), "Alpha".to_string()),
-            ("b".to_string(), "Beta".to_string()),
-            ("c".to_string(), "Gamma".to_string()),
-            ("d".to_string(), "Delta".to_string()),
-        ]);
-        crate::perform(crate::app::effects::Effect::Complete(
-            "run".to_string(),
-            request,
-            items.clone(),
-            String::new(),
-        ));
-        s.flush().unwrap();
-        let expanded = height(&s);
-        let popup_height = s.windows[0].popups[0].request.size.height;
-        s.type_text("b").unwrap();
-        s.advance(1).unwrap();
-        let loading = s.windows[0].states.choice("run#completion");
-        assert!(loading.loading);
-        assert!(
-            loading.items.is_empty(),
-            "stale results must not be selectable"
-        );
-        assert_eq!(s.windows[0].popups[0].request.size.height, popup_height);
-        assert_eq!(
-            height(&s),
-            expanded,
-            "loading must not shrink and re-expand the window"
-        );
-        crate::perform(crate::app::effects::Effect::Complete(
-            "run".to_string(),
-            loading.request,
-            items[..1].to_vec(),
-            String::new(),
-        ));
-        s.flush().unwrap();
-        let contracted = height(&s);
-        assert!(
-            contracted < expanded,
-            "finished results may contract to their real height"
-        );
-        crate::perform(crate::app::effects::Effect::Complete(
-            "run".to_string(),
-            request,
-            items,
-            String::new(),
-        ));
-        s.flush().unwrap();
-        assert_eq!(
-            height(&s),
-            contracted,
-            "stale responses must not resize the window"
-        );
-        s.shutdown();
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::application(
+                "Run",
+                "dev.gossamer.gui-completion-height-test",
+                String::new,
+                update,
+                |m: &String| {
+                    let mut input = TextInput::new("run", m, "Run", InputKind::Line);
+                    input.completion = Some(Completion::asynchronous(0));
+                    Widget::input(&input).padding(8).align(0.0, 0.0)
+                },
+            )
+            .size(400, 52)
+            .grows_for_popups()
+            .focus("run")
+            .start()
+            .unwrap();
+            assert_eq!(
+                s.windows[0].node.rect.height,
+                height(&s),
+                "initial growth must relayout the first frame"
+            );
+            s.type_text("a").unwrap();
+            s.advance(1).unwrap();
+            let request = s.windows[0].states.choice("run#completion").request;
+            let items = Widget::items(&[
+                ("a".to_string(), "Alpha".to_string()),
+                ("b".to_string(), "Beta".to_string()),
+                ("c".to_string(), "Gamma".to_string()),
+                ("d".to_string(), "Delta".to_string()),
+            ]);
+            crate::perform(crate::app::effects::Effect::Complete(
+                "run".to_string(),
+                request,
+                items.clone(),
+                String::new(),
+            ));
+            s.flush().unwrap();
+            let expanded = height(&s);
+            let popup_height = s.windows[0].popups[0].request.size.height;
+            s.type_text("b").unwrap();
+            s.advance(1).unwrap();
+            let loading = s.windows[0].states.choice("run#completion");
+            assert!(loading.loading);
+            assert!(
+                loading.items.is_empty(),
+                "stale results must not be selectable"
+            );
+            assert_eq!(s.windows[0].popups[0].request.size.height, popup_height);
+            assert_eq!(
+                height(&s),
+                expanded,
+                "loading must not shrink and re-expand the window"
+            );
+            crate::perform(crate::app::effects::Effect::Complete(
+                "run".to_string(),
+                loading.request,
+                items[..1].to_vec(),
+                String::new(),
+            ));
+            s.flush().unwrap();
+            let contracted = height(&s);
+            assert!(
+                contracted < expanded,
+                "finished results may contract to their real height"
+            );
+            crate::perform(crate::app::effects::Effect::Complete(
+                "run".to_string(),
+                request,
+                items,
+                String::new(),
+            ));
+            s.flush().unwrap();
+            assert_eq!(
+                height(&s),
+                contracted,
+                "stale responses must not resize the window"
+            );
+            s.shutdown();
+        })
     }
 
     #[test]
     fn a_run_box_grows_for_its_proposals_and_its_error_and_shrinks_back() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = crate::application(
-            "Run",
-            "dev.gossamer.gui-growth-test",
-            String::new,
-            update,
-            |m: &String| view(m),
-        )
-        .size(400, 52)
-        .grows_for_popups()
-        .focus("run")
-        .start()
-        .unwrap();
-        let closed = height(&s);
-        s.type_text("a").unwrap();
-        s.flush().unwrap();
-        let popup = s.windows[0].popups[0].clone();
-        assert!(height(&s) > closed, "{} <= {}", height(&s), closed);
-        // The list keeps the size it asked for and ends inside the window.
-        assert_eq!(popup.rect.height, popup.request.size.height);
-        assert!(
-            popup.rect.bottom() <= height(&s),
-            "{:?} in {}",
-            popup.rect,
-            height(&s)
-        );
-        s.press(Key::Escape, Mods::default()).unwrap();
-        s.flush().unwrap();
-        assert!(s.popup_owners().is_empty());
-        assert_eq!(height(&s), closed);
-        // The field's error line below it gets room too.
-        let primary = Mods {
-            ctrl: true,
-            ..Mods::default()
-        };
-        s.press(Key::A, primary).unwrap();
-        s.type_text("zz").unwrap();
-        s.flush().unwrap();
-        assert!(s.popup_owners().is_empty());
-        assert!(height(&s) > closed, "{} <= {}", height(&s), closed);
-        s.shutdown()
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::application(
+                "Run",
+                "dev.gossamer.gui-growth-test",
+                String::new,
+                update,
+                |m: &String| view(m),
+            )
+            .size(400, 52)
+            .grows_for_popups()
+            .focus("run")
+            .start()
+            .unwrap();
+            let closed = height(&s);
+            s.type_text("a").unwrap();
+            s.flush().unwrap();
+            let popup = s.windows[0].popups[0].clone();
+            assert!(height(&s) > closed, "{} <= {}", height(&s), closed);
+            // The list keeps the size it asked for and ends inside the window.
+            assert_eq!(popup.rect.height, popup.request.size.height);
+            assert!(
+                popup.rect.bottom() <= height(&s),
+                "{:?} in {}",
+                popup.rect,
+                height(&s)
+            );
+            s.press(Key::Escape, Mods::default()).unwrap();
+            s.flush().unwrap();
+            assert!(s.popup_owners().is_empty());
+            assert_eq!(height(&s), closed);
+            // The field's error line below it gets room too.
+            let primary = Mods {
+                ctrl: true,
+                ..Mods::default()
+            };
+            s.press(Key::A, primary).unwrap();
+            s.type_text("zz").unwrap();
+            s.flush().unwrap();
+            assert!(s.popup_owners().is_empty());
+            assert!(height(&s) > closed, "{} <= {}", height(&s), closed);
+            s.shutdown()
+        })
     }
 }
 
@@ -6489,37 +6525,39 @@ mod warning_tests {
 
     #[test]
     fn duplicate_ids_and_unknown_commands_are_reported_once() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = crate::application(
-            "Warnings",
-            "dev.gossamer.gui-warning-test",
-            || 0,
-            |m, _msg: UiMsg| m,
-            view,
-        )
-        .size(300, 200)
-        .start()
-        .unwrap();
-        s.flush().unwrap();
-        s.emit(&UiMsg::Text("name".to_string(), "a".to_string()));
-        s.flush().unwrap();
-        let warnings = s
-            .log
-            .iter()
-            .filter(|l| l.starts_with("warning:"))
-            .cloned()
-            .collect::<Vec<_>>();
-        assert_eq!(
-            warnings,
-            vec![
-                "warning: window \"main\" has two widgets with the id \"name\"; give each its own id or `.key(..)`",
-                "warning: window \"main\" names the command \"app.sav\", which no command declares",
-            ]
-        );
-        s.shutdown()
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::application(
+                "Warnings",
+                "dev.gossamer.gui-warning-test",
+                || 0,
+                |m, _msg: UiMsg| m,
+                view,
+            )
+            .size(300, 200)
+            .start()
+            .unwrap();
+            s.flush().unwrap();
+            s.emit(&UiMsg::Text("name".to_string(), "a".to_string()));
+            s.flush().unwrap();
+            let warnings = s
+                .log
+                .iter()
+                .filter(|l| l.starts_with("warning:"))
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(
+                warnings,
+                vec![
+                    "warning: window \"main\" has two widgets with the id \"name\"; give each its own id or `.key(..)`",
+                    "warning: window \"main\" names the command \"app.sav\", which no command declares",
+                ]
+            );
+            s.shutdown()
+        })
     }
 }
 
@@ -6528,42 +6566,44 @@ mod retained_render_tests {
     use super::*;
     #[test]
     fn occlusion_pauses_visual_work_restore_repaints_and_low_memory_purges_layers() {
-        let config = crate::services::private_test_config();
-        let _cleanup = scopeguard::guard((), |_| crate::services::remove_test_config(&config));
-        let mut s = start("Retained tests", "dev.gossamer.retained-tests").unwrap();
-        s.set_shell(|_| {}, |_| Widget::label("Retained"), Vec::new);
-        s.open_window("main", "Retained", 320, 200).unwrap();
-        let id = s.windows[0].native.id();
-        let before = s.windows[0].frames;
-        s.timers.push(Timer {
-            deadline: s.now(),
-            window: "main".into(),
-            owner: String::new(),
-            tag: "gui:frame".into(),
-            repeat: 33,
-        });
-        s.inject(&windowing::Event::Occluded { window: id })
-            .unwrap();
-        assert_eq!(s.next_deadline(), -1);
-        s.advance(1000).unwrap();
-        assert_eq!(s.windows[0].frames, before);
-        s.inject(&windowing::Event::Restored { window: id })
-            .unwrap();
-        assert!(!s.windows[0].occluded);
-        s.inject(&windowing::Event::RedrawRequested { window: id })
-            .unwrap();
-        assert!(s.windows[0].frames > before);
-        assert!(s.rendering_stats(0).unwrap().scene_bytes > 0);
-        s.inject(&windowing::Event::LowMemory).unwrap();
-        assert_eq!(s.rendering_stats(0).unwrap().scene_bytes, 0);
-        s.set_render_budgets(0, 0, 0).unwrap();
-        s.flush().unwrap();
-        assert_eq!(s.rendering_stats(0).unwrap().layer_bytes, 0);
-        s.inject(&windowing::Event::RenderReset { window: id })
-            .unwrap();
-        s.close_window(0);
-        assert!(s.renderers.is_empty());
-        s.shutdown();
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _cleanup = scopeguard::guard((), |_| crate::services::remove_test_config(&config));
+            let mut s = start("Retained tests", "dev.gossamer.retained-tests").unwrap();
+            s.set_shell(|_| {}, |_| Widget::label("Retained"), Vec::new);
+            s.open_window("main", "Retained", 320, 200).unwrap();
+            let id = s.windows[0].native.id();
+            let before = s.windows[0].frames;
+            s.timers.push(Timer {
+                deadline: s.now(),
+                window: "main".into(),
+                owner: String::new(),
+                tag: "gui:frame".into(),
+                repeat: 33,
+            });
+            s.inject(&windowing::Event::Occluded { window: id })
+                .unwrap();
+            assert_eq!(s.next_deadline(), -1);
+            s.advance(1000).unwrap();
+            assert_eq!(s.windows[0].frames, before);
+            s.inject(&windowing::Event::Restored { window: id })
+                .unwrap();
+            assert!(!s.windows[0].occluded);
+            s.inject(&windowing::Event::RedrawRequested { window: id })
+                .unwrap();
+            assert!(s.windows[0].frames > before);
+            assert!(s.rendering_stats(0).unwrap().scene_bytes > 0);
+            s.inject(&windowing::Event::LowMemory).unwrap();
+            assert_eq!(s.rendering_stats(0).unwrap().scene_bytes, 0);
+            s.set_render_budgets(0, 0, 0).unwrap();
+            s.flush().unwrap();
+            assert_eq!(s.rendering_stats(0).unwrap().layer_bytes, 0);
+            s.inject(&windowing::Event::RenderReset { window: id })
+                .unwrap();
+            s.close_window(0);
+            assert!(s.renderers.is_empty());
+            s.shutdown();
+        })
     }
 }
 
@@ -6571,22 +6611,24 @@ mod retained_render_tests {
 mod reservation_render_tests {
     #[test]
     fn repaint_reuses_an_existing_frame_reservation_at_the_session_limit() {
-        let mut session = crate::application(
-            "Frame admission",
-            "test.frame-admission",
-            || (),
-            |_, _: crate::widgets::cx::UiMsg| (),
-            |_| crate::widgets::Widget::label("steady"),
-        )
-        .size(320, 200)
-        .start()
-        .unwrap();
-        session.flush().unwrap();
-        session
-            .set_memory_limit(session.resource_usage().total)
+        crate::testing::on_ui_thread(|| {
+            let mut session = crate::application(
+                "Frame admission",
+                "test.frame-admission",
+                || (),
+                |_, _: crate::widgets::cx::UiMsg| (),
+                |_| crate::widgets::Widget::label("steady"),
+            )
+            .size(320, 200)
+            .start()
             .unwrap();
-        session.render(0).unwrap();
-        session.shutdown();
+            session.flush().unwrap();
+            session
+                .set_memory_limit(session.resource_usage().total)
+                .unwrap();
+            session.render(0).unwrap();
+            session.shutdown();
+        })
     }
 }
 
@@ -6596,33 +6638,35 @@ mod advance_tests {
 
     #[test]
     fn advancing_the_clock_fires_a_repeating_timer_once_per_period() {
-        let config = crate::services::private_test_config();
-        let _cleanup = scopeguard::guard((), |_| crate::services::remove_test_config(&config));
-        let mut s = crate::application(
-            "Ticks",
-            "dev.gossamer.gui-advance-test",
-            || 0_i64,
-            // A handler slower than the period must not earn extra ticks.
-            |n, msg| match msg {
-                UiMsg::Timer(tag) if tag == "tick" => {
-                    std::thread::sleep(std::time::Duration::from_millis(150));
-                    n + 1
-                }
-                _ => n,
-            },
-            |n| Widget::label(&format!("ticks {n}")),
-        )
-        .size(200, 100)
-        .start()
-        .unwrap();
-        effects::perform(effects::Effect::Timer("tick".into(), 100, true));
-        s.flush().unwrap();
-        s.advance(1_000).unwrap();
-        assert!(s.semantics(0).dump().contains("ticks 10"));
-        s.advance(50).unwrap();
-        assert!(s.semantics(0).dump().contains("ticks 10"));
-        s.advance(50).unwrap();
-        assert!(s.semantics(0).dump().contains("ticks 11"));
-        s.shutdown()
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _cleanup = scopeguard::guard((), |_| crate::services::remove_test_config(&config));
+            let mut s = crate::application(
+                "Ticks",
+                "dev.gossamer.gui-advance-test",
+                || 0_i64,
+                // A handler slower than the period must not earn extra ticks.
+                |n, msg| match msg {
+                    UiMsg::Timer(tag) if tag == "tick" => {
+                        std::thread::sleep(std::time::Duration::from_millis(150));
+                        n + 1
+                    }
+                    _ => n,
+                },
+                |n| Widget::label(&format!("ticks {n}")),
+            )
+            .size(200, 100)
+            .start()
+            .unwrap();
+            effects::perform(effects::Effect::Timer("tick".into(), 100, true));
+            s.flush().unwrap();
+            s.advance(1_000).unwrap();
+            assert!(s.semantics(0).dump().contains("ticks 10"));
+            s.advance(50).unwrap();
+            assert!(s.semantics(0).dump().contains("ticks 10"));
+            s.advance(50).unwrap();
+            assert!(s.semantics(0).dump().contains("ticks 11"));
+            s.shutdown()
+        })
     }
 }

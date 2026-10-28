@@ -896,7 +896,11 @@ impl IconLookup {
                 _ => IconDirKind::Threshold,
             };
             for home in &homes {
-                let folder = paths::join(home, sub.trim());
+                // Theme directories are written with `/` on every platform.
+                let folder = sub
+                    .trim()
+                    .split('/')
+                    .fold(home.to_string(), |at, step| paths::join(&at, step));
                 let Ok(entries) = paths::read_dir(&folder) else {
                     continue;
                 };
@@ -1281,6 +1285,12 @@ mod tests {
     use crate::strext::StrExt;
     use std::fs;
 
+    // `rel`, written with `/`, under `base` in the platform's spelling.
+    fn under(base: &str, rel: &str) -> String {
+        rel.split('/')
+            .fold(base.to_string(), |at, step| paths::join(&at, step))
+    }
+
     fn named(id: &str, name: &str) -> AppEntry {
         AppEntry {
             id: id.to_string(),
@@ -1356,21 +1366,21 @@ mod tests {
             fs::create_dir_all(paths::join(&home, "apps")).unwrap();
             fs::write(paths::join(&home, "index.theme"), format!("[Icon Theme]\nDirectories=apps\nInherits={parents}\n[apps]\nSize={size}\nType=Fixed\n")).unwrap();
             fs::write(paths::join(&home, &format!("apps/{name}.svg")), "").unwrap();
-            fs::write(paths::join(&home, "apps/shared.svg"), "").unwrap();
+            fs::write(under(&home, "apps/shared.svg"), "").unwrap();
         }
         let lookup = IconLookup::for_theme(&roots, "current");
         // A current-theme icon wins even if the parent has an exact-size match.
         assert_eq!(
             lookup.find("shared", 32),
-            Some(paths::join(&roots[0], "current/apps/shared.svg"))
+            Some(under(&roots[0], "current/apps/shared.svg"))
         );
         assert_eq!(
             lookup.find("parent", 32),
-            Some(paths::join(&roots[0], "parent/apps/parent.svg"))
+            Some(under(&roots[0], "parent/apps/parent.svg"))
         );
         assert_eq!(
             lookup.find("hicolor", 32),
-            Some(paths::join(&roots[0], "hicolor/apps/hicolor.svg"))
+            Some(under(&roots[0], "hicolor/apps/hicolor.svg"))
         );
         assert!(lookup.find("missing", 32).is_none());
         let svg = paths::join(&config, "application.svg");
@@ -1394,20 +1404,20 @@ mod tests {
         }
         fs::write(paths::join(&theme, "index.theme"), "[Icon Theme]\nName=Hicolor\nDirectories=48x48/apps,scalable/apps,16x16/apps\n\n[48x48/apps]\nSize=48\nType=Threshold\n\n[scalable/apps]\nSize=128\nMinSize=1\nMaxSize=512\nType=Scalable\n\n[16x16/apps]\nSize=16\nType=Fixed").unwrap();
         let square = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 2 2\"><rect width=\"2\" height=\"2\" fill=\"#3366cc\"/></svg>";
-        fs::write(paths::join(&theme, "scalable/apps/drawn.svg"), square).unwrap();
-        fs::write(paths::join(&theme, "16x16/apps/tiny.svg"), square).unwrap();
+        fs::write(under(&theme, "scalable/apps/drawn.svg"), square).unwrap();
+        fs::write(under(&theme, "16x16/apps/tiny.svg"), square).unwrap();
         let lookup = IconLookup::in_roots(&[paths::join(&config, "icons")]);
         assert_eq!(
             lookup.find("drawn", 96),
-            Some(paths::join(&theme, "scalable/apps/drawn.svg"))
+            Some(under(&theme, "scalable/apps/drawn.svg"))
         );
         assert_eq!(
             lookup.find("drawn.svg", 96),
-            Some(paths::join(&theme, "scalable/apps/drawn.svg"))
+            Some(under(&theme, "scalable/apps/drawn.svg"))
         );
         assert_eq!(
             lookup.find("tiny", 96),
-            Some(paths::join(&theme, "16x16/apps/tiny.svg"))
+            Some(under(&theme, "16x16/apps/tiny.svg"))
         );
         assert_eq!(lookup.find("missing", 96), None);
         let Some(icon) = super::load_icon_file(&paths::join(&theme, "scalable/apps/drawn.svg"), 24)

@@ -1,4 +1,8 @@
 [env]
-# Sessions drive SDL, whose video calls must come from the main thread; libtest
-# runs tests on the main thread only when it runs them one at a time.
+# Tests share process-wide state (the configuration root, queued effects, the
+# clipboard), so they run one at a time. libtest still gives each its own
+# thread; sessions run on the one UI thread `src/testing.rs` keeps for SDL.
 RUST_TEST_THREADS = "1"
+# A failed SDL assertion aborts the test run instead of asking through a
+# message box, which nothing answers under test.
+SDL_ASSERT = "abort"

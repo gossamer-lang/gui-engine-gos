@@ -1377,52 +1377,54 @@ mod session_tests {
 
     #[test]
     fn a_filtered_picker_whose_items_all_go_keeps_its_filter() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let view = |revision: &i64| {
-            Widget::column(
-                &[
-                    Widget::select("choice", &revised_items(*revision), "", "Choose"),
-                    Widget::picker(
-                        "many",
-                        &revised_items(*revision),
-                        &["a".to_string()],
-                        true,
-                        "Many",
-                    ),
-                ],
-                4,
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let view = |revision: &i64| {
+                Widget::column(
+                    &[
+                        Widget::select("choice", &revised_items(*revision), "", "Choose"),
+                        Widget::picker(
+                            "many",
+                            &revised_items(*revision),
+                            &["a".to_string()],
+                            true,
+                            "Many",
+                        ),
+                    ],
+                    4,
+                )
+            };
+            let update = |revision: i64, msg: UiMsg| match msg {
+                UiMsg::Click(id) if id == "change" => revision + 1,
+                _ => revision,
+            };
+            let mut s = crate::application(
+                "Revised",
+                "dev.gossamer.gui-revised-test",
+                || 0,
+                update,
+                view,
             )
-        };
-        let update = |revision: i64, msg: UiMsg| match msg {
-            UiMsg::Click(id) if id == "change" => revision + 1,
-            _ => revision,
-        };
-        let mut s = crate::application(
-            "Revised",
-            "dev.gossamer.gui-revised-test",
-            || 0,
-            update,
-            view,
-        )
-        .size(420, 280)
-        .start()
-        .unwrap();
-        s.emit(&UiMsg::Click("change".to_string()));
-        s.emit(&UiMsg::Click("change".to_string()));
-        s.flush().unwrap();
-        assert!(s.focus("many").unwrap());
-        s.type_text("Dup").unwrap();
-        s.emit(&UiMsg::Click("change".to_string()));
-        s.flush().unwrap();
-        let empty = s.windows[0].states.choice("many");
-        assert_eq!(empty.filter, "Dup");
-        assert!(empty.items.is_empty());
-        s.press(Key::Down, Mods::default()).unwrap();
-        s.press(Key::Return, Mods::default()).unwrap();
-        s.shutdown()
+            .size(420, 280)
+            .start()
+            .unwrap();
+            s.emit(&UiMsg::Click("change".to_string()));
+            s.emit(&UiMsg::Click("change".to_string()));
+            s.flush().unwrap();
+            assert!(s.focus("many").unwrap());
+            s.type_text("Dup").unwrap();
+            s.emit(&UiMsg::Click("change".to_string()));
+            s.flush().unwrap();
+            let empty = s.windows[0].states.choice("many");
+            assert_eq!(empty.filter, "Dup");
+            assert!(empty.items.is_empty());
+            s.press(Key::Down, Mods::default()).unwrap();
+            s.press(Key::Return, Mods::default()).unwrap();
+            s.shutdown()
+        })
     }
 
     #[derive(Debug, Clone, Default, PartialEq)]
@@ -1514,137 +1516,145 @@ mod session_tests {
 
     #[test]
     fn a_select_browses_by_keyboard_and_rolls_back_on_escape() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = start(Picks::default());
-        assert!(s.focus("fruit").unwrap());
-        // Closed, the arrows and typeahead commit directly.
-        press(&mut s, Key::Down);
-        press(&mut s, Key::Down);
-        s.type_text("c").unwrap();
-        // Open, browsing commits nothing until Enter; Escape keeps Cherry.
-        press(&mut s, Key::Return);
-        press(&mut s, Key::Up);
-        press(&mut s, Key::Escape);
-        // Alt+Down opens; Home then Enter commits Apple and keeps focus.
-        s.press(
-            Key::Down,
-            Mods {
-                alt: true,
-                ..Mods::default()
-            },
-        )
-        .unwrap();
-        press(&mut s, Key::Home);
-        press(&mut s, Key::Return);
-        assert_eq!(s.focused(), "fruit");
-        assert_eq!(log(&s), "fruit=a fruit=b fruit=c fruit=a");
-        // Assistive technology chooses an item by pressing it.
-        s.accessible_action("fruit", "fruit#b", "press", "")
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = start(Picks::default());
+            assert!(s.focus("fruit").unwrap());
+            // Closed, the arrows and typeahead commit directly.
+            press(&mut s, Key::Down);
+            press(&mut s, Key::Down);
+            s.type_text("c").unwrap();
+            // Open, browsing commits nothing until Enter; Escape keeps Cherry.
+            press(&mut s, Key::Return);
+            press(&mut s, Key::Up);
+            press(&mut s, Key::Escape);
+            // Alt+Down opens; Home then Enter commits Apple and keeps focus.
+            s.press(
+                Key::Down,
+                Mods {
+                    alt: true,
+                    ..Mods::default()
+                },
+            )
             .unwrap();
-        assert_eq!(log(&s), "fruit=a fruit=b fruit=c fruit=a fruit=b");
-        s.shutdown()
+            press(&mut s, Key::Home);
+            press(&mut s, Key::Return);
+            assert_eq!(s.focused(), "fruit");
+            assert_eq!(log(&s), "fruit=a fruit=b fruit=c fruit=a");
+            // Assistive technology chooses an item by pressing it.
+            s.accessible_action("fruit", "fruit#b", "press", "")
+                .unwrap();
+            assert_eq!(log(&s), "fruit=a fruit=b fruit=c fruit=a fruit=b");
+            s.shutdown()
+        })
     }
 
     #[test]
     fn clicking_an_open_select_closes_it() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = start(Picks::default());
-        assert!(s.click("fruit").unwrap());
-        assert_eq!(
-            s.popup_owners()
-                .iter()
-                .map(|p| p.0.clone())
-                .collect::<Vec<_>>(),
-            vec!["fruit"]
-        );
-        assert!(s.click("fruit").unwrap());
-        assert!(s.popup_owners().is_empty(), "{:?}", s.popup_owners());
-        assert!(s.click("fruit").unwrap());
-        assert_eq!(
-            s.popup_owners()
-                .iter()
-                .map(|p| p.0.clone())
-                .collect::<Vec<_>>(),
-            vec!["fruit"]
-        );
-        s.shutdown()
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = start(Picks::default());
+            assert!(s.click("fruit").unwrap());
+            assert_eq!(
+                s.popup_owners()
+                    .iter()
+                    .map(|p| p.0.clone())
+                    .collect::<Vec<_>>(),
+                vec!["fruit"]
+            );
+            assert!(s.click("fruit").unwrap());
+            assert!(s.popup_owners().is_empty(), "{:?}", s.popup_owners());
+            assert!(s.click("fruit").unwrap());
+            assert_eq!(
+                s.popup_owners()
+                    .iter()
+                    .map(|p| p.0.clone())
+                    .collect::<Vec<_>>(),
+                vec!["fruit"]
+            );
+            s.shutdown()
+        })
     }
 
     #[test]
     fn a_multi_picker_keeps_its_selection_across_filters_and_removes_tokens() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = start(Picks::default());
-        assert!(s.focus("tags").unwrap());
-        s.type_text("ban").unwrap();
-        press(&mut s, Key::Return);
-        // Escape clears the query first; a new query keeps Banana selected.
-        press(&mut s, Key::Escape);
-        s.type_text("kiwi").unwrap();
-        press(&mut s, Key::Return);
-        press(&mut s, Key::Escape);
-        press(&mut s, Key::Escape);
-        // Closed, Backspace removes the last token; Left then Delete the first.
-        press(&mut s, Key::Backspace);
-        press(&mut s, Key::Left);
-        press(&mut s, Key::Delete);
-        assert_eq!(log(&s), "tags=banana tags=banana,kiwi tags=banana tags=");
-        // Each token is a "Remove" button assistive technology can press.
-        s.type_text("apple").unwrap();
-        press(&mut s, Key::Return);
-        press(&mut s, Key::Escape);
-        press(&mut s, Key::Escape);
-        assert!(
-            s.semantics(0).dump().contains("button \"Remove Apple\""),
-            "{}",
-            s.semantics(0).dump()
-        );
-        s.accessible_action("tags", "tags#token:apple", "press", "")
-            .unwrap();
-        assert!(log(&s).ends_with("tags=apple tags="), "{}", log(&s));
-        s.shutdown()
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = start(Picks::default());
+            assert!(s.focus("tags").unwrap());
+            s.type_text("ban").unwrap();
+            press(&mut s, Key::Return);
+            // Escape clears the query first; a new query keeps Banana selected.
+            press(&mut s, Key::Escape);
+            s.type_text("kiwi").unwrap();
+            press(&mut s, Key::Return);
+            press(&mut s, Key::Escape);
+            press(&mut s, Key::Escape);
+            // Closed, Backspace removes the last token; Left then Delete the first.
+            press(&mut s, Key::Backspace);
+            press(&mut s, Key::Left);
+            press(&mut s, Key::Delete);
+            assert_eq!(log(&s), "tags=banana tags=banana,kiwi tags=banana tags=");
+            // Each token is a "Remove" button assistive technology can press.
+            s.type_text("apple").unwrap();
+            press(&mut s, Key::Return);
+            press(&mut s, Key::Escape);
+            press(&mut s, Key::Escape);
+            assert!(
+                s.semantics(0).dump().contains("button \"Remove Apple\""),
+                "{}",
+                s.semantics(0).dump()
+            );
+            s.accessible_action("tags", "tags#token:apple", "press", "")
+                .unwrap();
+            assert!(log(&s).ends_with("tags=apple tags="), "{}", log(&s));
+            s.shutdown()
+        })
     }
 
     #[test]
     fn a_strict_combo_restores_its_item_when_left_with_other_text() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = start(Picks {
-            city: "Rome".to_string(),
-            ..Picks::default()
-        });
-        assert!(s.focus("city").unwrap());
-        s.type_text("x").unwrap();
-        press(&mut s, Key::Tab);
-        assert!(
-            s.semantics(0).dump().contains("city is Rome"),
-            "{}",
-            s.semantics(0).dump()
-        );
-        // Accepting a proposal is what a later blur restores.
-        assert!(s.focus("city").unwrap());
-        primary_select_all(&mut s);
-        s.type_text("Par").unwrap();
-        press(&mut s, Key::Down);
-        press(&mut s, Key::Return);
-        s.type_text("zz").unwrap();
-        press(&mut s, Key::Tab);
-        assert!(
-            s.semantics(0).dump().contains("city is Paris"),
-            "{}",
-            s.semantics(0).dump()
-        );
-        s.shutdown()
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = start(Picks {
+                city: "Rome".to_string(),
+                ..Picks::default()
+            });
+            assert!(s.focus("city").unwrap());
+            s.type_text("x").unwrap();
+            press(&mut s, Key::Tab);
+            assert!(
+                s.semantics(0).dump().contains("city is Rome"),
+                "{}",
+                s.semantics(0).dump()
+            );
+            // Accepting a proposal is what a later blur restores.
+            assert!(s.focus("city").unwrap());
+            primary_select_all(&mut s);
+            s.type_text("Par").unwrap();
+            press(&mut s, Key::Down);
+            press(&mut s, Key::Return);
+            s.type_text("zz").unwrap();
+            press(&mut s, Key::Tab);
+            assert!(
+                s.semantics(0).dump().contains("city is Paris"),
+                "{}",
+                s.semantics(0).dump()
+            );
+            s.shutdown()
+        })
     }
 
     #[derive(Debug, Clone, Default, PartialEq)]
@@ -1679,77 +1689,79 @@ mod session_tests {
 
     #[test]
     fn late_answers_are_dropped_and_a_failure_retries_its_query() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = crate::application(
-            "Lookup",
-            "dev.gossamer.gui-lookup-test",
-            Lookup::default,
-            lookup_update,
-            lookup_view,
-        )
-        .size(420, 320)
-        .start()
-        .unwrap();
-        assert!(s.focus("q").unwrap());
-        s.type_text("p").unwrap();
-        s.advance(10).unwrap();
-        s.type_text("a").unwrap();
-        s.advance(10).unwrap();
-        assert!(
-            s.semantics(0)
-                .dump()
-                .contains("asked [(1, \"p\"), (2, \"pa\")]"),
-            "{}",
-            s.semantics(0).dump()
-        );
-        // The answer to the newer query arrives first; the older one is late.
-        crate::perform(crate::app::effects::Effect::Complete(
-            "q".to_string(),
-            2,
-            Widget::items(&[("paris".to_string(), "Paris".to_string())]),
-            "".to_string(),
-        ));
-        crate::perform(crate::app::effects::Effect::Complete(
-            "q".to_string(),
-            1,
-            Widget::items(&[("prague".to_string(), "Prague".to_string())]),
-            "".to_string(),
-        ));
-        s.flush().unwrap();
-        press(&mut s, Key::Return);
-        assert!(
-            s.semantics(0).dump().contains("text Paris"),
-            "{}",
-            s.semantics(0).dump()
-        );
-        // Accepting cancels whatever was outstanding, so the next query is
-        // request 4. A failed answer shows its error; Enter asks again.
-        primary_select_all(&mut s);
-        s.type_text("r").unwrap();
-        s.advance(10).unwrap();
-        crate::perform(crate::app::effects::Effect::Complete(
-            "q".to_string(),
-            4,
-            vec![],
-            "offline".to_string(),
-        ));
-        s.flush().unwrap();
-        press(&mut s, Key::Return);
-        s.advance(10).unwrap();
-        assert!(
-            s.semantics(0).dump().contains("(4, \"r\"), (5, \"r\")]"),
-            "{}",
-            s.semantics(0).dump()
-        );
-        assert!(
-            s.semantics(0).dump().contains("text r"),
-            "{}",
-            s.semantics(0).dump()
-        );
-        s.shutdown()
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::application(
+                "Lookup",
+                "dev.gossamer.gui-lookup-test",
+                Lookup::default,
+                lookup_update,
+                lookup_view,
+            )
+            .size(420, 320)
+            .start()
+            .unwrap();
+            assert!(s.focus("q").unwrap());
+            s.type_text("p").unwrap();
+            s.advance(10).unwrap();
+            s.type_text("a").unwrap();
+            s.advance(10).unwrap();
+            assert!(
+                s.semantics(0)
+                    .dump()
+                    .contains("asked [(1, \"p\"), (2, \"pa\")]"),
+                "{}",
+                s.semantics(0).dump()
+            );
+            // The answer to the newer query arrives first; the older one is late.
+            crate::perform(crate::app::effects::Effect::Complete(
+                "q".to_string(),
+                2,
+                Widget::items(&[("paris".to_string(), "Paris".to_string())]),
+                "".to_string(),
+            ));
+            crate::perform(crate::app::effects::Effect::Complete(
+                "q".to_string(),
+                1,
+                Widget::items(&[("prague".to_string(), "Prague".to_string())]),
+                "".to_string(),
+            ));
+            s.flush().unwrap();
+            press(&mut s, Key::Return);
+            assert!(
+                s.semantics(0).dump().contains("text Paris"),
+                "{}",
+                s.semantics(0).dump()
+            );
+            // Accepting cancels whatever was outstanding, so the next query is
+            // request 4. A failed answer shows its error; Enter asks again.
+            primary_select_all(&mut s);
+            s.type_text("r").unwrap();
+            s.advance(10).unwrap();
+            crate::perform(crate::app::effects::Effect::Complete(
+                "q".to_string(),
+                4,
+                vec![],
+                "offline".to_string(),
+            ));
+            s.flush().unwrap();
+            press(&mut s, Key::Return);
+            s.advance(10).unwrap();
+            assert!(
+                s.semantics(0).dump().contains("(4, \"r\"), (5, \"r\")]"),
+                "{}",
+                s.semantics(0).dump()
+            );
+            assert!(
+                s.semantics(0).dump().contains("text r"),
+                "{}",
+                s.semantics(0).dump()
+            );
+            s.shutdown()
+        })
     }
 
     fn numbered(n: i64) -> Vec<crate::widgets::completion::CompletionItem> {
@@ -1765,50 +1777,54 @@ mod session_tests {
 
     #[test]
     fn an_open_select_exposes_the_rows_it_shows() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let twenty = numbered(20);
-        let view = move |m: &Picks| {
-            Widget::column(&[Widget::select("fruit", &twenty, &m.fruit, "Item")], 8).padding(8)
-        };
-        let mut s = crate::application(
-            "Rows",
-            "dev.gossamer.gui-rows-test",
-            Picks::default,
-            update,
-            view,
-        )
-        .size(420, 360)
-        .start()
-        .unwrap();
-        assert!(s.focus("fruit").unwrap());
-        press(&mut s, Key::Return);
-        let top = s.semantics(0).dump();
-        assert!(
-            top.contains("\"Item 0\"") && top.contains("1/20") && top.contains("8/20"),
-            "{}",
-            top
-        );
-        assert!(
-            !top.contains("9/20") && !top.contains("\"Item 8\""),
-            "{}",
-            top
-        );
-        press(&mut s, Key::End);
-        let bottom = s.semantics(0).dump();
-        assert!(
-            bottom.contains("\"Item 19\"") && bottom.contains("13/20") && bottom.contains("20/20"),
-            "{}",
-            bottom
-        );
-        assert!(
-            !bottom.contains("12/20") && !bottom.contains("\"Item 0\""),
-            "{}",
-            bottom
-        );
-        s.shutdown()
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let twenty = numbered(20);
+            let view = move |m: &Picks| {
+                Widget::column(&[Widget::select("fruit", &twenty, &m.fruit, "Item")], 8).padding(8)
+            };
+            let mut s = crate::application(
+                "Rows",
+                "dev.gossamer.gui-rows-test",
+                Picks::default,
+                update,
+                view,
+            )
+            .size(420, 360)
+            .start()
+            .unwrap();
+            assert!(s.focus("fruit").unwrap());
+            press(&mut s, Key::Return);
+            let top = s.semantics(0).dump();
+            assert!(
+                top.contains("\"Item 0\"") && top.contains("1/20") && top.contains("8/20"),
+                "{}",
+                top
+            );
+            assert!(
+                !top.contains("9/20") && !top.contains("\"Item 8\""),
+                "{}",
+                top
+            );
+            press(&mut s, Key::End);
+            let bottom = s.semantics(0).dump();
+            assert!(
+                bottom.contains("\"Item 19\"")
+                    && bottom.contains("13/20")
+                    && bottom.contains("20/20"),
+                "{}",
+                bottom
+            );
+            assert!(
+                !bottom.contains("12/20") && !bottom.contains("\"Item 0\""),
+                "{}",
+                bottom
+            );
+            s.shutdown()
+        })
     }
 
     #[derive(Debug, Clone, Default, PartialEq)]
@@ -1851,73 +1867,75 @@ mod session_tests {
 
     #[test]
     fn removing_an_owner_closes_its_popup_and_drops_its_answers() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = crate::application(
-            "Owner",
-            "dev.gossamer.gui-owner-test",
-            Owner::default,
-            owner_update,
-            owner_view,
-        )
-        .size(420, 360)
-        .start()
-        .unwrap();
-        assert!(s.focus("fruit").unwrap());
-        press(&mut s, Key::Return);
-        press(&mut s, Key::Down);
-        assert_eq!(
-            s.popup_owners()
-                .iter()
-                .map(|p| p.0.clone())
-                .collect::<Vec<_>>(),
-            vec!["fruit"]
-        );
-        // The select goes away while its list is open: the popup closes with
-        // it, focus leaves it, and keys reach nothing that was there.
-        s.emit(&UiMsg::Click("toggle".to_string()));
-        s.flush().unwrap();
-        assert!(s.popup_owners().is_empty(), "{:?}", s.popup_owners());
-        assert!(s.focused() != "fruit", "{}", s.focused());
-        press(&mut s, Key::Return);
-        press(&mut s, Key::Down);
-        assert_eq!(log(&s), "");
-        // Shown again, it starts closed with nothing browsed.
-        s.emit(&UiMsg::Click("toggle".to_string()));
-        s.flush().unwrap();
-        assert!(s.focus("fruit").unwrap());
-        press(&mut s, Key::Return);
-        press(&mut s, Key::Return);
-        assert_eq!(log(&s), "fruit=a");
-        // An autocomplete removed while its request is outstanding drops the
-        // late answer, and a new one asks again from nothing.
-        assert!(s.focus("q").unwrap());
-        s.type_text("p").unwrap();
-        s.advance(10).unwrap();
-        assert!(log(&s).ends_with("asked 1 p"), "{}", log(&s));
-        s.emit(&UiMsg::Click("toggle".to_string()));
-        s.flush().unwrap();
-        crate::perform(crate::app::effects::Effect::Complete(
-            "q".to_string(),
-            1,
-            Widget::items(&[("paris".to_string(), "Paris".to_string())]),
-            "".to_string(),
-        ));
-        s.flush().unwrap();
-        assert!(s.popup_owners().is_empty(), "{:?}", s.popup_owners());
-        s.emit(&UiMsg::Click("toggle".to_string()));
-        s.flush().unwrap();
-        assert!(s.focus("q").unwrap());
-        press(&mut s, Key::Down);
-        press(&mut s, Key::Return);
-        assert!(
-            !s.semantics(0).dump().contains("Paris"),
-            "{}",
-            s.semantics(0).dump()
-        );
-        s.shutdown()
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::application(
+                "Owner",
+                "dev.gossamer.gui-owner-test",
+                Owner::default,
+                owner_update,
+                owner_view,
+            )
+            .size(420, 360)
+            .start()
+            .unwrap();
+            assert!(s.focus("fruit").unwrap());
+            press(&mut s, Key::Return);
+            press(&mut s, Key::Down);
+            assert_eq!(
+                s.popup_owners()
+                    .iter()
+                    .map(|p| p.0.clone())
+                    .collect::<Vec<_>>(),
+                vec!["fruit"]
+            );
+            // The select goes away while its list is open: the popup closes with
+            // it, focus leaves it, and keys reach nothing that was there.
+            s.emit(&UiMsg::Click("toggle".to_string()));
+            s.flush().unwrap();
+            assert!(s.popup_owners().is_empty(), "{:?}", s.popup_owners());
+            assert!(s.focused() != "fruit", "{}", s.focused());
+            press(&mut s, Key::Return);
+            press(&mut s, Key::Down);
+            assert_eq!(log(&s), "");
+            // Shown again, it starts closed with nothing browsed.
+            s.emit(&UiMsg::Click("toggle".to_string()));
+            s.flush().unwrap();
+            assert!(s.focus("fruit").unwrap());
+            press(&mut s, Key::Return);
+            press(&mut s, Key::Return);
+            assert_eq!(log(&s), "fruit=a");
+            // An autocomplete removed while its request is outstanding drops the
+            // late answer, and a new one asks again from nothing.
+            assert!(s.focus("q").unwrap());
+            s.type_text("p").unwrap();
+            s.advance(10).unwrap();
+            assert!(log(&s).ends_with("asked 1 p"), "{}", log(&s));
+            s.emit(&UiMsg::Click("toggle".to_string()));
+            s.flush().unwrap();
+            crate::perform(crate::app::effects::Effect::Complete(
+                "q".to_string(),
+                1,
+                Widget::items(&[("paris".to_string(), "Paris".to_string())]),
+                "".to_string(),
+            ));
+            s.flush().unwrap();
+            assert!(s.popup_owners().is_empty(), "{:?}", s.popup_owners());
+            s.emit(&UiMsg::Click("toggle".to_string()));
+            s.flush().unwrap();
+            assert!(s.focus("q").unwrap());
+            press(&mut s, Key::Down);
+            press(&mut s, Key::Return);
+            assert!(
+                !s.semantics(0).dump().contains("Paris"),
+                "{}",
+                s.semantics(0).dump()
+            );
+            s.shutdown()
+        })
     }
 
     fn primary_select_all(s: &mut crate::Session) {

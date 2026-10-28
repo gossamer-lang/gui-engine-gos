@@ -523,97 +523,99 @@ mod session {
 
     #[test]
     fn background_exports_answer_through_the_session_and_cancel() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = crate::app::start("Print", "dev.gossamer.gui-print-test").unwrap();
-        let events = Rc::new(RefCell::new(Vec::new()));
-        let heard = events.clone();
-        s.set_shell(
-            move |m| {
-                if let crate::widgets::cx::UiMsg::Print(job, event) = m {
-                    heard.borrow_mut().push((job, event));
-                }
-            },
-            |_| crate::widgets::Widget::label("print"),
-            Vec::new,
-        );
-        s.open_window("main", "Print", 200, 100).unwrap();
-        let path = std::env::temp_dir().join(format!("gui-export-{}.pdf", std::process::id()));
-        let target = job::Target::Pdf(path.display().to_string());
-        let id = job::start(
-            job::Source::Items(paragraphs(40), PageSetup::default()),
-            "Export".into(),
-            target.clone(),
-        )
-        .unwrap();
-        let finished = |events: &[(i64, job::Event)], id: i64| {
-            events
-                .iter()
-                .any(|(j, e)| *j == id && !matches!(e, job::Event::Paginated(_)))
-        };
-        while !finished(&events.borrow(), id) {
-            s.step().unwrap();
-        }
-        let done: Vec<job::Event> = events
-            .borrow()
-            .iter()
-            .filter(|(j, _)| *j == id)
-            .map(|(_, e)| e.clone())
-            .collect();
-        assert!(
-            matches!(done[0], job::Event::Paginated(n) if n > 1),
-            "{done:?}"
-        );
-        let job::Event::Exported { bytes, .. } = &done[1] else {
-            panic!("{done:?}")
-        };
-        assert_eq!(std::fs::metadata(&path).unwrap().len() as i64, *bytes);
-        std::fs::remove_file(&path).unwrap();
-        let handle = document::open(
-            paragraphs(400),
-            PageSetup::default(),
-            crate::app::effects::current_budget(),
-        )
-        .unwrap();
-        assert!(
-            document::page_text(handle, 1)
-                .unwrap()
-                .contains("Paragraph 0")
-        );
-        // A cancelled job reports cancellation and writes nothing.
-        let id = job::start(
-            job::Source::Items(paragraphs(20_000), PageSetup::default()),
-            "Big".into(),
-            target.clone(),
-        )
-        .unwrap();
-        job::cancel(id).unwrap();
-        while !finished(&events.borrow(), id) {
-            s.step().unwrap();
-        }
-        assert!(
-            events
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::app::start("Print", "dev.gossamer.gui-print-test").unwrap();
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let heard = events.clone();
+            s.set_shell(
+                move |m| {
+                    if let crate::widgets::cx::UiMsg::Print(job, event) = m {
+                        heard.borrow_mut().push((job, event));
+                    }
+                },
+                |_| crate::widgets::Widget::label("print"),
+                Vec::new,
+            );
+            s.open_window("main", "Print", 200, 100).unwrap();
+            let path = std::env::temp_dir().join(format!("gui-export-{}.pdf", std::process::id()));
+            let target = job::Target::Pdf(path.display().to_string());
+            let id = job::start(
+                job::Source::Items(paragraphs(40), PageSetup::default()),
+                "Export".into(),
+                target.clone(),
+            )
+            .unwrap();
+            let finished = |events: &[(i64, job::Event)], id: i64| {
+                events
+                    .iter()
+                    .any(|(j, e)| *j == id && !matches!(e, job::Event::Paginated(_)))
+            };
+            while !finished(&events.borrow(), id) {
+                s.step().unwrap();
+            }
+            let done: Vec<job::Event> = events
                 .borrow()
                 .iter()
-                .any(|(j, e)| *j == id && *e == job::Event::Cancelled)
-        );
-        assert!(!path.exists());
-        assert!(job::cancel(id).is_err());
-        // An open document's pages export without laying out again.
-        let id = job::start(job::Source::Document(handle), "Doc".into(), target).unwrap();
-        while !finished(&events.borrow(), id) {
-            s.step().unwrap();
-        }
-        assert!(
-            events
-                .borrow()
-                .iter()
-                .any(|(j, e)| *j == id && matches!(e, job::Event::Exported { .. }))
-        );
-        std::fs::remove_file(&path).unwrap();
-        s.shutdown();
-        assert!(document::pages(handle).is_err());
+                .filter(|(j, _)| *j == id)
+                .map(|(_, e)| e.clone())
+                .collect();
+            assert!(
+                matches!(done[0], job::Event::Paginated(n) if n > 1),
+                "{done:?}"
+            );
+            let job::Event::Exported { bytes, .. } = &done[1] else {
+                panic!("{done:?}")
+            };
+            assert_eq!(std::fs::metadata(&path).unwrap().len() as i64, *bytes);
+            std::fs::remove_file(&path).unwrap();
+            let handle = document::open(
+                paragraphs(400),
+                PageSetup::default(),
+                crate::app::effects::current_budget(),
+            )
+            .unwrap();
+            assert!(
+                document::page_text(handle, 1)
+                    .unwrap()
+                    .contains("Paragraph 0")
+            );
+            // A cancelled job reports cancellation and writes nothing.
+            let id = job::start(
+                job::Source::Items(paragraphs(20_000), PageSetup::default()),
+                "Big".into(),
+                target.clone(),
+            )
+            .unwrap();
+            job::cancel(id).unwrap();
+            while !finished(&events.borrow(), id) {
+                s.step().unwrap();
+            }
+            assert!(
+                events
+                    .borrow()
+                    .iter()
+                    .any(|(j, e)| *j == id && *e == job::Event::Cancelled)
+            );
+            assert!(!path.exists());
+            assert!(job::cancel(id).is_err());
+            // An open document's pages export without laying out again.
+            let id = job::start(job::Source::Document(handle), "Doc".into(), target).unwrap();
+            while !finished(&events.borrow(), id) {
+                s.step().unwrap();
+            }
+            assert!(
+                events
+                    .borrow()
+                    .iter()
+                    .any(|(j, e)| *j == id && matches!(e, job::Event::Exported { .. }))
+            );
+            std::fs::remove_file(&path).unwrap();
+            s.shutdown();
+            assert!(document::pages(handle).is_err());
+        })
     }
 }

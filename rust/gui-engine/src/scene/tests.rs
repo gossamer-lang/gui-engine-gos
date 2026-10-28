@@ -303,138 +303,140 @@ mod session {
 
     #[test]
     fn pointer_and_keyboard_edit_the_scene_which_draws_as_it_exports() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = crate::app::start("Scene", "dev.gossamer.gui-scene-test").unwrap();
-        let blue = Node {
-            fill: Some(Color::rgb(0, 0, 200)),
-            ..rect("b", 200.0, 40.0, 60.0, 60.0)
-        };
-        let id = create(
-            vec![rect("a", 40.0, 40.0, 80.0, 60.0), blue],
-            crate::app::effects::current_budget(),
-        )
-        .unwrap();
-        let heard = Rc::new(RefCell::new(Vec::new()));
-        let log = heard.clone();
-        s.set_shell(
-            move |m| {
-                if let crate::widgets::cx::UiMsg::Scene(_, info) = m {
-                    log.borrow_mut().push(info);
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::app::start("Scene", "dev.gossamer.gui-scene-test").unwrap();
+            let blue = Node {
+                fill: Some(Color::rgb(0, 0, 200)),
+                ..rect("b", 200.0, 40.0, 60.0, 60.0)
+            };
+            let id = create(
+                vec![rect("a", 40.0, 40.0, 80.0, 60.0), blue],
+                crate::app::effects::current_budget(),
+            )
+            .unwrap();
+            let heard = Rc::new(RefCell::new(Vec::new()));
+            let log = heard.clone();
+            s.set_shell(
+                move |m| {
+                    if let crate::widgets::cx::UiMsg::Scene(_, info) = m {
+                        log.borrow_mut().push(info);
+                    }
+                },
+                move |_| {
+                    Widget::column(
+                        &[
+                            Widget::label("Header"),
+                            Widget::Scene(widget::View {
+                                id: "canvas".into(),
+                                scene: id,
+                                label: "Drawing".into(),
+                                width: 500,
+                                height: 300,
+                            }),
+                        ],
+                        8,
+                    )
+                    .padding(24)
+                },
+                Vec::new,
+            );
+            s.open_window("main", "Scene", 600, 420).unwrap();
+            s.step().unwrap();
+            let r = s.rect_of("canvas").unwrap();
+            let zoom = s.windows[0].theme.scale;
+            let at = |x: f64, y: f64| (r.x + (x * zoom) as i64, r.y + (y * zoom) as i64);
+            // The view draws what the export draws: the blue square's middle.
+            let (cx, cy) = at(230.0, 70.0);
+            let frame = s.capture_window(0).unwrap();
+            let pixel = &frame.pixels[((cy * frame.width + cx) * 4) as usize..][..3];
+            assert_eq!(pixel, [0, 0, 200]);
+            let ops = read(id, |sc| {
+                render::render(sc, &crate::style::Theme::light(), false)
+            })
+            .unwrap();
+            let mut canvas = crate::render::Canvas::try_new(500, 300).unwrap();
+            crate::render::display::draw(&mut canvas, &ops, 0, 0);
+            assert_eq!(
+                &canvas.pixels[((70 * 500 + 230) * 4) as usize..][..3],
+                [0, 0, 200]
+            );
+            // Click selects; Shift-click adds; dragging moves both as one step.
+            let (ax, ay) = at(60.0, 60.0);
+            s.click_at(ax, ay).unwrap();
+            let (bx, by) = at(220.0, 60.0);
+            s.click_with(
+                bx,
+                by,
+                windowing::Mods {
+                    shift: true,
+                    ..windowing::Mods::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(read(id, |sc| sc.selection.clone()).unwrap(), ["a", "b"]);
+            s.drag(ax, ay, ax + (20.0 * zoom) as i64, ay + (10.0 * zoom) as i64)
+                .unwrap();
+            let moved = read(id, |sc| (sc.nodes[0].transform.x, sc.nodes[1].transform.y)).unwrap();
+            assert!(
+                (moved.0 - 60.0).abs() < 1.0 && (moved.1 - 50.0).abs() < 1.0,
+                "{moved:?}"
+            );
+            assert_eq!(with(id, |e| Ok(e.undo.len())).unwrap(), 1);
+            // The keyboard walks objects, deletes and undoes.
+            assert!(s.focus("canvas").unwrap());
+            s.press(windowing::Key::Home, windowing::Mods::default())
+                .unwrap();
+            s.advance(2000).unwrap();
+            assert!(
+                s.spoken().iter().any(|t| t == "A, rectangle, 1 of 2"),
+                "{:?}",
+                s.spoken()
+            );
+            s.press(windowing::Key::Delete, windowing::Mods::default())
+                .unwrap();
+            assert_eq!(info_of(id).unwrap().nodes, 1);
+            s.press(
+                windowing::Key::Z,
+                windowing::Mods {
+                    ctrl: true,
+                    ..windowing::Mods::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(info_of(id).unwrap().nodes, 2);
+            assert!(heard.borrow().len() >= 4);
+            // Every object is an accessible child, with its selection.
+            let tree = s.semantics(0);
+            fn find_node<'a>(
+                n: &'a crate::accessibility::AccessNode,
+                id: &str,
+            ) -> Option<&'a crate::accessibility::AccessNode> {
+                if n.id == id {
+                    return Some(n);
                 }
-            },
-            move |_| {
-                Widget::column(
-                    &[
-                        Widget::label("Header"),
-                        Widget::Scene(widget::View {
-                            id: "canvas".into(),
-                            scene: id,
-                            label: "Drawing".into(),
-                            width: 500,
-                            height: 300,
-                        }),
-                    ],
-                    8,
-                )
-                .padding(24)
-            },
-            Vec::new,
-        );
-        s.open_window("main", "Scene", 600, 420).unwrap();
-        s.step().unwrap();
-        let r = s.rect_of("canvas").unwrap();
-        let zoom = s.windows[0].theme.scale;
-        let at = |x: f64, y: f64| (r.x + (x * zoom) as i64, r.y + (y * zoom) as i64);
-        // The view draws what the export draws: the blue square's middle.
-        let (cx, cy) = at(230.0, 70.0);
-        let frame = s.capture_window(0).unwrap();
-        let pixel = &frame.pixels[((cy * frame.width + cx) * 4) as usize..][..3];
-        assert_eq!(pixel, [0, 0, 200]);
-        let ops = read(id, |sc| {
-            render::render(sc, &crate::style::Theme::light(), false)
-        })
-        .unwrap();
-        let mut canvas = crate::render::Canvas::try_new(500, 300).unwrap();
-        crate::render::display::draw(&mut canvas, &ops, 0, 0);
-        assert_eq!(
-            &canvas.pixels[((70 * 500 + 230) * 4) as usize..][..3],
-            [0, 0, 200]
-        );
-        // Click selects; Shift-click adds; dragging moves both as one step.
-        let (ax, ay) = at(60.0, 60.0);
-        s.click_at(ax, ay).unwrap();
-        let (bx, by) = at(220.0, 60.0);
-        s.click_with(
-            bx,
-            by,
-            windowing::Mods {
-                shift: true,
-                ..windowing::Mods::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(read(id, |sc| sc.selection.clone()).unwrap(), ["a", "b"]);
-        s.drag(ax, ay, ax + (20.0 * zoom) as i64, ay + (10.0 * zoom) as i64)
-            .unwrap();
-        let moved = read(id, |sc| (sc.nodes[0].transform.x, sc.nodes[1].transform.y)).unwrap();
-        assert!(
-            (moved.0 - 60.0).abs() < 1.0 && (moved.1 - 50.0).abs() < 1.0,
-            "{moved:?}"
-        );
-        assert_eq!(with(id, |e| Ok(e.undo.len())).unwrap(), 1);
-        // The keyboard walks objects, deletes and undoes.
-        assert!(s.focus("canvas").unwrap());
-        s.press(windowing::Key::Home, windowing::Mods::default())
-            .unwrap();
-        s.advance(2000).unwrap();
-        assert!(
-            s.spoken().iter().any(|t| t == "A, rectangle, 1 of 2"),
-            "{:?}",
-            s.spoken()
-        );
-        s.press(windowing::Key::Delete, windowing::Mods::default())
-            .unwrap();
-        assert_eq!(info_of(id).unwrap().nodes, 1);
-        s.press(
-            windowing::Key::Z,
-            windowing::Mods {
-                ctrl: true,
-                ..windowing::Mods::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(info_of(id).unwrap().nodes, 2);
-        assert!(heard.borrow().len() >= 4);
-        // Every object is an accessible child, with its selection.
-        let tree = s.semantics(0);
-        fn find_node<'a>(
-            n: &'a crate::accessibility::AccessNode,
-            id: &str,
-        ) -> Option<&'a crate::accessibility::AccessNode> {
-            if n.id == id {
-                return Some(n);
+                n.children.iter().find_map(|c| find_node(c, id))
             }
-            n.children.iter().find_map(|c| find_node(c, id))
-        }
-        let canvas = find_node(&tree, "canvas").unwrap();
-        assert_eq!(canvas.children.len(), 2);
-        assert_eq!(canvas.children[1].name, "B");
-        assert!(!canvas.children[1].selected);
-        s.accessible_action("canvas", "canvas#b", "select", "")
-            .unwrap();
-        assert_eq!(read(id, |sc| sc.selection.clone()).unwrap(), ["b"]);
-        let tree = s.semantics(0);
-        assert!(find_node(&tree, "canvas#b").unwrap().selected);
-        // The wheel zooms about the pointer; dragging empty space pans.
-        s.scroll_at(r.x + 10, r.y + 10, 3.0).unwrap();
-        assert!(read(id, |sc| sc.camera.zoom).unwrap() > 1.2);
-        let (ex, ey) = at(400.0, 250.0);
-        s.drag(ex, ey, ex - 50, ey - 50).unwrap();
-        assert!(read(id, |sc| sc.camera.x).unwrap() > 0.0);
-        s.shutdown();
-        assert!(read(id, |_| ()).is_err());
+            let canvas = find_node(&tree, "canvas").unwrap();
+            assert_eq!(canvas.children.len(), 2);
+            assert_eq!(canvas.children[1].name, "B");
+            assert!(!canvas.children[1].selected);
+            s.accessible_action("canvas", "canvas#b", "select", "")
+                .unwrap();
+            assert_eq!(read(id, |sc| sc.selection.clone()).unwrap(), ["b"]);
+            let tree = s.semantics(0);
+            assert!(find_node(&tree, "canvas#b").unwrap().selected);
+            // The wheel zooms about the pointer; dragging empty space pans.
+            s.scroll_at(r.x + 10, r.y + 10, 3.0).unwrap();
+            assert!(read(id, |sc| sc.camera.zoom).unwrap() > 1.2);
+            let (ex, ey) = at(400.0, 250.0);
+            s.drag(ex, ey, ex - 50, ey - 50).unwrap();
+            assert!(read(id, |sc| sc.camera.x).unwrap() > 0.0);
+            s.shutdown();
+            assert!(read(id, |_| ()).is_err());
+        })
     }
 }

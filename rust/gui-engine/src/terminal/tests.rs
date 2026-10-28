@@ -106,104 +106,110 @@ mod session {
 
     #[test]
     fn a_real_program_runs_in_a_view_with_typed_input_events_and_cleanup() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = crate::app::start("Terminal", "dev.gossamer.gui-terminal-test").unwrap();
-        let id = create(&options(8, 40, 100), crate::app::effects::current_budget()).unwrap();
-        let events = Rc::new(RefCell::new(Vec::new()));
-        let heard = events.clone();
-        s.set_shell(
-            move |m| {
-                if let UiMsg::Terminal(_, event) = m {
-                    heard.borrow_mut().push(event);
-                }
-            },
-            move |_| Widget::Terminal(widget::View::new("term", id, "Shell")),
-            Vec::new,
-        );
-        s.open_window("main", "Terminal", 420, 240).unwrap();
-        let script = "printf '\\033]2;demo\\007ready\\r\\n'; read line; \
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::app::start("Terminal", "dev.gossamer.gui-terminal-test").unwrap();
+            let id = create(&options(8, 40, 100), crate::app::effects::current_budget()).unwrap();
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let heard = events.clone();
+            s.set_shell(
+                move |m| {
+                    if let UiMsg::Terminal(_, event) = m {
+                        heard.borrow_mut().push(event);
+                    }
+                },
+                move |_| Widget::Terminal(widget::View::new("term", id, "Shell")),
+                Vec::new,
+            );
+            s.open_window("main", "Terminal", 420, 240).unwrap();
+            let script = "printf '\\033]2;demo\\007ready\\r\\n'; read line; \
                       printf 'got:%s\\r\\n' \"$line\"; exit 3";
-        spawn(
-            id,
-            &Command {
-                program: "/bin/sh".into(),
-                args: vec!["-c".into(), script.into()],
-                ..Command::default()
-            },
-        )
-        .unwrap();
-        assert!(s.focus("term").unwrap());
-        step_until(&mut s, || snapshot(id).unwrap().text.contains("ready"));
-        // The view sized the screen to the window and told the program.
-        let sized = snapshot(id).unwrap();
-        assert!(sized.cols > 20 && sized.rows > 4, "{sized:?}");
-        s.type_text("héllo 界").unwrap();
-        s.press(windowing::Key::Return, windowing::Mods::default())
+            spawn(
+                id,
+                &Command {
+                    program: "/bin/sh".into(),
+                    args: vec!["-c".into(), script.into()],
+                    ..Command::default()
+                },
+            )
             .unwrap();
-        step_until(&mut s, || events.borrow().contains(&Event::Exited(3)));
-        assert!(events.borrow().contains(&Event::Title("demo".into())));
-        let shown = snapshot(id).unwrap();
-        assert!(shown.text.contains("got:héllo 界"), "{}", shown.text);
-        assert!(!shown.running);
-        let tree = s.semantics(0);
-        let node = find(&tree, "term").unwrap();
-        assert_eq!(node.role, crate::accessibility::Role::Terminal);
-        assert!(node.value.contains("got:héllo 界"));
-        assert_eq!(node.description, "demo");
-        assert!(node.focused);
-        s.shutdown();
-        assert!(snapshot(id).is_err());
+            assert!(s.focus("term").unwrap());
+            step_until(&mut s, || snapshot(id).unwrap().text.contains("ready"));
+            // The view sized the screen to the window and told the program.
+            let sized = snapshot(id).unwrap();
+            assert!(sized.cols > 20 && sized.rows > 4, "{sized:?}");
+            s.type_text("héllo 界").unwrap();
+            s.press(windowing::Key::Return, windowing::Mods::default())
+                .unwrap();
+            step_until(&mut s, || events.borrow().contains(&Event::Exited(3)));
+            assert!(events.borrow().contains(&Event::Title("demo".into())));
+            let shown = snapshot(id).unwrap();
+            assert!(shown.text.contains("got:héllo 界"), "{}", shown.text);
+            assert!(!shown.running);
+            let tree = s.semantics(0);
+            let node = find(&tree, "term").unwrap();
+            assert_eq!(node.role, crate::accessibility::Role::Terminal);
+            assert!(node.value.contains("got:héllo 界"));
+            assert_eq!(node.description, "demo");
+            assert!(node.focused);
+            s.shutdown();
+            assert!(snapshot(id).is_err());
+        })
     }
 
     #[test]
     fn sustained_output_stays_within_its_queues_and_the_screen_keeps_the_end() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = crate::app::start("Terminal load", "dev.gossamer.gui-terminal-load").unwrap();
-        let budget = crate::app::effects::current_budget();
-        let id = create(&options(24, 80, 500), budget.clone()).unwrap();
-        let exited = Rc::new(RefCell::new(false));
-        let heard = exited.clone();
-        s.set_shell(
-            move |m| {
-                if let UiMsg::Terminal(_, Event::Exited(0)) = m {
-                    *heard.borrow_mut() = true;
-                }
-            },
-            move |_| Widget::Terminal(widget::View::new("term", id, "Load")),
-            Vec::new,
-        );
-        s.open_window("main", "Load", 700, 420).unwrap();
-        // The window's own frames are charged once it has drawn; everything
-        // charged after that belongs to the terminal and its program.
-        let before = budget.usage().0 - snapshot(id).unwrap().reserved_bytes as usize - ENTRY_BYTES;
-        spawn(
-            id,
-            &Command {
-                program: "/bin/sh".into(),
-                args: vec![
-                    "-c".into(),
-                    "i=0; while [ $i -lt 20000 ]; do echo row-$i; i=$((i+1)); done".into(),
-                ],
-                ..Command::default()
-            },
-        )
-        .unwrap();
-        let mut peak = 0;
-        step_until(&mut s, || {
-            let shown = snapshot(id).unwrap();
-            peak = peak.max(shown.queued_output);
-            *exited.borrow()
-        });
-        assert!(peak <= transport::OUTPUT as i64);
-        assert!(snapshot(id).unwrap().text.contains("row-19999"));
-        close(id);
-        assert_eq!(budget.usage().0, before);
-        s.shutdown();
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s =
+                crate::app::start("Terminal load", "dev.gossamer.gui-terminal-load").unwrap();
+            let budget = crate::app::effects::current_budget();
+            let id = create(&options(24, 80, 500), budget.clone()).unwrap();
+            let exited = Rc::new(RefCell::new(false));
+            let heard = exited.clone();
+            s.set_shell(
+                move |m| {
+                    if let UiMsg::Terminal(_, Event::Exited(0)) = m {
+                        *heard.borrow_mut() = true;
+                    }
+                },
+                move |_| Widget::Terminal(widget::View::new("term", id, "Load")),
+                Vec::new,
+            );
+            s.open_window("main", "Load", 700, 420).unwrap();
+            // The window's own frames are charged once it has drawn; everything
+            // charged after that belongs to the terminal and its program.
+            let before =
+                budget.usage().0 - snapshot(id).unwrap().reserved_bytes as usize - ENTRY_BYTES;
+            spawn(
+                id,
+                &Command {
+                    program: "/bin/sh".into(),
+                    args: vec![
+                        "-c".into(),
+                        "i=0; while [ $i -lt 20000 ]; do echo row-$i; i=$((i+1)); done".into(),
+                    ],
+                    ..Command::default()
+                },
+            )
+            .unwrap();
+            let mut peak = 0;
+            step_until(&mut s, || {
+                let shown = snapshot(id).unwrap();
+                peak = peak.max(shown.queued_output);
+                *exited.borrow()
+            });
+            assert!(peak <= transport::OUTPUT as i64);
+            assert!(snapshot(id).unwrap().text.contains("row-19999"));
+            close(id);
+            assert_eq!(budget.usage().0, before);
+            s.shutdown();
+        })
     }
 }

@@ -1136,123 +1136,129 @@ mod session_tests {
 
     #[test]
     fn values_at_a_bound_or_unchanged_report_nothing() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = crate::application(
-            "Numbers",
-            "dev.gossamer.gui-numeric-test",
-            || Model {
-                count: 9.0,
-                low: 20.0,
-                high: 80.0,
-                angle: 75.0,
-                ..Model::default()
-            },
-            update,
-            view,
-        )
-        .size(420, 420)
-        .start()
-        .unwrap();
-        assert!(s.focus("count").unwrap());
-        press(&mut s, Key::Up);
-        press(&mut s, Key::Up);
-        press(&mut s, Key::PageUp);
-        assert!(s.focus("span").unwrap());
-        press(&mut s, Key::Left);
-        press(&mut s, Key::Left);
-        press(&mut s, Key::Left);
-        assert!(s.focus("angle").unwrap());
-        press(&mut s, Key::Right);
-        press(&mut s, Key::Right);
-        assert_eq!(log(&s), "count=10; span=10..80; span=0..80; angle=90");
-        s.shutdown()
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::application(
+                "Numbers",
+                "dev.gossamer.gui-numeric-test",
+                || Model {
+                    count: 9.0,
+                    low: 20.0,
+                    high: 80.0,
+                    angle: 75.0,
+                    ..Model::default()
+                },
+                update,
+                view,
+            )
+            .size(420, 420)
+            .start()
+            .unwrap();
+            assert!(s.focus("count").unwrap());
+            press(&mut s, Key::Up);
+            press(&mut s, Key::Up);
+            press(&mut s, Key::PageUp);
+            assert!(s.focus("span").unwrap());
+            press(&mut s, Key::Left);
+            press(&mut s, Key::Left);
+            press(&mut s, Key::Left);
+            assert!(s.focus("angle").unwrap());
+            press(&mut s, Key::Right);
+            press(&mut s, Key::Right);
+            assert_eq!(log(&s), "count=10; span=10..80; span=0..80; angle=90");
+            s.shutdown()
+        })
     }
 
     #[test]
     fn dragging_a_range_thumb_reports_each_new_value_once() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = crate::application(
-            "Numbers",
-            "dev.gossamer.gui-numeric-test",
-            || Model {
-                low: 20.0,
-                high: 80.0,
-                ..Model::default()
-            },
-            update,
-            view,
-        )
-        .size(420, 420)
-        .start()
-        .unwrap();
-        let r = s.rect_of("span").unwrap();
-        let y = r.center_y();
-        // Grab the high thumb and move a pixel at a time: values change in
-        // steps of 10, each reported once.
-        let start = r.x + r.width * 8 / 10;
-        s.press_pointer(start, y).unwrap();
-        let mut x = start;
-        while x < r.x + r.width {
-            x += 1;
-            s.move_pointer(x, y, true).unwrap()
-        }
-        s.release_pointer(x, y).unwrap();
-        let logged = log(&s);
-        let events = logged.split("; ").filter(|e| !e.is_empty());
-        let mut seen: Vec<String> = vec![];
-        for e in events {
-            assert!(
-                !seen.iter().any(|x| x == e),
-                "{} reported twice in {}",
-                e,
-                log(&s)
-            );
-            seen.push(e.to_string())
-        }
-        assert!(log(&s).ends_with("span=20..100"), "{}", log(&s));
-        s.shutdown()
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::application(
+                "Numbers",
+                "dev.gossamer.gui-numeric-test",
+                || Model {
+                    low: 20.0,
+                    high: 80.0,
+                    ..Model::default()
+                },
+                update,
+                view,
+            )
+            .size(420, 420)
+            .start()
+            .unwrap();
+            let r = s.rect_of("span").unwrap();
+            let y = r.center_y();
+            // Grab the high thumb and move a pixel at a time: values change in
+            // steps of 10, each reported once.
+            let start = r.x + r.width * 8 / 10;
+            s.press_pointer(start, y).unwrap();
+            let mut x = start;
+            while x < r.x + r.width {
+                x += 1;
+                s.move_pointer(x, y, true).unwrap()
+            }
+            s.release_pointer(x, y).unwrap();
+            let logged = log(&s);
+            let events = logged.split("; ").filter(|e| !e.is_empty());
+            let mut seen: Vec<String> = vec![];
+            for e in events {
+                assert!(
+                    !seen.iter().any(|x| x == e),
+                    "{} reported twice in {}",
+                    e,
+                    log(&s)
+                );
+                seen.push(e.to_string())
+            }
+            assert!(log(&s).ends_with("span=20..100"), "{}", log(&s));
+            s.shutdown()
+        })
     }
 
     #[test]
     fn shift_tab_moves_a_range_back_to_its_low_thumb() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = crate::application(
-            "Numbers",
-            "dev.gossamer.gui-numeric-test",
-            || Model {
-                low: 20.0,
-                high: 80.0,
-                ..Model::default()
-            },
-            update,
-            view,
-        )
-        .size(420, 420)
-        .start()
-        .unwrap();
-        assert!(s.focus("span").unwrap());
-        press(&mut s, Key::Tab);
-        press(&mut s, Key::Right);
-        s.press(
-            Key::Tab,
-            Mods {
-                shift: true,
-                ..Mods::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(s.focused(), "span");
-        press(&mut s, Key::Right);
-        assert_eq!(log(&s), "span=20..90; span=30..90");
-        s.shutdown()
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::application(
+                "Numbers",
+                "dev.gossamer.gui-numeric-test",
+                || Model {
+                    low: 20.0,
+                    high: 80.0,
+                    ..Model::default()
+                },
+                update,
+                view,
+            )
+            .size(420, 420)
+            .start()
+            .unwrap();
+            assert!(s.focus("span").unwrap());
+            press(&mut s, Key::Tab);
+            press(&mut s, Key::Right);
+            s.press(
+                Key::Tab,
+                Mods {
+                    shift: true,
+                    ..Mods::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(s.focused(), "span");
+            press(&mut s, Key::Right);
+            assert_eq!(log(&s), "span=20..90; span=30..90");
+            s.shutdown()
+        })
     }
 }

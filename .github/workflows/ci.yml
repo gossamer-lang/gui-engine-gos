@@ -61,6 +61,7 @@ jobs:
   rust:
     name: Rust (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:

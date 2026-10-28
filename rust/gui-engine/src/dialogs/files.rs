@@ -313,18 +313,15 @@ fn listed(inst: Instance, request: i64, found: &Listing) -> Instance {
 // Asks for the folders the location field's text can continue into: those
 // in the text's folder whose names start with what follows its last slash.
 fn complete_location(inst: &Instance, request: i64, query: &str) {
-    let slash = query.rfind("/").map_or(-1, |at| at as i64);
-    let folder = if slash < 0 {
-        value(inst, "directory")
-    } else if slash == 0 {
-        "/".to_string()
-    } else {
-        query.substring(0, slash).to_string()
+    // The folder keeps its trailing separator, so a root (`/`, `C:\`) stays one.
+    let (folder, prefix) = match query.rfind(std::path::is_separator) {
+        Some(at) => (query[..=at].to_string(), &query[at + 1..]),
+        None => (value(inst, "directory"), query),
     };
     let mut req = ListRequest::new(&cid(inst, "complete"), request, &folder);
     req.folders_only = true;
     req.hidden = value(inst, "hidden") == "true";
-    req.prefix = query.substring(slash + 1, query.byte_len()).to_string();
+    req.prefix = prefix.to_string();
     req.limit = 50;
     crate::perform(Effect::ListDirectory(req))
 }

@@ -419,10 +419,15 @@ mod tests {
     #[test]
     fn parse_and_label_round_trip() {
         let s = Shortcut::parse("Primary+Shift+S").unwrap();
-        assert_eq!(
-            Shortcut::parse(&s.label().replace("Ctrl", "Primary")),
-            Some(s)
-        );
+        // macOS labels draw the modifiers as symbols, which are not spellings.
+        if super::platform_is_macos() {
+            assert_eq!(s.label(), "\u{21E7}\u{2318}S");
+        } else {
+            assert_eq!(
+                Shortcut::parse(&s.label().replace("Ctrl", "Primary")),
+                Some(s)
+            );
+        }
         let chord = Shortcut::parse("Ctrl+K Ctrl+C").unwrap();
         assert!(chord.is_chord());
         assert_eq!(chord.strokes.len(), 2);

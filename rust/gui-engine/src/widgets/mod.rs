@@ -2469,109 +2469,111 @@ mod tests {
 
     #[test]
     fn every_control_shows_hover_press_focus_disabled_invalid_and_inactive_states() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = crate::application(
-            "States",
-            "dev.gossamer.gui-state-matrix",
-            || 0,
-            matrix_update,
-            matrix_view,
-        )
-        .size(480, 720)
-        .start()
-        .unwrap();
-        s.flush().unwrap();
-        let mut rest = HashMap::new();
-        for id in CONTROLS {
-            rest.insert(id, look(&mut s, id));
-        }
-        // Keyboard focus shows on every control.
-        s.press(Key::Tab, Mods::default()).unwrap();
-        for id in CONTROLS {
-            assert!(s.focus(id).unwrap(), "{} takes focus", id);
-            assert!(look(&mut s, id) != rest[id], "{}: focus does not show", id)
-        }
-        // Hover and press differ from rest and from each other; a release
-        // away from the control cancels the press.
-        for id in CONTROLS {
-            if id == "field" || id == "bad" || id == "spin" {
-                continue;
-            };
-            s.hover(1, 1).unwrap();
-            let (x, y) = target(&s, id);
-            s.hover(x, y).unwrap();
-            let hovered = look(&mut s, id);
-            s.press_pointer(x, y).unwrap();
-            let pressed = look(&mut s, id);
-            s.move_pointer(1, 1, true).unwrap();
-            s.release_pointer(1, 1).unwrap();
-            assert!(hovered != rest[id], "{}: hover does not show", id);
-            assert!(pressed != hovered, "{}: press does not show", id)
-        }
-        s.press(Key::Escape, Mods::default()).unwrap();
-        // A field marks its error beyond color: the text says what is wrong.
-        let bad = s.semantics(0).find("bad").unwrap();
-        assert!(
-            bad.invalid && bad.description == "Not a number",
-            "{} {}",
-            bad.invalid,
-            bad.description
-        );
-        let invalid = look(&mut s, "bad");
-        s.emit(&UiMsg::Click("mode:2".to_string()));
-        s.flush().unwrap();
-        assert!(
-            look(&mut s, "bad") != invalid,
-            "an invalid field looks like a valid one"
-        );
-        // An inactive window dims the selection and hides the caret.
-        assert!(s.focus("field").unwrap());
-        let primary = Mods {
-            ctrl: true,
-            ..Mods::default()
-        };
-        s.press(Key::A, primary).unwrap();
-        let active = look(&mut s, "field");
-        assert!(
-            s.semantics(0).active,
-            "the active window's node lacks the active state"
-        );
-        s.set_active(false).unwrap();
-        assert!(
-            look(&mut s, "field") != active,
-            "an inactive window paints the selection as active"
-        );
-        assert!(
-            !s.semantics(0).active,
-            "an inactive window's node keeps the active state"
-        );
-        s.set_active(true).unwrap();
-        assert!(
-            s.semantics(0).active,
-            "activation does not restore the active state"
-        );
-        // Disabled controls look different, ignore the pointer, and skip focus.
-        s.emit(&UiMsg::Click("mode:1".to_string()));
-        s.flush().unwrap();
-        for id in CONTROLS {
-            let off = look(&mut s, id);
-            assert!(off != rest[id], "{}: disabled looks enabled", id);
-            let (x, y) = target(&s, id);
-            s.hover(x, y).unwrap();
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::application(
+                "States",
+                "dev.gossamer.gui-state-matrix",
+                || 0,
+                matrix_update,
+                matrix_view,
+            )
+            .size(480, 720)
+            .start()
+            .unwrap();
+            s.flush().unwrap();
+            let mut rest = HashMap::new();
+            for id in CONTROLS {
+                rest.insert(id, look(&mut s, id));
+            }
+            // Keyboard focus shows on every control.
+            s.press(Key::Tab, Mods::default()).unwrap();
+            for id in CONTROLS {
+                assert!(s.focus(id).unwrap(), "{} takes focus", id);
+                assert!(look(&mut s, id) != rest[id], "{}: focus does not show", id)
+            }
+            // Hover and press differ from rest and from each other; a release
+            // away from the control cancels the press.
+            for id in CONTROLS {
+                if id == "field" || id == "bad" || id == "spin" {
+                    continue;
+                };
+                s.hover(1, 1).unwrap();
+                let (x, y) = target(&s, id);
+                s.hover(x, y).unwrap();
+                let hovered = look(&mut s, id);
+                s.press_pointer(x, y).unwrap();
+                let pressed = look(&mut s, id);
+                s.move_pointer(1, 1, true).unwrap();
+                s.release_pointer(1, 1).unwrap();
+                assert!(hovered != rest[id], "{}: hover does not show", id);
+                assert!(pressed != hovered, "{}: press does not show", id)
+            }
+            s.press(Key::Escape, Mods::default()).unwrap();
+            // A field marks its error beyond color: the text says what is wrong.
+            let bad = s.semantics(0).find("bad").unwrap();
             assert!(
-                look(&mut s, id) == off,
-                "{}: a disabled control shows hover",
-                id
+                bad.invalid && bad.description == "Not a number",
+                "{} {}",
+                bad.invalid,
+                bad.description
+            );
+            let invalid = look(&mut s, "bad");
+            s.emit(&UiMsg::Click("mode:2".to_string()));
+            s.flush().unwrap();
+            assert!(
+                look(&mut s, "bad") != invalid,
+                "an invalid field looks like a valid one"
+            );
+            // An inactive window dims the selection and hides the caret.
+            assert!(s.focus("field").unwrap());
+            let primary = Mods {
+                ctrl: true,
+                ..Mods::default()
+            };
+            s.press(Key::A, primary).unwrap();
+            let active = look(&mut s, "field");
+            assert!(
+                s.semantics(0).active,
+                "the active window's node lacks the active state"
+            );
+            s.set_active(false).unwrap();
+            assert!(
+                look(&mut s, "field") != active,
+                "an inactive window paints the selection as active"
             );
             assert!(
-                !s.focus(id).unwrap(),
-                "{}: a disabled control takes focus",
-                id
-            )
-        }
-        s.shutdown()
+                !s.semantics(0).active,
+                "an inactive window's node keeps the active state"
+            );
+            s.set_active(true).unwrap();
+            assert!(
+                s.semantics(0).active,
+                "activation does not restore the active state"
+            );
+            // Disabled controls look different, ignore the pointer, and skip focus.
+            s.emit(&UiMsg::Click("mode:1".to_string()));
+            s.flush().unwrap();
+            for id in CONTROLS {
+                let off = look(&mut s, id);
+                assert!(off != rest[id], "{}: disabled looks enabled", id);
+                let (x, y) = target(&s, id);
+                s.hover(x, y).unwrap();
+                assert!(
+                    look(&mut s, id) == off,
+                    "{}: a disabled control shows hover",
+                    id
+                );
+                assert!(
+                    !s.focus(id).unwrap(),
+                    "{}: a disabled control takes focus",
+                    id
+                )
+            }
+            s.shutdown()
+        })
     }
 }

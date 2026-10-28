@@ -676,105 +676,111 @@ mod tests {
 
     #[test]
     fn bounded_queue_supersedes_inflight_and_queued_work_and_cleans_up() {
-        let mut session = crate::start("Job races", "test.jobs-races").unwrap();
-        let mut inbox = Inbox::new();
-        let mail = inbox.mailbox(session.waker());
-        let shared = Arc::new(Shared::default());
-        let runner = Arc::clone(&shared);
-        let (started_tx, started_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let thread = std::thread::spawn(move || {
-            run_worker_with(&runner, &mail, |job, _| {
-                if matches!(job, Job::List(req) if req.request == 1) {
-                    started_tx.send(()).unwrap();
-                    release_rx.recv().unwrap();
-                }
-                job.failure("completed")
-            })
-        });
-        let mut worker = Worker {
-            shared,
-            thread: Some(thread),
-        };
-        let old = worker.submit(&job("owner", 1), DEFAULT_DEADLINE).unwrap();
-        started_rx.recv().unwrap();
-        let replaced = worker.submit(&job("owner", 2), DEFAULT_DEADLINE).unwrap();
-        let newest = worker.submit(&job("owner", 3), DEFAULT_DEADLINE).unwrap();
-        assert!(!old.active() && !replaced.active() && newest.active());
-        assert_eq!(worker.usage().0, 2);
-        for owner in 0..QUEUE_LIMIT - 2 {
-            worker
-                .submit(&job(&format!("other-{owner}"), 4), DEFAULT_DEADLINE)
-                .unwrap();
-        }
-        assert!(matches!(
-            worker.submit(&job("overflow", 4), DEFAULT_DEADLINE),
-            Err(SubmitError::Full)
-        ));
-        assert!(worker.usage().1 <= QUEUE_BYTE_LIMIT);
-        worker.cancel_owner("owner");
-        assert!(!newest.active());
-        release_tx.send(()).unwrap();
-        worker.shutdown();
-        assert_eq!(worker.usage(), (0, 0));
-        assert!(matches!(
-            worker.submit(&job("later", 4), DEFAULT_DEADLINE),
-            Err(SubmitError::Stopped)
-        ));
-        assert!(
-            inbox
-                .drain()
-                .iter()
-                .all(|m| !matches!(m, UiMsg::Listed(owner, _, _) if owner == "owner"))
-        );
-        session.shutdown();
+        crate::testing::on_ui_thread(|| {
+            let mut session = crate::start("Job races", "test.jobs-races").unwrap();
+            let mut inbox = Inbox::new();
+            let mail = inbox.mailbox(session.waker());
+            let shared = Arc::new(Shared::default());
+            let runner = Arc::clone(&shared);
+            let (started_tx, started_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                run_worker_with(&runner, &mail, |job, _| {
+                    if matches!(job, Job::List(req) if req.request == 1) {
+                        started_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                    }
+                    job.failure("completed")
+                })
+            });
+            let mut worker = Worker {
+                shared,
+                thread: Some(thread),
+            };
+            let old = worker.submit(&job("owner", 1), DEFAULT_DEADLINE).unwrap();
+            started_rx.recv().unwrap();
+            let replaced = worker.submit(&job("owner", 2), DEFAULT_DEADLINE).unwrap();
+            let newest = worker.submit(&job("owner", 3), DEFAULT_DEADLINE).unwrap();
+            assert!(!old.active() && !replaced.active() && newest.active());
+            assert_eq!(worker.usage().0, 2);
+            for owner in 0..QUEUE_LIMIT - 2 {
+                worker
+                    .submit(&job(&format!("other-{owner}"), 4), DEFAULT_DEADLINE)
+                    .unwrap();
+            }
+            assert!(matches!(
+                worker.submit(&job("overflow", 4), DEFAULT_DEADLINE),
+                Err(SubmitError::Full)
+            ));
+            assert!(worker.usage().1 <= QUEUE_BYTE_LIMIT);
+            worker.cancel_owner("owner");
+            assert!(!newest.active());
+            release_tx.send(()).unwrap();
+            worker.shutdown();
+            assert_eq!(worker.usage(), (0, 0));
+            assert!(matches!(
+                worker.submit(&job("later", 4), DEFAULT_DEADLINE),
+                Err(SubmitError::Stopped)
+            ));
+            assert!(
+                inbox
+                    .drain()
+                    .iter()
+                    .all(|m| !matches!(m, UiMsg::Listed(owner, _, _) if owner == "owner"))
+            );
+            session.shutdown();
+        })
     }
 
     #[test]
     fn result_already_in_mailbox_is_cancelled_when_a_new_revision_arrives() {
-        let mut session = crate::start("Stale job", "test.jobs-stale").unwrap();
-        let mut inbox = Inbox::new();
-        let mail = inbox.mailbox(session.waker());
-        let shared = Arc::new(Shared::default());
-        let runner = Arc::clone(&shared);
-        let (done_tx, done_rx) = mpsc::channel();
-        let thread = std::thread::spawn(move || {
-            run_worker_with(&runner, &mail, |job, _| {
-                done_tx.send(()).unwrap();
-                job.failure("completed")
-            })
-        });
-        let mut worker = Worker {
-            shared,
-            thread: Some(thread),
-        };
-        worker.submit(&job("owner", 1), DEFAULT_DEADLINE).unwrap();
-        done_rx.recv().unwrap();
-        // Wait for posting using a bounded deadline, independent of scheduling.
-        let until = Instant::now() + Duration::from_secs(5);
-        while inbox.usage().0 == 0 && Instant::now() < until {
-            std::thread::yield_now();
-        }
-        assert_eq!(inbox.usage().0, 1);
-        let current = worker.submit(&job("owner", 2), DEFAULT_DEADLINE).unwrap();
-        let messages = inbox.drain();
-        assert!(!messages.iter().any(|m| matches!(m, UiMsg::Listed(_, 1, _))));
-        current.cancel();
-        worker.shutdown();
-        session.shutdown();
+        crate::testing::on_ui_thread(|| {
+            let mut session = crate::start("Stale job", "test.jobs-stale").unwrap();
+            let mut inbox = Inbox::new();
+            let mail = inbox.mailbox(session.waker());
+            let shared = Arc::new(Shared::default());
+            let runner = Arc::clone(&shared);
+            let (done_tx, done_rx) = mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                run_worker_with(&runner, &mail, |job, _| {
+                    done_tx.send(()).unwrap();
+                    job.failure("completed")
+                })
+            });
+            let mut worker = Worker {
+                shared,
+                thread: Some(thread),
+            };
+            worker.submit(&job("owner", 1), DEFAULT_DEADLINE).unwrap();
+            done_rx.recv().unwrap();
+            // Wait for posting using a bounded deadline, independent of scheduling.
+            let until = Instant::now() + Duration::from_secs(5);
+            while inbox.usage().0 == 0 && Instant::now() < until {
+                std::thread::yield_now();
+            }
+            assert_eq!(inbox.usage().0, 1);
+            let current = worker.submit(&job("owner", 2), DEFAULT_DEADLINE).unwrap();
+            let messages = inbox.drain();
+            assert!(!messages.iter().any(|m| matches!(m, UiMsg::Listed(_, 1, _))));
+            current.cancel();
+            worker.shutdown();
+            session.shutdown();
+        })
     }
 
     #[test]
     fn oversized_requests_are_rejected_before_cloning() {
-        let mut session = crate::start("Job sizes", "test.jobs-sizes").unwrap();
-        let mut worker = Worker::new(session.mailbox()).unwrap();
-        assert!(matches!(
-            worker.submit(&Job::Fonts("x".repeat(JOB_BYTE_LIMIT)), DEFAULT_DEADLINE),
-            Err(SubmitError::TooLarge)
-        ));
-        assert_eq!(worker.usage(), (0, 0));
-        worker.shutdown();
-        session.shutdown();
+        crate::testing::on_ui_thread(|| {
+            let mut session = crate::start("Job sizes", "test.jobs-sizes").unwrap();
+            let mut worker = Worker::new(session.mailbox()).unwrap();
+            assert!(matches!(
+                worker.submit(&Job::Fonts("x".repeat(JOB_BYTE_LIMIT)), DEFAULT_DEADLINE),
+                Err(SubmitError::TooLarge)
+            ));
+            assert_eq!(worker.usage(), (0, 0));
+            worker.shutdown();
+            session.shutdown();
+        })
     }
 }
 
@@ -785,29 +791,31 @@ mod deadline_tests {
 
     #[test]
     fn an_expired_request_delivers_a_terminal_failure_without_running_the_provider() {
-        let mut session = crate::start("Deadline", "test.jobs-deadline").unwrap();
-        let mut inbox = Inbox::new();
-        let mail = inbox.mailbox(session.waker());
-        let shared = Arc::new(Shared::default());
-        // Queue before starting the worker so there is no timing dependency.
-        let mut worker = Worker {
-            shared: Arc::clone(&shared),
-            thread: None,
-        };
-        let request = Job::List(listing::ListRequest::new("expired", 7, "."));
-        worker.submit(&request, Duration::ZERO).unwrap();
-        worker.thread = Some(std::thread::spawn(move || {
-            run_worker_with(&shared, &mail, |_, _| panic!("expired provider ran"))
-        }));
-        let until = Instant::now() + Duration::from_secs(5);
-        while inbox.usage().0 == 0 && Instant::now() < until {
-            std::thread::yield_now();
-        }
-        assert!(
-            matches!(inbox.drain().as_slice(), [UiMsg::Listed(_, 7, result)] if result.error == "background deadline exceeded")
-        );
-        worker.shutdown();
-        session.shutdown();
+        crate::testing::on_ui_thread(|| {
+            let mut session = crate::start("Deadline", "test.jobs-deadline").unwrap();
+            let mut inbox = Inbox::new();
+            let mail = inbox.mailbox(session.waker());
+            let shared = Arc::new(Shared::default());
+            // Queue before starting the worker so there is no timing dependency.
+            let mut worker = Worker {
+                shared: Arc::clone(&shared),
+                thread: None,
+            };
+            let request = Job::List(listing::ListRequest::new("expired", 7, "."));
+            worker.submit(&request, Duration::ZERO).unwrap();
+            worker.thread = Some(std::thread::spawn(move || {
+                run_worker_with(&shared, &mail, |_, _| panic!("expired provider ran"))
+            }));
+            let until = Instant::now() + Duration::from_secs(5);
+            while inbox.usage().0 == 0 && Instant::now() < until {
+                std::thread::yield_now();
+            }
+            assert!(
+                matches!(inbox.drain().as_slice(), [UiMsg::Listed(_, 7, result)] if result.error == "background deadline exceeded")
+            );
+            worker.shutdown();
+            session.shutdown();
+        })
     }
 }
 
@@ -817,31 +825,34 @@ mod shutdown_tests {
     use crate::app::mailbox::{Inbox, PostError};
     #[test]
     fn shutdown_interrupts_a_worker_waiting_for_a_saturated_mailbox() {
-        let mut session = crate::start("Backpressure shutdown", "test.jobs-backpressure").unwrap();
-        let mut inbox = Inbox::new();
-        let mail = inbox.mailbox(session.waker());
-        let message = UiMsg::Custom("fill".into(), String::new());
-        while mail.try_post(&message).is_ok() {}
-        assert_eq!(mail.try_post(&message), Err(PostError::Full));
-        let mut worker = Worker::new(mail).unwrap();
-        let job = Job::List(listing::ListRequest::new("blocked", 1, "."));
-        worker.submit(&job, DEFAULT_DEADLINE).unwrap();
-        let until = Instant::now() + Duration::from_secs(5);
-        while worker.shared.state.lock().active.is_none() && Instant::now() < until {
-            std::thread::yield_now();
-        }
-        assert!(worker.shared.state.lock().active.is_some());
-        let start = Instant::now();
-        worker.shutdown();
-        assert!(start.elapsed() < Duration::from_secs(5));
-        assert_eq!(worker.usage(), (0, 0));
-        assert!(
-            !inbox
-                .drain()
-                .iter()
-                .any(|m| matches!(m, UiMsg::Listed(owner, _, _) if owner == "blocked"))
-        );
-        session.shutdown();
+        crate::testing::on_ui_thread(|| {
+            let mut session =
+                crate::start("Backpressure shutdown", "test.jobs-backpressure").unwrap();
+            let mut inbox = Inbox::new();
+            let mail = inbox.mailbox(session.waker());
+            let message = UiMsg::Custom("fill".into(), String::new());
+            while mail.try_post(&message).is_ok() {}
+            assert_eq!(mail.try_post(&message), Err(PostError::Full));
+            let mut worker = Worker::new(mail).unwrap();
+            let job = Job::List(listing::ListRequest::new("blocked", 1, "."));
+            worker.submit(&job, DEFAULT_DEADLINE).unwrap();
+            let until = Instant::now() + Duration::from_secs(5);
+            while worker.shared.state.lock().active.is_none() && Instant::now() < until {
+                std::thread::yield_now();
+            }
+            assert!(worker.shared.state.lock().active.is_some());
+            let start = Instant::now();
+            worker.shutdown();
+            assert!(start.elapsed() < Duration::from_secs(5));
+            assert_eq!(worker.usage(), (0, 0));
+            assert!(
+                !inbox
+                    .drain()
+                    .iter()
+                    .any(|m| matches!(m, UiMsg::Listed(owner, _, _) if owner == "blocked"))
+            );
+            session.shutdown();
+        })
     }
 }
 
@@ -850,22 +861,24 @@ mod idle_tests {
     use super::*;
     #[test]
     fn empty_worker_does_no_provider_work_and_shutdown_releases_reservations() {
-        let mut session = crate::start("Idle worker", "test.jobs-idle").unwrap();
-        let budget = session.mailbox().budget();
-        let before = budget.usage().0;
-        let mut worker = Worker::new(session.mailbox()).unwrap();
-        let mut state = worker.shared.state.lock();
-        while state.parks == 0 {
-            worker.shared.idle.wait(&mut state);
-        }
-        // A worker with no requests blocks once and is never woken to poll.
-        assert_eq!(state.parks, 1);
-        assert!(state.active.is_none() && state.queue.is_empty() && state.latest.is_empty());
-        assert_eq!(state.bytes, 0);
-        drop(state);
-        worker.shutdown();
-        assert_eq!(budget.usage().0, before);
-        session.shutdown();
+        crate::testing::on_ui_thread(|| {
+            let mut session = crate::start("Idle worker", "test.jobs-idle").unwrap();
+            let budget = session.mailbox().budget();
+            let before = budget.usage().0;
+            let mut worker = Worker::new(session.mailbox()).unwrap();
+            let mut state = worker.shared.state.lock();
+            while state.parks == 0 {
+                worker.shared.idle.wait(&mut state);
+            }
+            // A worker with no requests blocks once and is never woken to poll.
+            assert_eq!(state.parks, 1);
+            assert!(state.active.is_none() && state.queue.is_empty() && state.latest.is_empty());
+            assert_eq!(state.bytes, 0);
+            drop(state);
+            worker.shutdown();
+            assert_eq!(budget.usage().0, before);
+            session.shutdown();
+        })
     }
 }
 
@@ -875,37 +888,39 @@ mod native_result_tests {
     use crate::app::mailbox::Inbox;
     #[test]
     fn cancelling_an_already_posted_native_document_releases_its_handle_and_bytes() {
-        let mut session = crate::start("Native result disposal", "test.native-result").unwrap();
-        let budget = session.mailbox().budget();
-        let mut inbox = Inbox::with_budget(budget.clone());
-        let mut worker = Worker::new(inbox.mailbox(session.waker())).unwrap();
-        let baseline = budget.usage().0;
-        let path =
-            std::env::temp_dir().join(format!("gui-native-cancel-{}.txt", std::process::id()));
-        std::fs::write(&path, "native snapshot").unwrap();
-        let cleanup = scopeguard::guard(path, |path| {
-            let _ = std::fs::remove_file(path);
-        });
-        let job = Job::Work(super::super::work::Work {
-            owner: "reader".into(),
-            request: 1,
-            revision: 0,
-            timeout_ms: 10000,
-            operation: super::super::work::Operation::ReadDocument(
-                cleanup.to_string_lossy().into_owned(),
-            ),
-        });
-        worker.submit(&job, Duration::from_secs(10)).unwrap();
-        let until = Instant::now() + Duration::from_secs(10);
-        while (inbox.usage().0 == 0 || worker.usage().0 != 0) && Instant::now() < until {
-            std::thread::yield_now();
-        }
-        assert!(inbox.usage().0 > 0);
-        assert!(budget.usage().0 > baseline);
-        worker.cancel_owner("reader");
-        assert!(inbox.drain().is_empty());
-        assert_eq!(budget.usage().0, baseline);
-        worker.shutdown();
-        session.shutdown();
+        crate::testing::on_ui_thread(|| {
+            let mut session = crate::start("Native result disposal", "test.native-result").unwrap();
+            let budget = session.mailbox().budget();
+            let mut inbox = Inbox::with_budget(budget.clone());
+            let mut worker = Worker::new(inbox.mailbox(session.waker())).unwrap();
+            let baseline = budget.usage().0;
+            let path =
+                std::env::temp_dir().join(format!("gui-native-cancel-{}.txt", std::process::id()));
+            std::fs::write(&path, "native snapshot").unwrap();
+            let cleanup = scopeguard::guard(path, |path| {
+                let _ = std::fs::remove_file(path);
+            });
+            let job = Job::Work(super::super::work::Work {
+                owner: "reader".into(),
+                request: 1,
+                revision: 0,
+                timeout_ms: 10000,
+                operation: super::super::work::Operation::ReadDocument(
+                    cleanup.to_string_lossy().into_owned(),
+                ),
+            });
+            worker.submit(&job, Duration::from_secs(10)).unwrap();
+            let until = Instant::now() + Duration::from_secs(10);
+            while (inbox.usage().0 == 0 || worker.usage().0 != 0) && Instant::now() < until {
+                std::thread::yield_now();
+            }
+            assert!(inbox.usage().0 > 0);
+            assert!(budget.usage().0 > baseline);
+            worker.cancel_owner("reader");
+            assert!(inbox.drain().is_empty());
+            assert_eq!(budget.usage().0, baseline);
+            worker.shutdown();
+            session.shutdown();
+        })
     }
 }

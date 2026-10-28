@@ -326,72 +326,78 @@ mod tests {
 
     #[test]
     fn saturation_oversize_and_closed_session_are_explicit_and_release_bytes() {
-        let mut session = crate::start("Mailbox budget", "test.mailbox-budget").unwrap();
-        let mut inbox = Inbox::new();
-        let mail = inbox.mailbox(session.waker());
-        let msg = UiMsg::Custom("owner".into(), "x".repeat(16 * 1024));
-        let mut accepted = 0;
-        while mail.try_post(&msg).is_ok() {
-            accepted += 1;
-        }
-        assert!(accepted > 0 && accepted <= MESSAGE_LIMIT);
-        assert!(inbox.usage().1 <= BYTE_LIMIT);
-        assert_eq!(mail.try_post(&msg), Err(PostError::Full));
-        assert_eq!(inbox.drain().len(), accepted);
-        assert_eq!(inbox.usage(), (0, 0));
-        assert_eq!(
-            mail.try_post(&UiMsg::Custom("owner".into(), "x".repeat(ENTRY_LIMIT))),
-            Err(PostError::TooLarge)
-        );
-        mail.try_post(&msg).unwrap();
-        inbox.close();
-        assert_eq!(inbox.usage(), (0, 0));
-        assert_eq!(mail.try_post(&msg), Err(PostError::Closed));
-        session.shutdown();
-        assert_eq!(mail.try_post(&msg), Err(PostError::Closed));
+        crate::testing::on_ui_thread(|| {
+            let mut session = crate::start("Mailbox budget", "test.mailbox-budget").unwrap();
+            let mut inbox = Inbox::new();
+            let mail = inbox.mailbox(session.waker());
+            let msg = UiMsg::Custom("owner".into(), "x".repeat(16 * 1024));
+            let mut accepted = 0;
+            while mail.try_post(&msg).is_ok() {
+                accepted += 1;
+            }
+            assert!(accepted > 0 && accepted <= MESSAGE_LIMIT);
+            assert!(inbox.usage().1 <= BYTE_LIMIT);
+            assert_eq!(mail.try_post(&msg), Err(PostError::Full));
+            assert_eq!(inbox.drain().len(), accepted);
+            assert_eq!(inbox.usage(), (0, 0));
+            assert_eq!(
+                mail.try_post(&UiMsg::Custom("owner".into(), "x".repeat(ENTRY_LIMIT))),
+                Err(PostError::TooLarge)
+            );
+            mail.try_post(&msg).unwrap();
+            inbox.close();
+            assert_eq!(inbox.usage(), (0, 0));
+            assert_eq!(mail.try_post(&msg), Err(PostError::Closed));
+            session.shutdown();
+            assert_eq!(mail.try_post(&msg), Err(PostError::Closed));
+        })
     }
 
     #[test]
     fn cancellation_after_post_rejects_the_already_queued_result() {
-        let mut session = crate::start("Mailbox race", "test.mailbox-race").unwrap();
-        let mut inbox = Inbox::new();
-        let mail = inbox.mailbox(session.waker());
-        let delivery = Delivery {
-            cancelled: Arc::new(Cancellation::default()),
-            deadline: Instant::now() + std::time::Duration::from_secs(5),
-        };
-        mail.post_guarded(&UiMsg::Custom("old".into(), "result".into()), &delivery)
-            .unwrap();
-        delivery.cancelled.cancel();
-        assert!(inbox.drain().is_empty());
-        assert_eq!(inbox.usage(), (0, 0));
-        session.shutdown();
+        crate::testing::on_ui_thread(|| {
+            let mut session = crate::start("Mailbox race", "test.mailbox-race").unwrap();
+            let mut inbox = Inbox::new();
+            let mail = inbox.mailbox(session.waker());
+            let delivery = Delivery {
+                cancelled: Arc::new(Cancellation::default()),
+                deadline: Instant::now() + std::time::Duration::from_secs(5),
+            };
+            mail.post_guarded(&UiMsg::Custom("old".into(), "result".into()), &delivery)
+                .unwrap();
+            delivery.cancelled.cancel();
+            assert!(inbox.drain().is_empty());
+            assert_eq!(inbox.usage(), (0, 0));
+            session.shutdown();
+        })
     }
 
     #[test]
     fn cancellation_wakes_a_sender_blocked_on_a_full_mailbox() {
-        let mut session = crate::start("Mailbox wake", "test.mailbox-wake").unwrap();
-        let mut inbox = Inbox::new();
-        let mail = inbox.mailbox(session.waker());
-        let msg = UiMsg::Custom("owner".into(), String::new());
-        while mail.try_post(&msg).is_ok() {}
-        let delivery = Delivery {
-            cancelled: Arc::new(Cancellation::default()),
-            deadline: Instant::now() + std::time::Duration::from_secs(3600),
-        };
-        let (started, ready) = std::sync::mpsc::channel();
-        let sender = {
-            let delivery = delivery.clone();
-            let msg = msg.clone();
-            std::thread::spawn(move || {
-                started.send(()).unwrap();
-                mail.post_guarded(&msg, &delivery)
-            })
-        };
-        ready.recv().unwrap();
-        delivery.cancelled.cancel();
-        assert_eq!(sender.join().unwrap(), Err(PostError::Closed));
-        inbox.close();
-        session.shutdown();
+        crate::testing::on_ui_thread(|| {
+            let mut session = crate::start("Mailbox wake", "test.mailbox-wake").unwrap();
+            let mut inbox = Inbox::new();
+            let mail = inbox.mailbox(session.waker());
+            let msg = UiMsg::Custom("owner".into(), String::new());
+            while mail.try_post(&msg).is_ok() {}
+            let delivery = Delivery {
+                cancelled: Arc::new(Cancellation::default()),
+                deadline: Instant::now() + std::time::Duration::from_secs(3600),
+            };
+            let (started, ready) = std::sync::mpsc::channel();
+            let sender = {
+                let delivery = delivery.clone();
+                let msg = msg.clone();
+                std::thread::spawn(move || {
+                    started.send(()).unwrap();
+                    mail.post_guarded(&msg, &delivery)
+                })
+            };
+            ready.recv().unwrap();
+            delivery.cancelled.cancel();
+            assert_eq!(sender.join().unwrap(), Err(PostError::Closed));
+            inbox.close();
+            session.shutdown();
+        })
     }
 }

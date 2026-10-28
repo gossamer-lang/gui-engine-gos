@@ -30,22 +30,29 @@ pub fn is_absolute(path: &str) -> bool {
 /// The path with `.` removed and each `..` folded into its parent, without
 /// touching the file system.
 pub fn normalize(path: &str) -> String {
-    let mut out = PathBuf::new();
+    let mut parts: Vec<Component> = vec![];
     for c in Path::new(path).components() {
         match c {
             Component::CurDir => {}
-            Component::ParentDir => {
-                if !out.pop() && !out.has_root() {
-                    out.push("..");
+            Component::ParentDir => match parts.last() {
+                Some(Component::Normal(_)) => {
+                    parts.pop();
                 }
-            }
-            other => out.push(other),
+                // A root has no parent to step up to.
+                Some(Component::RootDir) => {}
+                _ => parts.push(c),
+            },
+            other => parts.push(other),
         }
     }
-    if out.as_os_str().is_empty() {
+    if parts.is_empty() {
         return ".".to_string();
     }
-    out.to_string_lossy().into_owned()
+    parts
+        .iter()
+        .collect::<PathBuf>()
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Whether a directory exists at `path`.
@@ -122,8 +129,11 @@ mod tests {
 
     #[test]
     fn normalize_folds_parent_steps_lexically() {
-        assert_eq!(normalize("/a/./b/../c"), "/a/c");
+        let sep = std::path::MAIN_SEPARATOR_STR;
+        assert_eq!(normalize("/a/./b/../c"), format!("{sep}a{sep}c"));
+        assert_eq!(normalize("/.."), sep);
         assert_eq!(normalize("a/../.."), "..");
+        assert_eq!(normalize("../../a"), format!("..{sep}..{sep}a"));
         assert_eq!(normalize("./"), ".");
     }
 }

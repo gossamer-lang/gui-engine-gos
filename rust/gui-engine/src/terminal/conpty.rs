@@ -308,10 +308,24 @@ mod tests {
         )
         .unwrap();
         let mut output = Vec::new();
+        let mut answered = 0;
         loop {
             let got = pty.drain(OUTPUT);
             output.extend(got.bytes);
-            if got.exit.is_some() && String::from_utf8_lossy(&output).contains("conpty-native") {
+            let text = String::from_utf8_lossy(&output).into_owned();
+            // The pseudo-console inherits the cursor: it asks where the cursor
+            // is and renders nothing until the terminal answers, as a
+            // session's engine does.
+            let asked = text.matches("\x1b[6n").count();
+            for _ in answered..asked {
+                pty.write(b"\x1b[1;1R").unwrap();
+            }
+            answered = asked;
+            // Once the program has exited and the stream ended, nothing more
+            // arrives.
+            let shown = text.contains("conpty-native");
+            if got.exit.is_some() && (shown || got.eof) {
+                assert!(shown, "the program's output never arrived: {text:?}");
                 assert_eq!(got.exit, Some(Ok(7)));
                 break;
             }

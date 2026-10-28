@@ -1392,40 +1392,42 @@ mod session_tests {
 
     #[test]
     fn a_tooltip_waits_hides_on_press_and_returns_only_after_the_pointer_leaves() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = crate::application(
-            "Tips",
-            "dev.gossamer.gui-tip-test",
-            || 0,
-            |m: i64, _msg: UiMsg| m,
-            view,
-        )
-        .size(420, 320)
-        .start()
-        .unwrap();
-        let r = s.rect_of("save").unwrap();
-        let x = r.center_x();
-        let y = r.center_y();
-        s.hover(x, y).unwrap();
-        s.advance(300).unwrap();
-        assert_eq!(tips(&s), 0);
-        s.advance(400).unwrap();
-        assert_eq!(tips(&s), 1);
-        // A press hides it, and it stays hidden while the pointer stays.
-        s.click_at(x, y).unwrap();
-        assert_eq!(tips(&s), 0);
-        s.hover(x + 1, y).unwrap();
-        s.advance(1000).unwrap();
-        assert_eq!(tips(&s), 0);
-        // Leaving and coming back shows it again.
-        s.hover(x, y + 200).unwrap();
-        s.hover(x, y).unwrap();
-        s.advance(700).unwrap();
-        assert_eq!(tips(&s), 1);
-        s.shutdown()
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::application(
+                "Tips",
+                "dev.gossamer.gui-tip-test",
+                || 0,
+                |m: i64, _msg: UiMsg| m,
+                view,
+            )
+            .size(420, 320)
+            .start()
+            .unwrap();
+            let r = s.rect_of("save").unwrap();
+            let x = r.center_x();
+            let y = r.center_y();
+            s.hover(x, y).unwrap();
+            s.advance(300).unwrap();
+            assert_eq!(tips(&s), 0);
+            s.advance(400).unwrap();
+            assert_eq!(tips(&s), 1);
+            // A press hides it, and it stays hidden while the pointer stays.
+            s.click_at(x, y).unwrap();
+            assert_eq!(tips(&s), 0);
+            s.hover(x + 1, y).unwrap();
+            s.advance(1000).unwrap();
+            assert_eq!(tips(&s), 0);
+            // Leaving and coming back shows it again.
+            s.hover(x, y + 200).unwrap();
+            s.hover(x, y).unwrap();
+            s.advance(700).unwrap();
+            assert_eq!(tips(&s), 1);
+            s.shutdown()
+        })
     }
 }
 

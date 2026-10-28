@@ -1988,30 +1988,32 @@ mod tests {
 
     #[test]
     fn rows_arriving_above_a_scrolled_list_leave_what_the_reader_sees_in_place() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = crate::application(
-            "Feed",
-            "dev.gossamer.gui-feed-test",
-            || Feed {
-                items: keys(200),
-                log: crate::models::ModelLog::new(),
-            },
-            feed_update,
-            feed_view,
-        )
-        .size(480, 420)
-        .start()
-        .unwrap();
-        let r = s.rect_of("list").unwrap();
-        s.scroll_at(r.center_x(), r.center_y(), -6.0).unwrap();
-        let before = visible_rows(&s);
-        assert!(!before.contains(&"Row k0".to_string()), "{:?}", before);
-        assert!(s.click("arrive").unwrap());
-        assert_eq!(visible_rows(&s), before);
-        s.shutdown()
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::application(
+                "Feed",
+                "dev.gossamer.gui-feed-test",
+                || Feed {
+                    items: keys(200),
+                    log: crate::models::ModelLog::new(),
+                },
+                feed_update,
+                feed_view,
+            )
+            .size(480, 420)
+            .start()
+            .unwrap();
+            let r = s.rect_of("list").unwrap();
+            s.scroll_at(r.center_x(), r.center_y(), -6.0).unwrap();
+            let before = visible_rows(&s);
+            assert!(!before.contains(&"Row k0".to_string()), "{:?}", before);
+            assert!(s.click("arrive").unwrap());
+            assert_eq!(visible_rows(&s), before);
+            s.shutdown()
+        })
     }
 
     fn delegated_view(m: &str) -> crate::widgets::Widget {
@@ -2045,47 +2047,49 @@ mod tests {
 
     #[test]
     fn a_delegate_draws_row_content_while_the_row_keeps_input_and_semantics() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = crate::application(
-            "Delegates",
-            "dev.gossamer.gui-delegate-test",
-            String::new,
-            delegated_update,
-            |m: &String| delegated_view(m),
-        )
-        .size(480, 420)
-        .start()
-        .unwrap();
-        let drawn = s.capture().unwrap();
-        let names = s
-            .semantics(0)
-            .find("list")
-            .unwrap()
-            .children
-            .iter()
-            .map(|n| n.name.clone())
-            .collect::<Vec<_>>();
-        assert_eq!(names[0], "Row 0");
-        let r = s.rect_of("list").unwrap();
-        let row_h = Theme::light().row_height();
-        s.click_at(r.x + 40, r.y + row_h + row_h / 2).unwrap();
-        assert!(
-            s.semantics(0)
-                .dump()
-                .contains("listitem \"Row 1\" [focused selected"),
-            "{}",
-            s.semantics(0).dump()
-        );
-        s.emit(&UiMsg::Click("plain".to_string()));
-        s.flush().unwrap();
-        assert!(
-            s.capture().unwrap().pixels != drawn.pixels,
-            "the delegate drew nothing of its own"
-        );
-        s.shutdown()
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::application(
+                "Delegates",
+                "dev.gossamer.gui-delegate-test",
+                String::new,
+                delegated_update,
+                |m: &String| delegated_view(m),
+            )
+            .size(480, 420)
+            .start()
+            .unwrap();
+            let drawn = s.capture().unwrap();
+            let names = s
+                .semantics(0)
+                .find("list")
+                .unwrap()
+                .children
+                .iter()
+                .map(|n| n.name.clone())
+                .collect::<Vec<_>>();
+            assert_eq!(names[0], "Row 0");
+            let r = s.rect_of("list").unwrap();
+            let row_h = Theme::light().row_height();
+            s.click_at(r.x + 40, r.y + row_h + row_h / 2).unwrap();
+            assert!(
+                s.semantics(0)
+                    .dump()
+                    .contains("listitem \"Row 1\" [focused selected"),
+                "{}",
+                s.semantics(0).dump()
+            );
+            s.emit(&UiMsg::Click("plain".to_string()));
+            s.flush().unwrap();
+            assert!(
+                s.capture().unwrap().pixels != drawn.pixels,
+                "the delegate drew nothing of its own"
+            );
+            s.shutdown()
+        })
     }
 
     static HEIGHTS_ASKED: AtomicI64 = AtomicI64::new(0);
@@ -2101,29 +2105,31 @@ mod tests {
 
     #[test]
     fn variable_row_heights_are_measured_once_per_revision_not_per_frame() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = crate::application(
-            "Heights",
-            "dev.gossamer.gui-heights-test",
-            || 0,
-            |m: i64, _msg: UiMsg| m,
-            counted_view,
-        )
-        .size(480, 420)
-        .start()
-        .unwrap();
-        let _ = s.capture().unwrap();
-        let first = HEIGHTS_ASKED.load(Ordering::Relaxed);
-        assert!(first >= 20_000, "{}", first);
-        let r = s.rect_of("list").unwrap();
-        s.scroll_at(r.center_x(), r.center_y(), -3.0).unwrap();
-        let _ = s.capture().unwrap();
-        let _ = s.capture().unwrap();
-        assert_eq!(HEIGHTS_ASKED.load(Ordering::Relaxed), first);
-        s.shutdown()
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::application(
+                "Heights",
+                "dev.gossamer.gui-heights-test",
+                || 0,
+                |m: i64, _msg: UiMsg| m,
+                counted_view,
+            )
+            .size(480, 420)
+            .start()
+            .unwrap();
+            let _ = s.capture().unwrap();
+            let first = HEIGHTS_ASKED.load(Ordering::Relaxed);
+            assert!(first >= 20_000, "{}", first);
+            let r = s.rect_of("list").unwrap();
+            s.scroll_at(r.center_x(), r.center_y(), -3.0).unwrap();
+            let _ = s.capture().unwrap();
+            let _ = s.capture().unwrap();
+            assert_eq!(HEIGHTS_ASKED.load(Ordering::Relaxed), first);
+            s.shutdown()
+        })
     }
 
     #[test]

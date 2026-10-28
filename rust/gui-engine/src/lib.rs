@@ -32,6 +32,8 @@ pub mod services;
 pub mod strext;
 pub mod style;
 pub mod terminal;
+#[cfg(test)]
+pub(crate) mod testing;
 pub mod text;
 pub mod unicode;
 pub mod widgets;

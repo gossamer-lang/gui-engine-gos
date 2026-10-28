@@ -783,48 +783,51 @@ mod tests {
 
     #[test]
     fn only_the_action_under_the_pointer_shows_hover() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = crate::application(
-            "Banner test",
-            "dev.gossamer.gui-banner-test",
-            || 0,
-            |m: i64, _msg: UiMsg| m,
-            view,
-        )
-        .size(480, 200)
-        .start()
-        .unwrap();
-        let origin = s.rect_of("note").unwrap();
-        let Widget::Feedback(f) = banner(
-            "note",
-            Level::Info,
-            "Update",
-            "A new version is ready.",
-            &[
-                ("later".to_string(), "Later".to_string()),
-                ("now".to_string(), "Install".to_string()),
-            ],
-            false,
-        ) else {
-            return;
-        };
-        let (parts, _) = message_parts(&f, origin.width, &Theme::light());
-        let later = parts[2].offset(origin.x, origin.y);
-        let now = parts[3].offset(origin.x, origin.y);
-        let idle = s.capture().unwrap();
-        s.hover(now.center_x(), now.center_y()).unwrap();
-        let hovered = s.capture().unwrap();
-        assert_eq!(
-            centre(&hovered, later.x + 2, later.center_y()),
-            centre(&idle, later.x + 2, later.center_y())
-        );
-        assert!(
-            centre(&hovered, now.x + 2, now.center_y()) != centre(&idle, now.x + 2, now.center_y())
-        );
-        s.shutdown()
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::application(
+                "Banner test",
+                "dev.gossamer.gui-banner-test",
+                || 0,
+                |m: i64, _msg: UiMsg| m,
+                view,
+            )
+            .size(480, 200)
+            .start()
+            .unwrap();
+            let origin = s.rect_of("note").unwrap();
+            let Widget::Feedback(f) = banner(
+                "note",
+                Level::Info,
+                "Update",
+                "A new version is ready.",
+                &[
+                    ("later".to_string(), "Later".to_string()),
+                    ("now".to_string(), "Install".to_string()),
+                ],
+                false,
+            ) else {
+                return;
+            };
+            let (parts, _) = message_parts(&f, origin.width, &Theme::light());
+            let later = parts[2].offset(origin.x, origin.y);
+            let now = parts[3].offset(origin.x, origin.y);
+            let idle = s.capture().unwrap();
+            s.hover(now.center_x(), now.center_y()).unwrap();
+            let hovered = s.capture().unwrap();
+            assert_eq!(
+                centre(&hovered, later.x + 2, later.center_y()),
+                centre(&idle, later.x + 2, later.center_y())
+            );
+            assert!(
+                centre(&hovered, now.x + 2, now.center_y())
+                    != centre(&idle, now.x + 2, now.center_y())
+            );
+            s.shutdown()
+        })
     }
 
     #[derive(Debug, Clone, Default, PartialEq)]
@@ -894,70 +897,74 @@ mod tests {
 
     #[test]
     fn banner_actions_run_on_release_and_every_one_is_reachable_by_keyboard() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = crate::application(
-            "Banner test",
-            "dev.gossamer.gui-banner-test",
-            Log::default,
-            log_update,
-            log_view,
-        )
-        .size(560, 260)
-        .start()
-        .unwrap();
-        let details = part(&s, 3);
-        // Pressed and dragged off: nothing. Pressed and released over it: one click.
-        s.press_pointer(details.center_x(), details.center_y())
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::application(
+                "Banner test",
+                "dev.gossamer.gui-banner-test",
+                Log::default,
+                log_update,
+                log_view,
+            )
+            .size(560, 260)
+            .start()
             .unwrap();
-        assert_eq!(clicks(&s), "");
-        s.release_pointer(details.center_x(), details.center_y() + 100)
-            .unwrap();
-        s.click_at(details.center_x(), details.center_y()).unwrap();
-        // From the keyboard the arrows move between Retry, Details and Dismiss.
-        assert!(s.focus("b").unwrap());
-        s.press(windowing::Key::Return, windowing::Mods::default())
-            .unwrap();
-        s.press(windowing::Key::Right, windowing::Mods::default())
-            .unwrap();
-        s.press(windowing::Key::Space, windowing::Mods::default())
-            .unwrap();
-        s.press(windowing::Key::Right, windowing::Mods::default())
-            .unwrap();
-        s.press(windowing::Key::Return, windowing::Mods::default())
-            .unwrap();
-        assert_eq!(clicks(&s), "b:details; b:retry; b:details; b:dismiss");
-        s.shutdown()
+            let details = part(&s, 3);
+            // Pressed and dragged off: nothing. Pressed and released over it: one click.
+            s.press_pointer(details.center_x(), details.center_y())
+                .unwrap();
+            assert_eq!(clicks(&s), "");
+            s.release_pointer(details.center_x(), details.center_y() + 100)
+                .unwrap();
+            s.click_at(details.center_x(), details.center_y()).unwrap();
+            // From the keyboard the arrows move between Retry, Details and Dismiss.
+            assert!(s.focus("b").unwrap());
+            s.press(windowing::Key::Return, windowing::Mods::default())
+                .unwrap();
+            s.press(windowing::Key::Right, windowing::Mods::default())
+                .unwrap();
+            s.press(windowing::Key::Space, windowing::Mods::default())
+                .unwrap();
+            s.press(windowing::Key::Right, windowing::Mods::default())
+                .unwrap();
+            s.press(windowing::Key::Return, windowing::Mods::default())
+                .unwrap();
+            assert_eq!(clicks(&s), "b:details; b:retry; b:details; b:dismiss");
+            s.shutdown()
+        })
     }
 
     #[test]
     fn assistive_technology_presses_banner_actions_and_dismiss() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = crate::application(
-            "Banner test",
-            "dev.gossamer.gui-banner-test",
-            Log::default,
-            log_update,
-            log_view,
-        )
-        .size(560, 260)
-        .start()
-        .unwrap();
-        let dump = s.semantics(0).dump();
-        assert!(
-            dump.contains("button \"Retry\"") && dump.contains("button \"Dismiss\""),
-            "{}",
-            dump
-        );
-        s.accessible_action("b", "b:details", "press", "").unwrap();
-        s.accessible_action("b", "b:dismiss", "press", "").unwrap();
-        assert_eq!(clicks(&s), "b:details; b:dismiss");
-        s.shutdown()
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::application(
+                "Banner test",
+                "dev.gossamer.gui-banner-test",
+                Log::default,
+                log_update,
+                log_view,
+            )
+            .size(560, 260)
+            .start()
+            .unwrap();
+            let dump = s.semantics(0).dump();
+            assert!(
+                dump.contains("button \"Retry\"") && dump.contains("button \"Dismiss\""),
+                "{}",
+                dump
+            );
+            s.accessible_action("b", "b:details", "press", "").unwrap();
+            s.accessible_action("b", "b:dismiss", "press", "").unwrap();
+            assert_eq!(clicks(&s), "b:details; b:dismiss");
+            s.shutdown()
+        })
     }
 
     #[test]
@@ -1003,142 +1010,148 @@ mod tests {
 
     #[test]
     fn a_toast_times_out_waits_while_hovered_and_lets_clicks_through() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = crate::application(
-            "Toasts",
-            "dev.gossamer.gui-toast-test",
-            Log::default,
-            log_update,
-            toast_view,
-        )
-        .size(560, 400)
-        .start()
-        .unwrap();
-        show(&super::Toast::new("saved", "Document saved").lasting(3000));
-        s.flush().unwrap();
-        assert!(
-            s.semantics(0).dump().contains("Document saved"),
-            "{}",
-            s.semantics(0).dump()
-        );
-        assert!(
-            s.announcements.contains(&"Document saved".to_string()),
-            "{:?}",
-            s.announcements
-        );
-        // The rest of the window still takes the pointer.
-        assert!(s.click("work").unwrap());
-        // Hovered, it stays past its time; left, it goes and says so.
-        let r = s.rect_of("saved").unwrap();
-        s.hover(r.center_x(), r.center_y()).unwrap();
-        s.advance(4000).unwrap();
-        assert!(
-            s.semantics(0).dump().contains("Document saved"),
-            "{}",
-            s.semantics(0).dump()
-        );
-        s.hover(5, 5).unwrap();
-        s.advance(1100).unwrap();
-        assert!(
-            !s.semantics(0).dump().contains("Document saved"),
-            "{}",
-            s.semantics(0).dump()
-        );
-        assert_eq!(clicks(&s), "work; saved:timeout");
-        s.shutdown()
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::application(
+                "Toasts",
+                "dev.gossamer.gui-toast-test",
+                Log::default,
+                log_update,
+                toast_view,
+            )
+            .size(560, 400)
+            .start()
+            .unwrap();
+            show(&super::Toast::new("saved", "Document saved").lasting(3000));
+            s.flush().unwrap();
+            assert!(
+                s.semantics(0).dump().contains("Document saved"),
+                "{}",
+                s.semantics(0).dump()
+            );
+            assert!(
+                s.announcements.contains(&"Document saved".to_string()),
+                "{:?}",
+                s.announcements
+            );
+            // The rest of the window still takes the pointer.
+            assert!(s.click("work").unwrap());
+            // Hovered, it stays past its time; left, it goes and says so.
+            let r = s.rect_of("saved").unwrap();
+            s.hover(r.center_x(), r.center_y()).unwrap();
+            s.advance(4000).unwrap();
+            assert!(
+                s.semantics(0).dump().contains("Document saved"),
+                "{}",
+                s.semantics(0).dump()
+            );
+            s.hover(5, 5).unwrap();
+            s.advance(1100).unwrap();
+            assert!(
+                !s.semantics(0).dump().contains("Document saved"),
+                "{}",
+                s.semantics(0).dump()
+            );
+            assert_eq!(clicks(&s), "work; saved:timeout");
+            s.shutdown()
+        })
     }
 
     #[test]
     fn a_toast_action_closes_it_and_reaches_the_application() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = crate::application(
-            "Toasts",
-            "dev.gossamer.gui-toast-test",
-            Log::default,
-            log_update,
-            toast_view,
-        )
-        .size(560, 400)
-        .start()
-        .unwrap();
-        show(&super::Toast::new("gone", "Message deleted").action("undo", "Undo"));
-        s.flush().unwrap();
-        assert!(s.focus("gone").unwrap());
-        s.press(windowing::Key::Return, windowing::Mods::default())
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::application(
+                "Toasts",
+                "dev.gossamer.gui-toast-test",
+                Log::default,
+                log_update,
+                toast_view,
+            )
+            .size(560, 400)
+            .start()
             .unwrap();
-        assert!(
-            !s.semantics(0).dump().contains("Message deleted"),
-            "{}",
-            s.semantics(0).dump()
-        );
-        // Replacing and dismissing from the application report nothing.
-        show(&super::Toast::new("note", "First"));
-        show(&super::Toast::new("note", "Second"));
-        s.flush().unwrap();
-        let dump = s.semantics(0).dump();
-        assert!(
-            dump.contains("Second") && !dump.contains("First"),
-            "{}",
-            dump
-        );
-        crate::perform(crate::app::effects::Effect::DismissToast(
-            "note".to_string(),
-        ));
-        s.flush().unwrap();
-        s.advance(6000).unwrap();
-        assert!(
-            !s.semantics(0).dump().contains("Second"),
-            "{}",
-            s.semantics(0).dump()
-        );
-        assert_eq!(clicks(&s), "gone:undo");
-        s.shutdown()
+            show(&super::Toast::new("gone", "Message deleted").action("undo", "Undo"));
+            s.flush().unwrap();
+            assert!(s.focus("gone").unwrap());
+            s.press(windowing::Key::Return, windowing::Mods::default())
+                .unwrap();
+            assert!(
+                !s.semantics(0).dump().contains("Message deleted"),
+                "{}",
+                s.semantics(0).dump()
+            );
+            // Replacing and dismissing from the application report nothing.
+            show(&super::Toast::new("note", "First"));
+            show(&super::Toast::new("note", "Second"));
+            s.flush().unwrap();
+            let dump = s.semantics(0).dump();
+            assert!(
+                dump.contains("Second") && !dump.contains("First"),
+                "{}",
+                dump
+            );
+            crate::perform(crate::app::effects::Effect::DismissToast(
+                "note".to_string(),
+            ));
+            s.flush().unwrap();
+            s.advance(6000).unwrap();
+            assert!(
+                !s.semantics(0).dump().contains("Second"),
+                "{}",
+                s.semantics(0).dump()
+            );
+            assert_eq!(clicks(&s), "gone:undo");
+            s.shutdown()
+        })
     }
 
     #[test]
     fn a_burst_of_announcements_is_spoken_one_per_interval_newest_kept() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = crate::application(
-            "Toasts",
-            "dev.gossamer.gui-toast-test",
-            Log::default,
-            log_update,
-            toast_view,
-        )
-        .size(560, 400)
-        .start()
-        .unwrap();
-        let say = |text: String| crate::perform(crate::app::effects::Effect::Announce(text));
-        show(&super::Toast::new("a", "Copied"));
-        say("Copied".to_string());
-        say("1 of 4".to_string());
-        say("2 of 4".to_string());
-        say("3 of 4".to_string());
-        say("4 of 4".to_string());
-        say("4 of 4".to_string());
-        s.flush().unwrap();
-        // The first is spoken at once; its repeat and the oldest waiting are dropped.
-        assert_eq!(s.spoken(), vec!["Copied"]);
-        s.advance(750).unwrap();
-        assert_eq!(s.spoken(), vec!["Copied", "2 of 4"]);
-        s.advance(750).unwrap();
-        s.advance(750).unwrap();
-        s.advance(750).unwrap();
-        assert_eq!(s.spoken(), vec!["Copied", "2 of 4", "3 of 4", "4 of 4"]);
-        // Every request is still recorded, and a quiet interval speaks at once.
-        assert_eq!(s.announcements.len(), 7);
-        say("Copied".to_string());
-        s.flush().unwrap();
-        assert_eq!(s.spoken().len(), 5);
-        s.shutdown()
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::application(
+                "Toasts",
+                "dev.gossamer.gui-toast-test",
+                Log::default,
+                log_update,
+                toast_view,
+            )
+            .size(560, 400)
+            .start()
+            .unwrap();
+            let say = |text: String| crate::perform(crate::app::effects::Effect::Announce(text));
+            show(&super::Toast::new("a", "Copied"));
+            say("Copied".to_string());
+            say("1 of 4".to_string());
+            say("2 of 4".to_string());
+            say("3 of 4".to_string());
+            say("4 of 4".to_string());
+            say("4 of 4".to_string());
+            s.flush().unwrap();
+            // The first is spoken at once; its repeat and the oldest waiting are dropped.
+            assert_eq!(s.spoken(), vec!["Copied"]);
+            s.advance(750).unwrap();
+            assert_eq!(s.spoken(), vec!["Copied", "2 of 4"]);
+            s.advance(750).unwrap();
+            s.advance(750).unwrap();
+            s.advance(750).unwrap();
+            assert_eq!(s.spoken(), vec!["Copied", "2 of 4", "3 of 4", "4 of 4"]);
+            // Every request is still recorded, and a quiet interval speaks at once.
+            assert_eq!(s.announcements.len(), 7);
+            say("Copied".to_string());
+            s.flush().unwrap();
+            assert_eq!(s.spoken().len(), 5);
+            s.shutdown()
+        })
     }
 }

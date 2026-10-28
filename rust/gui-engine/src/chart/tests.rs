@@ -328,123 +328,125 @@ mod session {
 
     #[test]
     fn the_widget_hovers_pans_zooms_reads_aloud_and_follows_live_appends() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = crate::app::start("Chart", "dev.gossamer.gui-chart-test").unwrap();
-        let id = create(
-            Spec {
-                title: "Live".into(),
-                ..Spec::default()
-            },
-            crate::app::effects::current_budget(),
-        )
-        .unwrap();
-        add_series(
-            id,
-            line("Load", 1000),
-            &[(0.0, 1.0), (1.0, 2.0), (2.0, 1.5), (3.0, 3.0)],
-        )
-        .unwrap();
-        let clicked = Rc::new(RefCell::new(Vec::new()));
-        let heard = clicked.clone();
-        s.set_shell(
-            move |m| {
-                if let crate::widgets::cx::UiMsg::ChartPoint(_, hit) = m {
-                    heard.borrow_mut().push(hit);
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::app::start("Chart", "dev.gossamer.gui-chart-test").unwrap();
+            let id = create(
+                Spec {
+                    title: "Live".into(),
+                    ..Spec::default()
+                },
+                crate::app::effects::current_budget(),
+            )
+            .unwrap();
+            add_series(
+                id,
+                line("Load", 1000),
+                &[(0.0, 1.0), (1.0, 2.0), (2.0, 1.5), (3.0, 3.0)],
+            )
+            .unwrap();
+            let clicked = Rc::new(RefCell::new(Vec::new()));
+            let heard = clicked.clone();
+            s.set_shell(
+                move |m| {
+                    if let crate::widgets::cx::UiMsg::ChartPoint(_, hit) = m {
+                        heard.borrow_mut().push(hit);
+                    }
+                },
+                move |_| {
+                    // Offset from the window's origin, as an embedded chart is.
+                    let chart = Widget::Chart(widget::View {
+                        id: "chart".into(),
+                        chart: id,
+                        label: "Load".into(),
+                        width: 600,
+                        height: 400,
+                    });
+                    Widget::column(&[Widget::label("Header"), chart], 8).padding(24)
+                },
+                Vec::new,
+            );
+            s.open_window("main", "Chart", 600, 400).unwrap();
+            s.step().unwrap();
+            let rect = s.rect_of("chart").unwrap();
+            let theme = s.windows[0].theme.clone();
+            let size = crate::geometry::Size::new(rect.width, rect.height);
+            let (px, py) = read(id, |m| {
+                let map = Mapping::new(m, render::frame(m, size.width, size.height, &theme).plot);
+                (map.px(1.0).round() as i64, map.py(2.0).round() as i64)
+            })
+            .unwrap();
+            s.hover(rect.x + px, rect.y + py).unwrap();
+            assert_eq!(
+                read(id, |m| m.hover.as_ref().map(|h| h.index)).unwrap(),
+                Some(1)
+            );
+            s.click_at(rect.x + px, rect.y + py).unwrap();
+            assert_eq!(
+                clicked.borrow().last().map(|h| (h.x, h.y)),
+                Some((1.0, 2.0))
+            );
+            let fitted = window(id).unwrap();
+            s.scroll_at(rect.x + rect.width / 2, rect.y + rect.height / 2, 2.0)
+                .unwrap();
+            let zoomed = window(id).unwrap();
+            assert!(zoomed.x1 - zoomed.x0 < fitted.x1 - fitted.x0);
+            s.drag(
+                rect.x + rect.width / 2,
+                rect.y + rect.height / 2 + 30,
+                rect.x + rect.width / 2 + 100,
+                rect.y + rect.height / 2 + 30,
+            )
+            .unwrap();
+            let panned = window(id).unwrap();
+            assert!(panned.x0 < zoomed.x0, "{panned:?} {zoomed:?}");
+            // The keyboard reads points aloud and restores the view.
+            assert!(s.focus("chart").unwrap());
+            s.press(windowing::Key::Right, windowing::Mods::default())
+                .unwrap();
+            s.press(windowing::Key::Right, windowing::Mods::default())
+                .unwrap();
+            s.advance(2000).unwrap();
+            assert!(
+                s.spoken()
+                    .iter()
+                    .any(|t| t.contains("Load: 2, 1.5 (3 of 4)")),
+                "{:?}",
+                s.spoken()
+            );
+            s.press(windowing::Key::Home, windowing::Mods::default())
+                .unwrap();
+            assert_eq!(window(id).unwrap(), fitted);
+            let node = s.semantics(0);
+            fn find<'a>(
+                n: &'a crate::accessibility::AccessNode,
+                id: &str,
+            ) -> Option<&'a crate::accessibility::AccessNode> {
+                if n.id == id {
+                    return Some(n);
                 }
-            },
-            move |_| {
-                // Offset from the window's origin, as an embedded chart is.
-                let chart = Widget::Chart(widget::View {
-                    id: "chart".into(),
-                    chart: id,
-                    label: "Load".into(),
-                    width: 600,
-                    height: 400,
-                });
-                Widget::column(&[Widget::label("Header"), chart], 8).padding(24)
-            },
-            Vec::new,
-        );
-        s.open_window("main", "Chart", 600, 400).unwrap();
-        s.step().unwrap();
-        let rect = s.rect_of("chart").unwrap();
-        let theme = s.windows[0].theme.clone();
-        let size = crate::geometry::Size::new(rect.width, rect.height);
-        let (px, py) = read(id, |m| {
-            let map = Mapping::new(m, render::frame(m, size.width, size.height, &theme).plot);
-            (map.px(1.0).round() as i64, map.py(2.0).round() as i64)
-        })
-        .unwrap();
-        s.hover(rect.x + px, rect.y + py).unwrap();
-        assert_eq!(
-            read(id, |m| m.hover.as_ref().map(|h| h.index)).unwrap(),
-            Some(1)
-        );
-        s.click_at(rect.x + px, rect.y + py).unwrap();
-        assert_eq!(
-            clicked.borrow().last().map(|h| (h.x, h.y)),
-            Some((1.0, 2.0))
-        );
-        let fitted = window(id).unwrap();
-        s.scroll_at(rect.x + rect.width / 2, rect.y + rect.height / 2, 2.0)
-            .unwrap();
-        let zoomed = window(id).unwrap();
-        assert!(zoomed.x1 - zoomed.x0 < fitted.x1 - fitted.x0);
-        s.drag(
-            rect.x + rect.width / 2,
-            rect.y + rect.height / 2 + 30,
-            rect.x + rect.width / 2 + 100,
-            rect.y + rect.height / 2 + 30,
-        )
-        .unwrap();
-        let panned = window(id).unwrap();
-        assert!(panned.x0 < zoomed.x0, "{panned:?} {zoomed:?}");
-        // The keyboard reads points aloud and restores the view.
-        assert!(s.focus("chart").unwrap());
-        s.press(windowing::Key::Right, windowing::Mods::default())
-            .unwrap();
-        s.press(windowing::Key::Right, windowing::Mods::default())
-            .unwrap();
-        s.advance(2000).unwrap();
-        assert!(
-            s.spoken()
-                .iter()
-                .any(|t| t.contains("Load: 2, 1.5 (3 of 4)")),
-            "{:?}",
-            s.spoken()
-        );
-        s.press(windowing::Key::Home, windowing::Mods::default())
-            .unwrap();
-        assert_eq!(window(id).unwrap(), fitted);
-        let node = s.semantics(0);
-        fn find<'a>(
-            n: &'a crate::accessibility::AccessNode,
-            id: &str,
-        ) -> Option<&'a crate::accessibility::AccessNode> {
-            if n.id == id {
-                return Some(n);
+                n.children.iter().find_map(|c| find(c, id))
             }
-            n.children.iter().find_map(|c| find(c, id))
-        }
-        let chart = find(&node, "chart").unwrap();
-        assert!(
-            chart.description.contains("Load: 4 points, 1 to 3"),
-            "{}",
-            chart.description
-        );
-        assert_eq!(chart.value, "Load: 2, 1.5 (3 of 4)");
-        // A feed on another thread appends; the session wakes and repaints.
-        let revision = read(id, |m| m.revision).unwrap();
-        std::thread::spawn(move || append(id, 0, &[(4.0, 9.0)]).unwrap())
-            .join()
-            .unwrap();
-        s.step().unwrap();
-        assert!(read(id, |m| m.revision).unwrap() > revision);
-        assert!(window(id).unwrap().y1 > 9.0);
-        s.shutdown();
-        assert!(read(id, |_| ()).is_err());
+            let chart = find(&node, "chart").unwrap();
+            assert!(
+                chart.description.contains("Load: 4 points, 1 to 3"),
+                "{}",
+                chart.description
+            );
+            assert_eq!(chart.value, "Load: 2, 1.5 (3 of 4)");
+            // A feed on another thread appends; the session wakes and repaints.
+            let revision = read(id, |m| m.revision).unwrap();
+            std::thread::spawn(move || append(id, 0, &[(4.0, 9.0)]).unwrap())
+                .join()
+                .unwrap();
+            s.step().unwrap();
+            assert!(read(id, |m| m.revision).unwrap() > revision);
+            assert!(window(id).unwrap().y1 > 9.0);
+            s.shutdown();
+            assert!(read(id, |_| ()).is_err());
+        })
     }
 }

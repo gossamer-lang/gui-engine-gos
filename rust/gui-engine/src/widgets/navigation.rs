@@ -140,58 +140,65 @@ mod session_tests {
 
     #[test]
     fn a_disclosure_reports_expanded_and_toggles_from_the_keyboard() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = crate::application("Nav", "dev.gossamer.gui-nav-test", || false, update, view)
-            .size(420, 300)
-            .start()
-            .unwrap();
-        let closed = s.semantics(0).dump();
-        assert!(
-            closed.contains("button \"Details\" [collapsed]") && !closed.contains("Hidden content"),
-            "{}",
-            closed
-        );
-        assert!(s.focus("more").unwrap());
-        s.press(Key::Return, Mods::default()).unwrap();
-        let open = s.semantics(0).dump();
-        assert!(
-            open.contains("button \"Details\" [focused expanded]")
-                && open.contains("Hidden content"),
-            "{}",
-            open
-        );
-        s.press(Key::Space, Mods::default()).unwrap();
-        assert!(
-            s.semantics(0)
-                .dump()
-                .contains("button \"Details\" [focused collapsed]"),
-            "{}",
-            s.semantics(0).dump()
-        );
-        s.shutdown()
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s =
+                crate::application("Nav", "dev.gossamer.gui-nav-test", || false, update, view)
+                    .size(420, 300)
+                    .start()
+                    .unwrap();
+            let closed = s.semantics(0).dump();
+            assert!(
+                closed.contains("button \"Details\" [collapsed]")
+                    && !closed.contains("Hidden content"),
+                "{}",
+                closed
+            );
+            assert!(s.focus("more").unwrap());
+            s.press(Key::Return, Mods::default()).unwrap();
+            let open = s.semantics(0).dump();
+            assert!(
+                open.contains("button \"Details\" [focused expanded]")
+                    && open.contains("Hidden content"),
+                "{}",
+                open
+            );
+            s.press(Key::Space, Mods::default()).unwrap();
+            assert!(
+                s.semantics(0)
+                    .dump()
+                    .contains("button \"Details\" [focused collapsed]"),
+                "{}",
+                s.semantics(0).dump()
+            );
+            s.shutdown()
+        })
     }
 
     #[test]
     fn breadcrumb_separators_are_not_read() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = crate::application("Nav", "dev.gossamer.gui-nav-test", || false, update, view)
-            .size(420, 300)
-            .start()
-            .unwrap();
-        let dump = s.semantics(0).dump();
-        assert!(
-            dump.contains("button \"Home\"") && dump.contains("Page, current location"),
-            "{}",
-            dump
-        );
-        assert!(!dump.contains("\"/\""), "{}", dump);
-        s.shutdown()
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s =
+                crate::application("Nav", "dev.gossamer.gui-nav-test", || false, update, view)
+                    .size(420, 300)
+                    .start()
+                    .unwrap();
+            let dump = s.semantics(0).dump();
+            assert!(
+                dump.contains("button \"Home\"") && dump.contains("Page, current location"),
+                "{}",
+                dump
+            );
+            assert!(!dump.contains("\"/\""), "{}", dump);
+            s.shutdown()
+        })
     }
 
     fn tools_view(_m: &i64) -> Widget {
@@ -215,51 +222,53 @@ mod session_tests {
 
     #[test]
     fn a_toolbar_is_one_tab_stop_and_the_arrows_move_inside_it() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let mut s = crate::application(
-            "Tools",
-            "dev.gossamer.gui-toolbar-test",
-            || 0,
-            |m: i64, _msg: UiMsg| m,
-            tools_view,
-        )
-        .size(420, 300)
-        .start()
-        .unwrap();
-        assert!(s.focus("before").unwrap());
-        s.press(Key::Tab, Mods::default()).unwrap();
-        assert_eq!(s.focused(), "cut");
-        s.press(Key::Right, Mods::default()).unwrap();
-        s.press(Key::Right, Mods::default()).unwrap();
-        assert_eq!(s.focused(), "paste");
-        s.press(Key::Right, Mods::default()).unwrap();
-        assert_eq!(s.focused(), "cut");
-        s.press(Key::Left, Mods::default()).unwrap();
-        assert_eq!(s.focused(), "paste");
-        // Tab leaves the toolbar; coming back returns to where it was.
-        s.press(Key::Tab, Mods::default()).unwrap();
-        assert_eq!(s.focused(), "after");
-        s.press(
-            Key::Tab,
-            Mods {
-                shift: true,
-                ..Mods::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(s.focused(), "paste");
-        s.press(
-            Key::Tab,
-            Mods {
-                shift: true,
-                ..Mods::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(s.focused(), "before");
-        s.shutdown()
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::application(
+                "Tools",
+                "dev.gossamer.gui-toolbar-test",
+                || 0,
+                |m: i64, _msg: UiMsg| m,
+                tools_view,
+            )
+            .size(420, 300)
+            .start()
+            .unwrap();
+            assert!(s.focus("before").unwrap());
+            s.press(Key::Tab, Mods::default()).unwrap();
+            assert_eq!(s.focused(), "cut");
+            s.press(Key::Right, Mods::default()).unwrap();
+            s.press(Key::Right, Mods::default()).unwrap();
+            assert_eq!(s.focused(), "paste");
+            s.press(Key::Right, Mods::default()).unwrap();
+            assert_eq!(s.focused(), "cut");
+            s.press(Key::Left, Mods::default()).unwrap();
+            assert_eq!(s.focused(), "paste");
+            // Tab leaves the toolbar; coming back returns to where it was.
+            s.press(Key::Tab, Mods::default()).unwrap();
+            assert_eq!(s.focused(), "after");
+            s.press(
+                Key::Tab,
+                Mods {
+                    shift: true,
+                    ..Mods::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(s.focused(), "paste");
+            s.press(
+                Key::Tab,
+                Mods {
+                    shift: true,
+                    ..Mods::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(s.focused(), "before");
+            s.shutdown()
+        })
     }
 }

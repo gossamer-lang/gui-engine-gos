@@ -130,125 +130,127 @@ mod session {
 
     #[test]
     fn viewers_load_in_the_background_supersede_reload_replaced_files_and_zoom() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let dir = std::env::temp_dir().join(format!("gui-images-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let photo = dir.join("photo.jpg");
-        let other = dir.join("other.gif");
-        std::fs::write(&photo, ROTATED).unwrap();
-        std::fs::write(&other, GIF).unwrap();
-        let mut s = crate::app::start("Images", "dev.gossamer.gui-image-test").unwrap();
-        let id = open(crate::app::effects::current_budget()).unwrap();
-        let events = Rc::new(RefCell::new(Vec::new()));
-        let heard = events.clone();
-        s.set_shell(
-            move |m| {
-                if let UiMsg::Image(viewer, status) = m {
-                    heard.borrow_mut().push((viewer, status));
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let dir = std::env::temp_dir().join(format!("gui-images-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let photo = dir.join("photo.jpg");
+            let other = dir.join("other.gif");
+            std::fs::write(&photo, ROTATED).unwrap();
+            std::fs::write(&other, GIF).unwrap();
+            let mut s = crate::app::start("Images", "dev.gossamer.gui-image-test").unwrap();
+            let id = open(crate::app::effects::current_budget()).unwrap();
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let heard = events.clone();
+            s.set_shell(
+                move |m| {
+                    if let UiMsg::Image(viewer, status) = m {
+                        heard.borrow_mut().push((viewer, status));
+                    }
+                },
+                move |_| {
+                    Widget::ImageView(widget::View {
+                        id: "viewer".into(),
+                        viewer: id,
+                        label: "Photo".into(),
+                        width: 400,
+                        height: 300,
+                    })
+                },
+                Vec::new,
+            );
+            s.open_window("main", "Images", 400, 300).unwrap();
+            // A second load supersedes the first; only its outcome is reported.
+            load(id, &other.display().to_string()).unwrap();
+            load(id, &photo.display().to_string()).unwrap();
+            while !matches!(
+                ready(&events.borrow(), id).map(|s| s.state),
+                Some(State::Ready { .. } | State::Failed(_))
+            ) {
+                s.step().unwrap();
+            }
+            assert_eq!(events.borrow().len(), 1, "{:?}", events.borrow());
+            let status = status_of(id).unwrap();
+            assert_eq!(
+                status.state,
+                State::Ready {
+                    width: 32,
+                    height: 64,
+                    format: Format::Jpeg
                 }
-            },
-            move |_| {
-                Widget::ImageView(widget::View {
-                    id: "viewer".into(),
-                    viewer: id,
-                    label: "Photo".into(),
-                    width: 400,
-                    height: 300,
-                })
-            },
-            Vec::new,
-        );
-        s.open_window("main", "Images", 400, 300).unwrap();
-        // A second load supersedes the first; only its outcome is reported.
-        load(id, &other.display().to_string()).unwrap();
-        load(id, &photo.display().to_string()).unwrap();
-        while !matches!(
-            ready(&events.borrow(), id).map(|s| s.state),
-            Some(State::Ready { .. } | State::Failed(_))
-        ) {
-            s.step().unwrap();
-        }
-        assert_eq!(events.borrow().len(), 1, "{:?}", events.borrow());
-        let status = status_of(id).unwrap();
-        assert_eq!(
-            status.state,
-            State::Ready {
-                width: 32,
-                height: 64,
-                format: Format::Jpeg
+            );
+            let (cached, entries) = cache_usage();
+            assert!(cached > 0 && entries >= 1);
+            // A replaced file (its length differs) is decoded afresh, not served
+            // from the cache.
+            std::fs::write(&photo, PLAIN).unwrap();
+            assert!(reload(id).unwrap());
+            while !matches!(
+                ready(&events.borrow(), id).map(|s| s.state),
+                Some(State::Ready { width: 64, .. })
+            ) {
+                s.step().unwrap();
             }
-        );
-        let (cached, entries) = cache_usage();
-        assert!(cached > 0 && entries >= 1);
-        // A replaced file (its length differs) is decoded afresh, not served
-        // from the cache.
-        std::fs::write(&photo, PLAIN).unwrap();
-        assert!(reload(id).unwrap());
-        while !matches!(
-            ready(&events.borrow(), id).map(|s| s.state),
-            Some(State::Ready { width: 64, .. })
-        ) {
-            s.step().unwrap();
-        }
-        // A file that is not an image fails with a reason.
-        let broken = dir.join("broken.png");
-        std::fs::write(&broken, b"\x89PNG\r\n\x1a\nbroken").unwrap();
-        load(id, &broken.display().to_string()).unwrap();
-        while !matches!(
-            ready(&events.borrow(), id).map(|s| s.state),
-            Some(State::Failed(_))
-        ) {
-            s.step().unwrap();
-        }
-        load(id, &photo.display().to_string()).unwrap();
-        while !matches!(
-            ready(&events.borrow(), id).map(|s| s.state),
-            Some(State::Ready { .. })
-        ) {
-            s.step().unwrap();
-        }
-        // Keyboard and accessibility.
-        assert!(s.focus("viewer").unwrap());
-        s.press(windowing::Key::Num1, windowing::Mods::default())
-            .unwrap();
-        assert_eq!(status_of(id).unwrap().zoom, Zoom::Scale(1.0));
-        s.press(windowing::Key::PageUp, windowing::Mods::default())
-            .unwrap();
-        assert!(matches!(status_of(id).unwrap().zoom, Zoom::Scale(z) if z > 1.2));
-        s.press(windowing::Key::R, windowing::Mods::default())
-            .unwrap();
-        assert_eq!(
-            status_of(id).unwrap().state,
-            State::Ready {
-                width: 32,
-                height: 64,
-                format: Format::Jpeg
+            // A file that is not an image fails with a reason.
+            let broken = dir.join("broken.png");
+            std::fs::write(&broken, b"\x89PNG\r\n\x1a\nbroken").unwrap();
+            load(id, &broken.display().to_string()).unwrap();
+            while !matches!(
+                ready(&events.borrow(), id).map(|s| s.state),
+                Some(State::Failed(_))
+            ) {
+                s.step().unwrap();
             }
-        );
-        s.press(windowing::Key::Home, windowing::Mods::default())
-            .unwrap();
-        assert_eq!(status_of(id).unwrap().zoom, Zoom::Fit);
-        let tree = s.semantics(0);
-        fn find<'a>(
-            n: &'a crate::accessibility::AccessNode,
-            id: &str,
-        ) -> Option<&'a crate::accessibility::AccessNode> {
-            if n.id == id {
-                return Some(n);
+            load(id, &photo.display().to_string()).unwrap();
+            while !matches!(
+                ready(&events.borrow(), id).map(|s| s.state),
+                Some(State::Ready { .. })
+            ) {
+                s.step().unwrap();
             }
-            n.children.iter().find_map(|c| find(c, id))
-        }
-        let viewer = find(&tree, "viewer").unwrap();
-        assert!(
-            viewer.description.starts_with("32 by 64 pixels"),
-            "{}",
-            viewer.description
-        );
-        s.shutdown();
-        assert!(status_of(id).is_err());
-        std::fs::remove_dir_all(dir).unwrap();
+            // Keyboard and accessibility.
+            assert!(s.focus("viewer").unwrap());
+            s.press(windowing::Key::Num1, windowing::Mods::default())
+                .unwrap();
+            assert_eq!(status_of(id).unwrap().zoom, Zoom::Scale(1.0));
+            s.press(windowing::Key::PageUp, windowing::Mods::default())
+                .unwrap();
+            assert!(matches!(status_of(id).unwrap().zoom, Zoom::Scale(z) if z > 1.2));
+            s.press(windowing::Key::R, windowing::Mods::default())
+                .unwrap();
+            assert_eq!(
+                status_of(id).unwrap().state,
+                State::Ready {
+                    width: 32,
+                    height: 64,
+                    format: Format::Jpeg
+                }
+            );
+            s.press(windowing::Key::Home, windowing::Mods::default())
+                .unwrap();
+            assert_eq!(status_of(id).unwrap().zoom, Zoom::Fit);
+            let tree = s.semantics(0);
+            fn find<'a>(
+                n: &'a crate::accessibility::AccessNode,
+                id: &str,
+            ) -> Option<&'a crate::accessibility::AccessNode> {
+                if n.id == id {
+                    return Some(n);
+                }
+                n.children.iter().find_map(|c| find(c, id))
+            }
+            let viewer = find(&tree, "viewer").unwrap();
+            assert!(
+                viewer.description.starts_with("32 by 64 pixels"),
+                "{}",
+                viewer.description
+            );
+            s.shutdown();
+            assert!(status_of(id).is_err());
+            std::fs::remove_dir_all(dir).unwrap();
+        })
     }
 }

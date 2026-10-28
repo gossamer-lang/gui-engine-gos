@@ -16,13 +16,21 @@ fn threads() -> usize {
         .unwrap_or(0)
 }
 
-/// Runs the session until `done` holds for the player's reported statuses.
+/// Runs the session until `done` holds for the player's reported statuses,
+/// failing with the player's reason when it stops first.
 fn step_until(
     s: &mut crate::Session,
     heard: &Rc<RefCell<Vec<Status>>>,
     mut done: impl FnMut(&[Status]) -> bool,
 ) {
     while !done(&heard.borrow()) {
+        if let Some(Status {
+            state: State::Failed(why) | State::Unavailable(why),
+            ..
+        }) = heard.borrow().last()
+        {
+            panic!("the player stopped: {why}");
+        }
         assert!(s.step().unwrap(), "the session ended");
     }
 }
@@ -59,7 +67,7 @@ fn gstreamer_plays_seeks_reports_progress_fails_cleanly_and_tears_down() {
                     height: 240,
                 })
             },
-            Vec::new,
+            |_| Vec::new(),
         );
         s.open_window("main", "Media", 320, 240).unwrap();
         load(id, &clip()).unwrap();

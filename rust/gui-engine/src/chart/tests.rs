@@ -367,7 +367,7 @@ mod session {
                     });
                     Widget::column(&[Widget::label("Header"), chart], 8).padding(24)
                 },
-                Vec::new,
+                |_| Vec::new(),
             );
             s.open_window("main", "Chart", 600, 400).unwrap();
             s.step().unwrap();

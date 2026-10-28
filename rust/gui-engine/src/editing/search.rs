@@ -13,12 +13,53 @@ pub struct SearchOptions {
     pub match_case: bool,
     /// Accept only matches that start and end on word boundaries.
     pub whole_word: bool,
+    /// Read the query as a regular expression (the `regex` crate's syntax).
+    #[serde(default)]
+    pub regex: bool,
 }
 
 /// The non-overlapping matches of `query` in `text`, at most `limit` of
 /// them (0 for all). An empty query matches nothing.
 pub fn find_all(text: &str, query: &str, options: SearchOptions, limit: i64) -> Vec<ByteRange> {
     find_all_cancellable(text, query, options, limit, || true).unwrap_or_default()
+}
+
+/// The matches of regular expression `query`, compiled with `options`.
+fn find_pattern(
+    text: &str,
+    query: &str,
+    options: SearchOptions,
+    limit: i64,
+    active: impl Fn() -> bool,
+) -> Result<Vec<ByteRange>, String> {
+    let source = if options.whole_word {
+        format!(r"\b(?:{query})\b")
+    } else {
+        query.to_string()
+    };
+    let pattern = regex::RegexBuilder::new(&source)
+        .case_insensitive(!options.match_case)
+        .size_limit(1 << 20)
+        .build()
+        .map_err(|e| format!("invalid regular expression: {e}"))?;
+    let mut out = Vec::new();
+    for found in pattern.find_iter(text) {
+        if !active() {
+            return Err("search cancelled or expired".into());
+        }
+        // An empty match selects nothing.
+        if found.is_empty() {
+            continue;
+        }
+        out.push(ByteRange {
+            start: ByteOffset(found.start() as i64),
+            end: ByteOffset(found.end() as i64),
+        });
+        if limit > 0 && out.len() as i64 >= limit {
+            break;
+        }
+    }
+    Ok(out)
 }
 
 /// Streaming KMP search retains only a query-sized origin window, preserving
@@ -33,6 +74,9 @@ pub fn find_all_cancellable(
     use std::collections::VecDeque;
     if query.len() > 4096 {
         return Err("search query exceeds its byte budget".into());
+    }
+    if options.regex {
+        return find_pattern(text, query, options, limit, active);
     }
     let wanted = if options.match_case {
         query.chars().collect::<Vec<_>>()
@@ -179,6 +223,27 @@ mod tests {
     }
 
     #[test]
+    fn a_regular_expression_query_follows_case_and_word_options() {
+        let re = SearchOptions {
+            regex: true,
+            ..SearchOptions::default()
+        };
+        assert_eq!(starts("err 42, Err 7, error", r"err\s*\d+", re), vec![0, 8]);
+        let cased = SearchOptions {
+            match_case: true,
+            ..re
+        };
+        assert_eq!(starts("err 42, Err 7", r"err\s*\d+", cased), vec![0]);
+        let words = SearchOptions {
+            whole_word: true,
+            ..re
+        };
+        assert_eq!(starts("err error err", "err", words), vec![0, 10]);
+        assert_eq!(starts("abc", "x*", re), Vec::<i64>::new());
+        assert!(super::find_all_cancellable("abc", "(", re, 0, || true).is_err());
+    }
+
+    #[test]
     fn matches_fold_case_unless_asked_and_never_overlap() {
         let any = SearchOptions::default();
         assert_eq!(starts("Foo foo FOO", "foo", any), vec![0, 4, 8]);
@@ -188,7 +253,7 @@ mod tests {
                 "foo",
                 SearchOptions {
                     match_case: true,
-                    whole_word: false
+                    ..SearchOptions::default()
                 }
             ),
             vec![4]
@@ -201,8 +266,8 @@ mod tests {
     #[test]
     fn whole_words_reject_matches_inside_identifiers() {
         let words = SearchOptions {
-            match_case: false,
             whole_word: true,
+            ..SearchOptions::default()
         };
         assert_eq!(
             starts("let x = xs.len() + x_1 + x", "x", words),

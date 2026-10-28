@@ -1,5 +1,7 @@
-//! Recorded paint with bounded, revision-keyed raster tiles and persistent pixels.
+//! Recorded paint with bounded, revision-keyed raster tiles, painted into the
+//! pixels that persist in the window's own surface.
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -499,14 +501,39 @@ struct Tile {
     used: u64,
 }
 
+// How many recent contents of each tile position are remembered.
+const SEEN: usize = 4;
+
+/// The pixels a frame is rasterized into, such as a window's surface: rows
+/// `stride` bytes apart, each pixel four bytes holding red, green and blue at
+/// `offsets` and an opaque fourth byte.
+pub struct Target<'a> {
+    pub pixels: &'a mut [u8],
+    pub width: i64,
+    pub height: i64,
+    pub stride: i64,
+    pub offsets: (usize, usize, usize),
+}
+
 pub struct Retained {
-    pub canvas: Canvas,
+    /// The size of the frame the retained scene was last shown at.
+    pub width: i64,
+    pub height: i64,
     scene: Scene,
     tiles: Vec<Tile>,
+    /// The latest content revisions each tile position showed, newest last.
+    /// A raster is cached only for content that comes back after other
+    /// content replaced it there: content that recurs (a blinking cursor, a
+    /// menu closing) pays for its pixels, while content that only moves on (a
+    /// terminal's output) or is repainted in place (an exposed or restyled
+    /// window) does not.
+    seen: HashMap<(i64, i64), Vec<u64>>,
     pub(crate) subtrees: SubtreeCache,
     pub budgets: Budgets,
     clock: u64,
     valid: bool,
+    /// The last raster reached only part of the frame.
+    partial: bool,
     pub stats: Stats,
 }
 impl Default for Retained {
@@ -517,19 +544,23 @@ impl Default for Retained {
 impl Retained {
     pub fn new() -> Self {
         Self {
-            canvas: Canvas::new(0, 0),
+            width: 0,
+            height: 0,
             scene: Scene::default(),
             tiles: vec![],
+            seen: HashMap::new(),
             subtrees: SubtreeCache::default(),
             budgets: Budgets::default(),
             clock: 0,
             valid: false,
+            partial: false,
             stats: Stats::default(),
         }
     }
     pub fn purge(&mut self) {
         self.subtrees.clear();
         self.tiles = Vec::new();
+        self.seen = HashMap::new();
         self.scene = Scene::default();
         self.valid = false;
         self.stats = Stats::default();
@@ -549,46 +580,53 @@ impl Retained {
     pub fn invalidate(&mut self) {
         self.valid = false;
     }
-    /// Replays only damaged regions; removed and reordered operations damage
-    /// both the old and new bounds. Cached tiles are keyed by the full paint
-    /// revision, position and background, never by widget identity alone.
-    pub fn update(&mut self, width: i64, height: i64, scene: Scene) -> Vec<Rect> {
+    /// The regions of a `width` x `height` frame that showing `scene` in
+    /// place of the retained one changes; removed and reordered operations
+    /// damage both their old and new bounds. Starts the frame's statistics.
+    pub fn damage(&mut self, width: i64, height: i64, scene: &Scene) -> Vec<Rect> {
         self.subtrees.trim_limit(self.budgets.layers / 2);
         self.clock += 1;
         self.stats = Stats::default();
+        self.stats.cache_hits += self.subtrees.take_hits();
         let screen = Rect::new(0, 0, width, height);
-        let mut damage = vec![];
-        if self.canvas.width != width || self.canvas.height != height {
-            self.canvas = Canvas::new(width, height);
+        if self.width != width || self.height != height {
+            self.width = width;
+            self.height = height;
             self.valid = false;
             self.tiles.clear();
+            self.seen.clear();
         }
         if !self.valid {
-            damage.push(screen)
-        } else {
-            let prefix = self
-                .scene
-                .commands
-                .iter()
-                .zip(&scene.commands)
-                .take_while(|(a, b)| a == b)
-                .count();
-            let suffix = self.scene.commands[prefix..]
-                .iter()
-                .rev()
-                .zip(scene.commands[prefix..].iter().rev())
-                .take_while(|(a, b)| a == b)
-                .count();
-            for c in self.scene.commands[prefix..self.scene.commands.len() - suffix]
-                .iter()
-                .chain(&scene.commands[prefix..scene.commands.len() - suffix])
-            {
-                add_damage(&mut damage, c.bounds.intersect(screen));
-            }
+            return vec![screen];
         }
-        let subtree_bytes = self.subtrees.bytes();
-        let layer_budget = self.budgets.layers.saturating_sub(subtree_bytes);
-        self.stats.cache_hits += self.subtrees.take_hits();
+        let prefix = self
+            .scene
+            .commands
+            .iter()
+            .zip(&scene.commands)
+            .take_while(|(a, b)| a == b)
+            .count();
+        let suffix = self.scene.commands[prefix..]
+            .iter()
+            .rev()
+            .zip(scene.commands[prefix..].iter().rev())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let mut damage = vec![];
+        for c in self.scene.commands[prefix..self.scene.commands.len() - suffix]
+            .iter()
+            .chain(&scene.commands[prefix..scene.commands.len() - suffix])
+        {
+            add_damage(&mut damage, c.bounds.intersect(screen));
+        }
+        damage
+    }
+    /// Paints `damage` of `scene` into `target`, which keeps the pixels
+    /// outside it from earlier frames. Cached tiles are keyed by the full
+    /// paint revision, position and background, never by widget identity.
+    pub fn raster(&mut self, scene: &Scene, damage: &[Rect], target: Target<'_>) {
+        let (width, height) = (self.width, self.height);
+        let layer_budget = self.budgets.layers.saturating_sub(self.subtrees.bytes());
         let mut total = self.tiles.iter().map(|t| t.pixels.len()).sum::<usize>();
         while total > layer_budget {
             let i = self
@@ -628,9 +666,18 @@ impl Retained {
                     .tiles
                     .iter()
                     .position(|t| t.rect == tile && t.revision == revision);
+                let mut admit = false;
                 if let Some(i) = cached {
                     self.stats.cache_hits += 1;
                     self.tiles[i].used = self.clock;
+                } else {
+                    let history = self.seen.entry((x, y)).or_default();
+                    admit = history.iter().rev().skip(1).any(|r| *r == revision);
+                    history.retain(|r| *r != revision);
+                    if history.len() == SEEN {
+                        history.remove(0);
+                    }
+                    history.push(revision);
                 }
                 band.push(Job {
                     tile,
@@ -638,27 +685,37 @@ impl Retained {
                     revision,
                     commands,
                     cached,
+                    admit,
                 });
             }
             bands.push(band);
         }
-        let row_bytes = width as usize * 4;
+        let stride = target.stride.max(0) as usize;
         let room = AtomicUsize::new(layer_budget);
         let tiles = &self.tiles;
         let clock = self.clock;
-        let mut work: Vec<(i64, &mut [u8], Vec<Job>)> = self
-            .canvas
+        let mut work: Vec<(Band, Vec<Job>)> = target
             .pixels
-            .chunks_mut(row_bytes * TILE as usize)
+            .chunks_mut((stride * TILE as usize).max(1))
             .zip(bands)
             .zip((0..height).step_by(TILE as usize))
             .filter(|((_, jobs), _)| !jobs.is_empty())
-            .map(|((pixels, jobs), y)| (y, pixels, jobs))
+            .map(|((pixels, jobs), y)| {
+                let band = Band {
+                    y,
+                    rows: (pixels.len() / stride.max(1)) as i64,
+                    pixels,
+                    stride,
+                    width: target.width,
+                    offsets: target.offsets,
+                };
+                (band, jobs)
+            })
             .collect();
-        let raster = |work: &mut [(i64, &mut [u8], Vec<Job>)]| -> Banded {
+        let raster = |work: &mut [(Band, Vec<Job>)]| -> Banded {
             let mut done = Banded::default();
-            for (y, pixels, jobs) in work {
-                band_raster(*y, pixels, row_bytes, jobs, tiles, clock, &room, &mut done);
+            for (band, jobs) in work {
+                band_raster(band, jobs, tiles, clock, &room, &mut done);
             }
             done
         };
@@ -666,7 +723,7 @@ impl Retained {
         // rasterize do so side by side.
         let fresh = work
             .iter()
-            .filter(|(_, _, jobs)| jobs.iter().any(|j| j.cached.is_none()))
+            .filter(|(_, jobs)| jobs.iter().any(|j| j.cached.is_none()))
             .count();
         let workers = std::thread::available_parallelism()
             .map_or(1, |n| n.get())
@@ -694,8 +751,18 @@ impl Retained {
             self.stats.rasterized_pixels += done.rasterized_pixels;
             self.stats.damage_pixels += done.damage_pixels;
             for fresh in done.tiles {
-                // At most one cached revision occupies each tile position.
-                if let Some(i) = self.tiles.iter().position(|t| t.rect == fresh.rect) {
+                // A tile position keeps rasters of as many contents as it
+                // remembers, its least recently used one giving way.
+                let here = self.tiles.iter().filter(|t| t.rect == fresh.rect).count();
+                if here >= SEEN
+                    && let Some(i) = self
+                        .tiles
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, t)| t.rect == fresh.rect)
+                        .min_by_key(|(_, t)| t.used)
+                        .map(|(i, _)| i)
+                {
                     total -= self.tiles.remove(i).pixels.len();
                 }
                 while total + fresh.pixels.len() > layer_budget {
@@ -712,14 +779,21 @@ impl Retained {
                 self.tiles.push(fresh);
             }
         }
-        self.stats.layer_bytes = total + subtree_bytes;
+        self.partial = target.width != width || target.height != height;
+    }
+    /// Retains `scene` as what the frame shows, when it fits its budget.
+    pub fn commit(&mut self, scene: Scene) {
+        self.stats.layer_bytes =
+            self.tiles.iter().map(|t| t.pixels.len()).sum::<usize>() + self.subtrees.bytes();
         self.stats.scene_bytes = scene.bytes();
-        self.valid = self.stats.scene_bytes <= self.budgets.scene;
-        self.scene = if self.valid { scene } else { Scene::default() };
-        if !self.valid {
+        let fits = self.stats.scene_bytes <= self.budgets.scene;
+        // A target of another size than the frame holds only part of it,
+        // so the next frame repaints in full.
+        self.valid = fits && !std::mem::take(&mut self.partial);
+        self.scene = if fits { scene } else { Scene::default() };
+        if !fits {
             self.stats.scene_bytes = 0;
         }
-        damage
     }
 }
 // Fixed-size layers bound work and allocations even for a large primitive.
@@ -733,6 +807,18 @@ struct Job<'a> {
     revision: u64,
     commands: Vec<&'a Command>,
     cached: Option<usize>,
+    /// The tile showed this content before, so its raster is worth keeping.
+    admit: bool,
+}
+
+/// One band of target rows, from frame row `y`, `rows` of them.
+struct Band<'a> {
+    y: i64,
+    rows: i64,
+    pixels: &'a mut [u8],
+    stride: usize,
+    width: i64,
+    offsets: (usize, usize, usize),
 }
 
 /// What rasterizing some bands produced.
@@ -743,18 +829,18 @@ struct Banded {
     damage_pixels: u64,
 }
 
-/// Paints the damaged parts of one band of tiles, whose rows start at frame
-/// row `y`. New rasters are kept for the cache while `room` lasts.
+/// Paints the damaged parts of one band of tiles into the target's channel
+/// order. New rasters of recurring content are kept while `room` lasts.
 fn band_raster(
-    y: i64,
-    pixels: &mut [u8],
-    row_bytes: usize,
+    band: &mut Band,
     jobs: &[Job],
     tiles: &[Tile],
     clock: u64,
     room: &AtomicUsize,
     done: &mut Banded,
 ) {
+    let (ro, go, bo) = band.offsets;
+    let inside = Rect::new(0, band.y, band.width, band.rows);
     for job in jobs {
         let tile = job.tile;
         let raster: Cow<[u8]> = match job.cached {
@@ -769,15 +855,31 @@ fn band_raster(
             }
         };
         for part in &job.parts {
+            let part = part.intersect(inside);
+            if !nonempty(part) {
+                continue;
+            }
+            let len = part.width as usize * 4;
             for row in part.y..part.y + part.height {
                 let src = ((row - tile.y) * tile.width + part.x - tile.x) as usize * 4;
-                let dst = (row - y) as usize * row_bytes + part.x as usize * 4;
-                let len = part.width as usize * 4;
-                pixels[dst..dst + len].copy_from_slice(&raster[src..src + len]);
+                let dst = (row - band.y) as usize * band.stride + part.x as usize * 4;
+                for (d, s) in band.pixels[dst..dst + len]
+                    .as_chunks_mut::<4>()
+                    .0
+                    .iter_mut()
+                    .zip(raster[src..src + len].as_chunks::<4>().0)
+                {
+                    d[ro] = s[0];
+                    d[go] = s[1];
+                    d[bo] = s[2];
+                    d[3] = 255;
+                }
             }
             done.damage_pixels += (part.width * part.height) as u64;
         }
-        if let Cow::Owned(pixels) = raster {
+        if let Cow::Owned(pixels) = raster
+            && job.admit
+        {
             let len = pixels.len();
             let kept = room
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
@@ -822,6 +924,25 @@ fn add_damage(regions: &mut Vec<Rect>, mut rect: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Shows `scene` in `frame` as a window's surface would, answering the
+    // damage.
+    fn show(r: &mut Retained, frame: &mut Canvas, scene: Scene) -> Vec<Rect> {
+        let damage = r.damage(frame.width, frame.height, &scene);
+        let (width, height) = (frame.width, frame.height);
+        r.raster(
+            &scene,
+            &damage,
+            Target {
+                pixels: &mut frame.pixels,
+                width,
+                height,
+                stride: width * 4,
+                offsets: (0, 1, 2),
+            },
+        );
+        r.commit(scene);
+        damage
+    }
     fn picture(c: &mut Canvas, revision: i64) {
         c.fill(Color::rgb(240, 240, 240));
         c.push_clip(Rect::new(3, 5, 270, 170));
@@ -844,6 +965,7 @@ mod tests {
     #[test]
     fn incremental_pixels_match_immediate_paint_after_moves_removals_and_resize() {
         let mut retained = Retained::new();
+        let mut frame = Canvas::new(0, 0);
         for (w, h, r) in [
             (300, 200, 0),
             (300, 200, 1),
@@ -851,18 +973,52 @@ mod tests {
             (640, 480, 5),
             (300, 200, -100),
         ] {
-            retained.update(w, h, recorded(w, h, r));
+            if frame.width != w || frame.height != h {
+                frame = Canvas::new(w, h);
+            }
+            show(&mut retained, &mut frame, recorded(w, h, r));
             let mut reference = Canvas::new(w, h);
             picture(&mut reference, r);
-            assert_eq!(
-                retained.canvas.pixels, reference.pixels,
-                "{w}x{h} revision {r}"
-            );
+            assert_eq!(frame.pixels, reference.pixels, "{w}x{h} revision {r}");
         }
         let mut empty = Canvas::recording(300, 200, 1024);
         empty.fill(Color::white());
-        retained.update(300, 200, empty.take_scene().unwrap());
-        assert!(retained.canvas.pixels.iter().all(|v| *v == 255));
+        show(&mut retained, &mut frame, empty.take_scene().unwrap());
+        assert!(frame.pixels.iter().all(|v| *v == 255));
+    }
+    #[test]
+    fn frames_paint_into_a_padded_surface_in_its_own_channel_order() {
+        let (w, h) = (300, 200);
+        let stride = w * 4 + 12;
+        let mut surface = vec![9u8; (stride * h) as usize];
+        let mut r = Retained::new();
+        for revision in [0, 1, 40] {
+            let scene = recorded(w, h, revision);
+            let damage = r.damage(w, h, &scene);
+            r.raster(
+                &scene,
+                &damage,
+                Target {
+                    pixels: &mut surface,
+                    width: w,
+                    height: h,
+                    stride,
+                    offsets: (2, 1, 0),
+                },
+            );
+            r.commit(scene);
+            let mut reference = Canvas::new(w, h);
+            picture(&mut reference, revision);
+            for y in 0..h {
+                let row = &surface[(y * stride) as usize..][..(stride) as usize];
+                for x in 0..w {
+                    let s = &reference.pixels[((y * w + x) * 4) as usize..][..3];
+                    let d = &row[(x * 4) as usize..][..4];
+                    assert_eq!([d[2], d[1], d[0], d[3]], [s[0], s[1], s[2], 255], "{x},{y}");
+                }
+                assert!(row[(w * 4) as usize..].iter().all(|b| *b == 9));
+            }
+        }
     }
     #[test]
     fn shared_pixels_record_by_reference_and_damage_only_when_replaced() {
@@ -880,14 +1036,15 @@ mod tests {
             "the scene holds the frame by reference"
         );
         let mut r = Retained::new();
-        r.update(640, 480, first);
-        assert!(r.update(640, 480, scene(&frame)).is_empty());
+        let mut shown = Canvas::new(640, 480);
+        show(&mut r, &mut shown, first);
+        assert!(show(&mut r, &mut shown, scene(&frame)).is_empty());
         frame.replace(&vec![200u8; (sw * sh * 4) as usize]);
-        r.update(640, 480, scene(&frame));
+        show(&mut r, &mut shown, scene(&frame));
         assert_eq!(r.stats.damage_pixels, 640 * 360);
         let mut reference = Canvas::new(640, 480);
         scene(&frame).replay(&mut reference);
-        assert_eq!(r.canvas.pixels, reference.pixels);
+        assert_eq!(shown.pixels, reference.pixels);
     }
     #[test]
     fn caret_damage_is_small_idle_does_no_work_and_pixels_persist() {
@@ -900,41 +1057,64 @@ mod tests {
             c.take_scene().unwrap()
         };
         let mut r = Retained::new();
-        r.update(640, 480, scene(true));
-        let ptr = r.canvas.pixels.as_ptr();
-        r.update(640, 480, scene(false));
+        let mut frame = Canvas::new(640, 480);
+        show(&mut r, &mut frame, scene(true));
+        show(&mut r, &mut frame, scene(false));
         assert_eq!(r.stats.damage_pixels, 18);
-        assert_eq!(r.canvas.pixels.as_ptr(), ptr);
         assert!(r.stats.rasterized_pixels < 640 * 480);
-        assert!(r.update(640, 480, scene(false)).is_empty());
+        assert!(show(&mut r, &mut frame, scene(false)).is_empty());
         assert_eq!(r.stats.rasterized_pixels, 0);
         assert_eq!(r.stats.damage_pixels, 0);
     }
     #[test]
+    fn content_that_only_moves_on_is_never_cached() {
+        let mut r = Retained::new();
+        let mut shown = Canvas::new(300, 200);
+        for frame in 0..20 {
+            show(&mut r, &mut shown, recorded(300, 200, frame));
+            assert_eq!(r.stats.layer_bytes, 0, "frame {frame}");
+        }
+        // Two states taking turns (a blinking cursor) settle into hits.
+        for frame in 0..6 {
+            show(&mut r, &mut shown, recorded(300, 200, 100 + frame % 2));
+        }
+        assert!(r.stats.cache_hits > 0);
+    }
+    #[test]
     fn byte_budgets_eviction_revision_reuse_and_purge_preserve_pixels() {
         let mut r = Retained::new();
+        let mut frame = Canvas::new(300, 200);
         r.budgets.layers = 6 * 128 * 128 * 4;
-        r.update(300, 200, recorded(300, 200, 0));
-        assert!(r.stats.layer_bytes <= r.budgets.layers);
+        show(&mut r, &mut frame, recorded(300, 200, 0));
+        // Content shown once, or repainted in place, is not cached.
+        assert_eq!(r.stats.layer_bytes, 0);
         r.invalidate();
-        r.update(300, 200, recorded(300, 200, 0));
+        show(&mut r, &mut frame, recorded(300, 200, 0));
+        assert_eq!(r.stats.layer_bytes, 0);
+        // Content that comes back after other content replaced it is.
+        show(&mut r, &mut frame, recorded(300, 200, 1));
+        show(&mut r, &mut frame, recorded(300, 200, 0));
+        assert_eq!(r.stats.cache_hits, 0);
+        assert!(r.stats.layer_bytes > 0 && r.stats.layer_bytes <= r.budgets.layers);
+        show(&mut r, &mut frame, recorded(300, 200, 1));
+        show(&mut r, &mut frame, recorded(300, 200, 0));
         assert!(r.stats.cache_hits > 0);
         r.budgets.layers = 0;
         r.invalidate();
-        r.update(300, 200, recorded(300, 200, 0));
+        show(&mut r, &mut frame, recorded(300, 200, 0));
         assert_eq!(r.stats.layer_bytes, 0);
         r.budgets.scene = 0;
-        r.update(300, 200, recorded(300, 200, 1));
+        show(&mut r, &mut frame, recorded(300, 200, 1));
         assert_eq!(r.stats.scene_bytes, 0);
         r.purge();
         assert!(r.tiles.is_empty());
         assert!(r.scene.commands.is_empty());
         assert_eq!(r.scene.bytes(), 0);
         assert_eq!(r.tiles.capacity(), 0);
-        r.update(300, 200, recorded(300, 200, 1));
+        show(&mut r, &mut frame, recorded(300, 200, 1));
         let mut c = Canvas::new(300, 200);
         picture(&mut c, 1);
-        assert_eq!(r.canvas.pixels, c.pixels);
+        assert_eq!(frame.pixels, c.pixels);
         let mut c = Canvas::recording(10, 10, 16);
         c.image(0, 0, 10, 10, &[0; 400]);
         assert_eq!(c.recorded_bytes, 0);
@@ -984,6 +1164,7 @@ mod tests {
     #[test]
     fn unchanged_transformed_subtrees_hit_before_raster_and_share_the_layer_budget() {
         let mut r = Retained::new();
+        let mut frame = Canvas::new(128, 128);
         r.budgets.layers = 65536;
         let layer = |color| super::super::display::DrawOp::Layer {
             ops: vec![super::super::display::DrawOp::RoundRect {
@@ -1002,7 +1183,7 @@ mod tests {
             let mut c = r.recording(128, 128);
             c.fill(Color::white());
             super::super::display::draw(&mut c, &[layer(Color::rgb(100, 0, 0))], 0, 0);
-            r.update(128, 128, c.take_scene().unwrap());
+            show(&mut r, &mut frame, c.take_scene().unwrap());
             if repeat == 1 {
                 assert_eq!(r.stats.rasterized_pixels, 0);
                 assert!(r.stats.cache_hits > 0);
@@ -1013,14 +1194,14 @@ mod tests {
             let mut c = r.recording(128, 128);
             c.fill(Color::white());
             super::super::display::draw(&mut c, &[layer(Color::rgb(color, 0, 0))], 0, 0);
-            r.update(128, 128, c.take_scene().unwrap());
+            show(&mut r, &mut frame, c.take_scene().unwrap());
             assert!(r.stats.layer_bytes <= r.budgets.layers);
         }
         r.budgets.layers = 0;
         let mut c = r.recording(128, 128);
         c.fill(Color::white());
         super::super::display::draw(&mut c, &[layer(Color::rgb(100, 0, 0))], 0, 0);
-        r.update(128, 128, c.take_scene().unwrap());
+        show(&mut r, &mut frame, c.take_scene().unwrap());
         assert_eq!(r.stats.layer_bytes, 0);
         r.purge();
         assert_eq!(r.subtrees.bytes(), 0);

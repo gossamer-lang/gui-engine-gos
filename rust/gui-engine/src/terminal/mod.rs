@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, LazyLock};
 
+use encoding_rs::{Decoder, Encoding};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
@@ -119,10 +120,16 @@ pub struct Snapshot {
     pub exit: Option<i64>,
     /// Rows the view is scrolled back into history.
     pub scrolled: i64,
+    /// Rows of history kept above the screen.
+    pub history: i64,
     pub selection: Option<(Cell, Cell)>,
     pub reserved_bytes: i64,
     /// The program's process id, 0 without a program.
     pub pid: i64,
+    /// A job other than the program runs in the foreground, as a shell's
+    /// command does; closing the terminal would end it.
+    #[serde(default)]
+    pub busy: bool,
     /// Input bytes waiting for the program and output waiting to be parsed.
     pub queued_input: i64,
     pub queued_output: i64,
@@ -148,6 +155,74 @@ struct Entry {
     /// once, and the report waiting for the next pump.
     refused: Option<(u16, u16)>,
     refusal: Option<String>,
+    /// The program's character set, or `None` for UTF-8, which passes
+    /// through unchanged.
+    charset: Option<Charset>,
+}
+
+/// A non-UTF-8 character set the program reads and writes: its output is
+/// decoded to UTF-8 for the screen, and input is encoded from UTF-8.
+struct Charset {
+    encoding: &'static Encoding,
+    /// Holds a multibyte sequence split across reads.
+    decoder: Decoder,
+}
+
+impl Charset {
+    fn decode(&mut self, bytes: &[u8]) -> String {
+        let capacity = self
+            .decoder
+            .max_utf8_buffer_length(bytes.len())
+            .unwrap_or(bytes.len().saturating_mul(3));
+        let mut text = String::with_capacity(capacity);
+        // The buffer holds the longest decoding, so one call consumes `bytes`.
+        let _ = self.decoder.decode_to_string(bytes, &mut text, false);
+        text
+    }
+
+    // Characters the set cannot represent are sent as `?`.
+    fn encode(&self, bytes: &[u8]) -> Vec<u8> {
+        let text = String::from_utf8_lossy(bytes);
+        let mut encoder = self.encoding.new_encoder();
+        let mut rest: &str = &text;
+        let mut out = Vec::new();
+        loop {
+            if let Some(more) = encoder.max_buffer_length_from_utf8_without_replacement(rest.len())
+            {
+                out.reserve(more);
+            }
+            let (result, read) =
+                encoder.encode_from_utf8_to_vec_without_replacement(rest, &mut out, true);
+            rest = &rest[read..];
+            match result {
+                encoding_rs::EncoderResult::InputEmpty => return out,
+                encoding_rs::EncoderResult::Unmappable(_) => out.push(b'?'),
+                encoding_rs::EncoderResult::OutputFull => {}
+            }
+        }
+    }
+}
+
+/// The character set `label` names (a WHATWG label such as "ISO-8859-1",
+/// "windows-1251" or "Shift_JIS"), or `None` for UTF-8. Sets a terminal
+/// cannot carry are refused: UTF-16, whose bytes are not ASCII, and
+/// ISO-2022-JP, whose escapes collide with control sequences.
+fn charset(label: &str) -> Result<Option<Charset>, String> {
+    let encoding = Encoding::for_label(label.trim().as_bytes())
+        .ok_or_else(|| format!("unknown character set {label}"))?;
+    if encoding == encoding_rs::UTF_8 {
+        return Ok(None);
+    }
+    if encoding.output_encoding() != encoding || encoding == encoding_rs::ISO_2022_JP {
+        return Err(format!(
+            "a terminal cannot use the {} character set",
+            encoding.name()
+        ));
+    }
+    Ok(Some(Charset {
+        encoding,
+        decoder: encoding.new_decoder_without_bom_handling(),
+    }))
 }
 
 fn dimension(value: i64, limit: i64, what: &str) -> Result<u16, String> {
@@ -202,9 +277,38 @@ pub fn create(options: &Options, budget: Budget) -> Result<i64, String> {
             suppress_text: false,
             refused: None,
             refusal: None,
+            charset: None,
         },
     );
     Ok(id)
+}
+
+/// Every row of terminal `id`'s buffer, its oldest history row first; the
+/// last `Snapshot::rows` rows are the screen.
+pub fn rows(id: i64) -> Result<Vec<engine::Row>, String> {
+    with(id, |entry| Ok(entry.engine.rows()))
+}
+
+/// Sends signal `signum` to terminal `id`'s foreground job (POSIX only).
+pub fn signal(id: i64, signum: i64) -> Result<(), String> {
+    let signum = i32::try_from(signum).map_err(|_| format!("{signum} is not a signal number"))?;
+    with(id, |entry| {
+        entry
+            .transport
+            .as_ref()
+            .ok_or("the terminal runs no program")?
+            .signal(signum)
+    })
+}
+
+/// Sets the character set terminal `id`'s program reads and writes, from
+/// the next output on; "UTF-8" restores the default.
+pub fn set_encoding(id: i64, label: &str) -> Result<(), String> {
+    let chosen = charset(label)?;
+    with(id, |entry| {
+        entry.charset = chosen;
+        Ok(())
+    })
 }
 
 /// Runs `command` on terminal `id`, which must not already run a program.
@@ -251,7 +355,10 @@ fn send(entry: &mut Entry, bytes: &[u8]) -> Result<(), String> {
         .transport
         .as_ref()
         .ok_or("the terminal runs no program")?;
-    transport.write(bytes)?;
+    match &entry.charset {
+        Some(charset) => transport.write(&charset.encode(bytes))?,
+        None => transport.write(bytes)?,
+    }
     if entry.scrolled != 0 || entry.selection.is_some() {
         entry.scrolled = 0;
         entry.engine.scroll(0);
@@ -381,9 +488,14 @@ pub fn snapshot(id: i64) -> Result<Snapshot, String> {
                 _ => None,
             },
             scrolled: entry.scrolled as i64,
+            history: entry.engine.history() as i64,
             selection: entry.selection,
             reserved_bytes: entry.engine.charged_bytes() as i64,
             pid: i64::from(pid),
+            busy: entry
+                .transport
+                .as_ref()
+                .is_some_and(|t| entry.exit.is_none() && t.busy()),
             queued_input: queued_input as i64,
             queued_output: queued_output as i64,
         })
@@ -430,7 +542,13 @@ pub(crate) fn pump(budget: &Budget) -> (bool, Vec<UiMsg>) {
         }
         let drained = transport.drain(PUMP_BYTES);
         if !drained.bytes.is_empty() {
-            if entry.engine.process(&drained.bytes).is_ok() {
+            let processed = match &mut entry.charset {
+                Some(charset) => entry
+                    .engine
+                    .process(charset.decode(&drained.bytes).as_bytes()),
+                None => entry.engine.process(&drained.bytes),
+            };
+            if processed.is_ok() {
                 entry.revision += 1;
                 changed = true;
             }

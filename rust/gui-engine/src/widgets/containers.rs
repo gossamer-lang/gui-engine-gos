@@ -612,6 +612,23 @@ pub fn layout_scroll(s: &Scroll, c: Constraints, cx: &mut LayoutCx) -> Node {
         content.height
     };
     let size = c.constrain(Size::new(width, height));
+    // Content that overflows downward gives the vertical bar its track, so
+    // the thumb never covers it either.
+    let (child, content) = if s.vertical && !s.horizontal && content.height > size.height {
+        let narrower = (size.width - bar(&cx.theme)).max(0);
+        let child = s.child.layout(
+            Constraints {
+                min_width: child_c.min_width.min(narrower),
+                max_width: narrower,
+                ..child_c
+            },
+            cx,
+        );
+        let content = child.size();
+        (child, content)
+    } else {
+        (child, content)
+    };
     let st = clamp_scroll(cx.states.scroll(&s.id), content, size);
     let mut out = Node::leaf(size);
     out.content = content;

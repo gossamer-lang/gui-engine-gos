@@ -193,7 +193,7 @@ impl<M: 'static> App<M> {
                 Some(m) => window_view(m, key),
                 None => Widget::Empty,
             },
-            move || m3.borrow().as_ref().map(&commands).unwrap_or_default(),
+            move |_key: &str| m3.borrow().as_ref().map(&commands).unwrap_or_default(),
         );
         let opened = (|| {
             if let Some(icon) = &self.icon {

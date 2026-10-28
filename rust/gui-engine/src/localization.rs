@@ -523,6 +523,7 @@ mod pseudo_tests {
             workspace: "".to_string(),
             add_button: true,
             detachable: false,
+            joined: false,
         };
         Widget::column(
             &[

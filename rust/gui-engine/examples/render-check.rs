@@ -1,6 +1,8 @@
 //! Actual backend readback, recovery and bounded-work rendering measurements.
 use gui_engine::geometry::Rect;
-use gui_engine::render::{presenter::WindowRenderer, retained::Scene};
+use gui_engine::render::Canvas;
+use gui_engine::render::presenter::{Painted, WindowRenderer};
+use gui_engine::render::retained::Scene;
 use gui_engine::style::color::Color;
 use gui_engine::text::layout::{self, LayoutOptions, TextStyle};
 use std::time::Instant;
@@ -58,6 +60,14 @@ fn scene(
     );
     c.take_scene().unwrap()
 }
+// The pixels `scene` paints when replayed at once: the reference the
+// retained, damage-driven frames must match.
+fn reference(scene: &Scene, width: i64, height: i64) -> Canvas {
+    let mut c = Canvas::new(width, height);
+    scene.replay(&mut c);
+    c
+}
+
 // The compositor may apply a size later than SDL's own synchronization, so
 // measurement waits for the window to report the requested pixel size.
 fn resize(
@@ -103,12 +113,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         resize(&app, window, width, height)?;
         let mut renderer = WindowRenderer::default();
-        let damage = renderer.retained.update(
-            width,
-            height,
-            scene(&renderer.retained, width, height, true, 0, 0),
-        );
-        renderer.present(window, &damage)?;
+        let first = scene(&renderer.retained, width, height, true, 0, 0);
+        let expected = reference(&first, width, height);
+        renderer.present(window, width, height, Painted::Scene(first))?;
         if require_software {
             assert!(
                 renderer.gpu_name().is_none(),
@@ -119,11 +126,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             assert!(renderer.gpu_name().is_some(), "GPU unavailable");
         }
         if let Some(actual) = renderer.gpu_capture()? {
-            let expected = &renderer.retained.canvas.pixels;
-            assert_eq!(actual.len(), expected.len());
+            assert_eq!(actual.len(), expected.pixels.len());
             let max = actual
                 .iter()
-                .zip(expected)
+                .zip(&expected.pixels)
                 .map(|(a, b)| a.abs_diff(*b))
                 .max()
                 .unwrap_or(0);
@@ -141,7 +147,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             frame.pixels[src + g],
                             frame.pixels[src + b]
                         ],
-                        renderer.retained.canvas.pixels[dst..dst + 3]
+                        expected.pixels[dst..dst + 3]
                     );
                 }
             }
@@ -150,12 +156,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if window.pixel_size() != (width, height) {
                 resize(&app, window, width, height)?;
             }
-            let warm = renderer.retained.update(
-                width,
-                height,
-                scene(&renderer.retained, width, height, true, 0, 0),
-            );
-            renderer.present(window, &warm)?;
+            let warm = scene(&renderer.retained, width, height, true, 0, 0);
+            renderer.present(window, width, height, Painted::Scene(warm))?;
             let mut times = Vec::new();
             for n in 0..30 {
                 let begin = Instant::now();
@@ -169,19 +171,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 let revision = if operation == "typing" { n } else { 0 };
                 let caret = operation != "caret" || n % 2 == 0;
-                let damage = renderer.retained.update(
+                let frame = scene(
+                    &renderer.retained,
                     w,
                     h,
-                    scene(
-                        &renderer.retained,
-                        w,
-                        h,
-                        caret,
-                        revision,
-                        if operation == "scroll" { n % 24 } else { 0 },
-                    ),
+                    caret,
+                    revision,
+                    if operation == "scroll" { n % 24 } else { 0 },
                 );
-                renderer.present(window, &damage)?;
+                let expected = if n == 15 {
+                    Some(reference(&frame, w, h))
+                } else {
+                    None
+                };
+                renderer.present(window, w, h, Painted::Scene(frame))?;
                 if require_software {
                     assert!(
                         renderer.gpu_name().is_none(),
@@ -195,13 +198,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "GPU silently fell back during {operation}"
                     );
                 }
-                if n == 15
+                if let Some(expected) = expected
                     && let Some(actual) = renderer.gpu_capture()?
                 {
-                    let expected = &renderer.retained.canvas.pixels;
                     let max = actual
                         .iter()
-                        .zip(expected)
+                        .zip(&expected.pixels)
                         .map(|(a, b)| a.abs_diff(*b))
                         .max()
                         .unwrap_or(0);
@@ -255,12 +257,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if window.pixel_size() != (width, height) {
             resize(&app, window, width, height)?;
         }
-        let lost = renderer.retained.update(
-            width,
-            height,
-            scene(&renderer.retained, width, height, true, 0, 0),
-        );
-        renderer.present(window, &lost)?;
+        let lost = scene(&renderer.retained, width, height, true, 0, 0);
+        renderer.present(window, width, height, Painted::Scene(lost))?;
         assert!(
             renderer.gpu_name().is_none(),
             "device-loss frame must use software"
@@ -268,15 +266,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _software_frame = window.capture()?;
         // Drop/recreate target and layers, as on renderer-reset notification.
         renderer.invalidate();
-        let damage = renderer.retained.update(
-            width,
-            height,
-            scene(&renderer.retained, width, height, true, 0, 0),
-        );
+        let recovered = scene(&renderer.retained, width, height, true, 0, 0);
         if window.pixel_size() != (width, height) {
             resize(&app, window, width, height)?;
         }
-        renderer.present(window, &damage)?;
+        renderer.present(window, width, height, Painted::Scene(recovered))?;
         if require_gpu {
             assert!(renderer.gpu_name().is_some(), "GPU recovery failed");
         }

@@ -10,6 +10,7 @@ enum Answer {
     Rows(i64),
     Text(String),
     Snapshot(Snapshot),
+    Lines(Vec<super::engine::Row>),
     Done,
 }
 
@@ -69,6 +70,17 @@ pub fn call(method: &str, id: i64, text: &str) -> Result<String, String> {
             super::select(id, None)?;
             Answer::Done
         }
+        "signal" => {
+            let signum: i64 = args(text)?;
+            super::signal(id, signum)?;
+            Answer::Done
+        }
+        "encoding" => {
+            let label: String = args(text)?;
+            super::set_encoding(id, &label)?;
+            Answer::Done
+        }
+        "rows" => Answer::Lines(super::rows(id)?),
         "copy" => Answer::Text(super::copy(id)?),
         "snapshot" => Answer::Snapshot(super::snapshot(id)?),
         "close" => {

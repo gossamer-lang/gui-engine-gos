@@ -61,7 +61,7 @@ register_module!(
                     hosted(update, &msg);
                 },
                 move |key: &str| decode::<Widget>("view", &hosted(view, &serde_json::to_string(key).unwrap_or_default())),
-                move || decode("commands", &hosted(commands, "null")),
+                move |key: &str| decode("commands", &hosted(commands, &serde_json::to_string(key).unwrap_or_default())),
             );
             Ok(())
         })

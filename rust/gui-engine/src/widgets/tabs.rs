@@ -109,6 +109,11 @@ pub struct Tabs {
     pub add_button: bool,
     /// Offers "Move to New Window" in the tab menu.
     pub detachable: bool,
+    /// Joins the strip to the content below it: the strip takes the field
+    /// color a text area or terminal fills with, draws no dividing line, and
+    /// labels its tabs at the desktop's menu text size.
+    #[serde(default)]
+    pub joined: bool,
 }
 
 /// The commands a tabbed window offers; add them to `App::commands`.
@@ -211,12 +216,25 @@ fn overflow_part(n: i64) -> i64 {
     n * 2 + 1
 }
 
-fn strip_height(theme: &Theme) -> i64 {
-    theme.control_height() + theme.px(4)
+// The text style a strip labels its tabs in.
+fn label_font(t: &Tabs, theme: &Theme) -> crate::text::layout::TextStyle {
+    theme.font(if t.joined {
+        TextRole::Menu
+    } else {
+        TextRole::Body
+    })
 }
 
-fn natural_width(t: &TabItem, theme: &Theme) -> i64 {
-    let (tw, _) = layout::measure(&t.title, &theme.font(TextRole::Body));
+fn strip_height(t: &Tabs, theme: &Theme) -> i64 {
+    if t.joined {
+        layout::measure("Mg", &label_font(t, theme)).1.ceil() as i64 + theme.px(14)
+    } else {
+        theme.control_height() + theme.px(4)
+    }
+}
+
+fn natural_width(strip: &Tabs, t: &TabItem, theme: &Theme) -> i64 {
+    let (tw, _) = layout::measure(&t.title, &label_font(strip, theme));
     let pad = theme.padding();
     let mut w = pad * 2 + tw.ceil() as i64;
     if t.icon.is_some() {
@@ -248,7 +266,7 @@ fn index_of(t: &Tabs, key: &str) -> i64 {
 
 pub fn layout_tabs(t: &Tabs, c: Constraints, cx: &mut LayoutCx) -> Node {
     let theme = &cx.theme;
-    let h = strip_height(theme);
+    let h = strip_height(t, theme);
     let width = if c.max_width >= crate::geometry::UNBOUNDED {
         theme.px(640)
     } else {
@@ -258,7 +276,7 @@ pub fn layout_tabs(t: &Tabs, c: Constraints, cx: &mut LayoutCx) -> Node {
     let mut widths = vec![];
     let mut total = 0;
     for item in &t.items {
-        let w = natural_width(item, theme);
+        let w = natural_width(t, item, theme);
         widths.push(w);
         total += w;
     }
@@ -371,18 +389,22 @@ pub fn layout_tabs(t: &Tabs, c: Constraints, cx: &mut LayoutCx) -> Node {
 
 pub fn paint_tabs(t: &Tabs, node: &Node, cx: &mut PaintCx) {
     let theme = cx.theme.clone();
-    let h = strip_height(&theme);
+    let h = strip_height(t, &theme);
     let strip = Rect::new(0, 0, node.size().width, h);
-    cx.fill(strip, theme.surface_alt);
-    cx.fill(
-        Rect::new(
-            0,
-            h - theme.border_width(),
-            strip.width,
-            theme.border_width(),
-        ),
-        theme.border,
-    );
+    if t.joined {
+        cx.fill(strip, theme.field);
+    } else {
+        cx.fill(strip, theme.surface_alt);
+        cx.fill(
+            Rect::new(
+                0,
+                h - theme.border_width(),
+                strip.width,
+                theme.border_width(),
+            ),
+            theme.border,
+        );
+    }
     let n = t.items.len();
     let overflow = node.parts.len() > overflow_part(n as i64) as usize
         && !node.parts[(overflow_part(n as i64)) as usize].is_empty();
@@ -401,7 +423,7 @@ pub fn paint_tabs(t: &Tabs, node: &Node, cx: &mut PaintCx) {
         h,
     ));
     cx.canvas.push_clip(clip_rect.intersect(saved));
-    let body = theme.font(TextRole::Body);
+    let body = label_font(t, &theme);
     let drag_from = cx.states.field(&t.id, "drag-key", "");
     let mut i = 0;
     while i < n && close_part(i as i64) < node.parts.len() as i64 {
@@ -410,16 +432,25 @@ pub fn paint_tabs(t: &Tabs, node: &Node, cx: &mut PaintCx) {
         let on = item.key == t.active;
         let tab_rect = Rect::new(r.x, r.y + theme.px(4), r.width, r.height - theme.px(4));
         if on {
-            cx.fill_round(tab_rect, theme.radius(), theme.background);
-            cx.fill(
-                Rect::new(
-                    r.x,
-                    r.y + r.height - theme.border_width(),
-                    r.width,
-                    theme.border_width(),
-                ),
-                theme.background,
-            );
+            // A joined strip raises the active tab off the field; a plain one
+            // opens it onto the page below.
+            let page = if t.joined {
+                theme.surface
+            } else {
+                theme.background
+            };
+            cx.fill_round(tab_rect, theme.radius(), page);
+            if !t.joined {
+                cx.fill(
+                    Rect::new(
+                        r.x,
+                        r.y + r.height - theme.border_width(),
+                        r.width,
+                        theme.border_width(),
+                    ),
+                    page,
+                );
+            }
             cx.fill(
                 Rect::new(
                     r.x + theme.px(6),
@@ -691,7 +722,7 @@ fn open_popup_at(
 
 pub fn tabs_event(t: &Tabs, node: &Node, ev: &Event, st: &mut StateStore, cx: &mut EventCx) {
     let theme = cx.theme.clone();
-    let h = strip_height(&theme);
+    let h = strip_height(t, &theme);
     let n = t.items.len();
     let active = index_of(t, &t.active);
     match ev {

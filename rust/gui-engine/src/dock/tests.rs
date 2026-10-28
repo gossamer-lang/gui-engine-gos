@@ -357,7 +357,7 @@ mod session {
                     let window = if key == "main" { "" } else { key };
                     view(&shown.borrow(), "dock", window, &panes(&value.borrow()))
                 },
-                Vec::new,
+                |_| Vec::new(),
             );
             s.open_window("main", "Dock", 900, 600).unwrap();
             s.step().unwrap();

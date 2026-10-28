@@ -1098,6 +1098,7 @@ fn node_view(node: &Node, dock: &str, panes: &HashMap<String, Pane>) -> Widget {
                 workspace: dock.to_string(),
                 add_button: false,
                 detachable: true,
+                joined: false,
             })
         }
     }

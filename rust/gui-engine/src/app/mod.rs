@@ -37,7 +37,7 @@ use crate::dialogs::host;
 use crate::dialogs::request::{DialogRequest, Modality};
 use crate::geometry::{Constraints, Rect, Size, UNBOUNDED};
 use crate::render::Canvas;
-use crate::render::presenter::WindowRenderer;
+use crate::render::presenter::{Painted, WindowRenderer};
 use crate::services;
 use crate::style::Theme;
 use crate::style::color::Color;
@@ -98,6 +98,10 @@ pub struct WindowState {
     pub theme: Theme,
     pub focus: String,
     pub focus_visible: bool,
+    /// The latest input was a key rather than the pointer. Focus the
+    /// toolkit moves on its own (into an opening dialog) shows its ring
+    /// only then.
+    pub keyboard_input: bool,
     /// Focus to restore as popups and dialogs close.
     pub popup_focus: Option<String>,
     pub focus_stack: Vec<String>,
@@ -153,11 +157,14 @@ struct Timer {
     repeat: i64,
 }
 
+/// The application's commands for the window with the key it is given.
+pub type WindowCommands = Box<dyn Fn(&str) -> Vec<Command>>;
+
 /// The application half of the Elm shape.
 pub struct Shell {
     pub update: Box<dyn FnMut(UiMsg)>,
     pub view: Box<dyn Fn(&str) -> Widget>,
-    pub commands: Box<dyn Fn() -> Vec<Command>>,
+    pub commands: WindowCommands,
 }
 
 // The key prefix of the window a file dialog opens in, followed by the key
@@ -428,6 +435,9 @@ fn with_preferences(
     if !explicit_text_scale && let Some(f) = prefs.text_scale {
         t.text_scale = f.clamp(0.5, 3.0)
     };
+    if let Some(points) = prefs.menu_font_size.filter(|p| (4.0..=72.0).contains(p)) {
+        t.typography = t.typography.with_menu_points(points)
+    }
     t
 }
 
@@ -444,7 +454,7 @@ impl Session {
         &mut self,
         update: impl FnMut(UiMsg) + 'static,
         view: impl Fn(&str) -> Widget + 'static,
-        commands: impl Fn() -> Vec<Command> + 'static,
+        commands: impl Fn(&str) -> Vec<Command> + 'static,
     ) {
         self.shell = Some(Shell {
             update: Box::new(update),
@@ -622,6 +632,7 @@ impl Session {
             theme: theme.clone(),
             focus: String::new(),
             focus_visible: false,
+            keyboard_input: false,
             popup_focus: None,
             focus_stack: vec![],
             hover: vec![],
@@ -785,7 +796,6 @@ impl Session {
                 let retained = &renderer.retained;
                 usage.rendering = usage
                     .rendering
-                    .saturating_add(retained.canvas.pixels.capacity().saturating_mul(4))
                     .saturating_add(retained.stats.scene_bytes)
                     .saturating_add(retained.stats.layer_bytes)
                     .saturating_add(retained.stats.gpu_layer_bytes);
@@ -1334,18 +1344,13 @@ impl Session {
                 for win in &mut self.windows {
                     win.states.purge_caches();
                 }
-                for win in &self.windows {
+                for win in &mut self.windows {
                     if let Some(renderer) = self.renderers.get_mut(&win.key) {
+                        // A software surface keeps its pixels; a dropped GPU
+                        // target leaves the window blank until it repaints.
+                        let blank = renderer.gpu_name().is_some();
                         renderer.purge();
-                        let (width, height) = (
-                            renderer.retained.canvas.width,
-                            renderer.retained.canvas.height,
-                        );
-                        // Dropping a GPU target must not leave a blank surface.
-                        // Present retained pixels without rebuilding the caches.
-                        if !win.occluded && width > 0 && height > 0 {
-                            renderer.present(win.native, &[Rect::new(0, 0, width, height)])?;
-                        }
+                        win.dirty |= blank;
                     }
                 }
             }
@@ -1926,6 +1931,7 @@ impl Session {
             return;
         }
         self.windows[w as usize].focus_visible = false;
+        self.windows[w as usize].keyboard_input = false;
         self.log_line(&format!("down {},{}", x, y));
         // Clicks count on our clock so simulated input double-clicks too.
         let now = self.now();
@@ -2156,6 +2162,7 @@ impl Session {
             return Ok(());
         };
         self.log_line(&format!("key {}", crate::input::key_name(key)));
+        self.windows[w as usize].keyboard_input = true;
         if key == Key::Escape && !self.windows[w as usize].capture.is_empty() {
             let capture = self.windows[w as usize].capture.clone();
             self.windows[w as usize].capture = "".to_string();
@@ -2177,10 +2184,6 @@ impl Session {
             || key == Key::Down
             || key == Key::Left
             || key == Key::Right;
-        if keyboard_nav && !self.windows[w as usize].focus_visible {
-            self.windows[w as usize].focus_visible = true;
-            self.windows[w as usize].dirty = true;
-        }
         // 1. A popup that takes keys (menus, pickers) sees them first.
         let np = self.windows[w as usize].popups.len();
         if np > 0 && self.windows[w as usize].popups[np - 1].request.takes_keys {
@@ -2204,6 +2207,13 @@ impl Session {
         }
         if handled {
             return Ok(());
+        }
+        // A key the focused widget took was input to it (a caret move, a
+        // shell's history), not a move of focus, so only one left to the
+        // window shows where focus is.
+        if keyboard_nav && !self.windows[w as usize].focus_visible {
+            self.windows[w as usize].focus_visible = true;
+            self.windows[w as usize].dirty = true;
         }
         if self.floor_layer(w) < 0 {
             // 3. Commands.
@@ -3187,7 +3197,7 @@ impl Session {
         let mut cmds = commands::standard_commands();
         if let Some(ref s) = self.shell {
             let f = &s.commands;
-            for c in f() {
+            for c in f(&self.windows[w as usize].key) {
                 // Application commands replace standard ones with the same id.
                 cmds = cmds
                     .iter()
@@ -3594,7 +3604,10 @@ impl Session {
                 }
                 Effect::SetThemeTokens(tokens) => {
                     self.base_theme = self.base_theme.with_tokens(&tokens);
-                    self.retheme()
+                    self.retheme();
+                    // The tokens carry a whole type ramp; the desktop's menu
+                    // size goes back over it.
+                    self.apply_system_preferences()
                 }
                 Effect::SetLocale(catalog) => {
                     self.base_theme.rtl = catalog.rtl();
@@ -4237,7 +4250,7 @@ impl Session {
         if !target.is_empty() {
             self.set_focus(w, &target)
         };
-        self.windows[w as usize].focus_visible = true;
+        self.windows[w as usize].focus_visible = self.windows[w as usize].keyboard_input;
         self.speak(&host::announcement(&self.windows[w as usize].dialogs[k]));
         if modality == Modality::Application {
             let _ = self.windows[w as usize].native.focus();
@@ -4634,33 +4647,34 @@ impl Session {
                 self.frame_leases.insert(key.clone(), lease);
             }
         }
-        let mut renderer = self.renderers.remove(&key).unwrap_or_default();
-        let recording = renderer.retained.recording(pw, ph);
+        let recording = self
+            .renderers
+            .entry(key.clone())
+            .or_default()
+            .retained
+            .recording(pw, ph);
         let mut recorded = self.paint_window(w, recording);
         if let Some(error) = recorded.paint_error.take() {
             return Err(errors::new(error));
         }
-        let damage = if let Some(scene) = recorded.take_scene() {
-            renderer.retained.update(pw, ph, scene)
-        } else {
-            // A scene larger than its budget still paints correctly without
-            // retaining an unbounded command list. Reuse its framebuffer.
-            let canvas = std::mem::replace(&mut renderer.retained.canvas, Canvas::new(0, 0));
-            let canvas = if canvas.width == pw && canvas.height == ph {
-                canvas
-            } else {
-                Canvas::new(pw, ph)
-            };
-            renderer.retained.purge();
-            renderer.retained.canvas = self.paint_window(w, canvas);
-            if let Some(error) = renderer.retained.canvas.paint_error.take() {
-                return Err(errors::new(error));
+        let painted = match recorded.take_scene() {
+            Some(scene) => Painted::Scene(scene),
+            None => {
+                // A scene larger than its budget still paints correctly
+                // without retaining an unbounded command list.
+                let mut canvas = self.paint_window(w, Canvas::new(pw, ph));
+                if let Some(error) = canvas.paint_error.take() {
+                    return Err(errors::new(error));
+                }
+                Painted::Frame(canvas)
             }
-            vec![Rect::new(0, 0, pw, ph)]
         };
-        let presented = renderer.present(self.windows[w as usize].native, &damage);
-        self.renderers.insert(key, renderer);
-        presented?;
+        let native = self.windows[w as usize].native;
+        let damage = self
+            .renderers
+            .entry(key)
+            .or_default()
+            .present(native, pw, ph, painted)?;
         self.windows[w as usize].dirty = false;
         if !damage.is_empty() {
             self.windows[w as usize].frames += 1;
@@ -5192,10 +5206,7 @@ impl Session {
         if let Some(renderer) = self.renderers.get_mut(&self.windows[w as usize].key)
             && let Some(pixels) = renderer.gpu_capture()?
         {
-            let mut canvas = Canvas::new(
-                renderer.retained.canvas.width,
-                renderer.retained.canvas.height,
-            );
+            let mut canvas = Canvas::new(renderer.retained.width, renderer.retained.height);
             canvas.pixels = pixels;
             return Ok(canvas);
         }
@@ -5789,6 +5800,7 @@ mod dialog_scope_tests {
             reduced_motion: motion,
             accent,
             text_scale: text,
+            menu_font_size: None,
         }
     }
 
@@ -5845,6 +5857,24 @@ mod dialog_scope_tests {
             ),
             base
         )
+    }
+
+    #[test]
+    fn the_desktop_menu_font_size_sets_menu_text_and_leaves_body_text() {
+        let base = crate::style::Theme::light();
+        let mut desktop = prefs(None, None, None, None);
+        desktop.menu_font_size = Some(11.0);
+        let t = super::with_preferences(base.clone(), desktop, None, false, false, false);
+        let menu = t.font(crate::style::TextRole::Menu);
+        assert!((menu.size - 11.0 * 96.0 / 72.0 * t.scale * t.text_scale).abs() < 1e-9);
+        assert_eq!(
+            t.font(crate::style::TextRole::Body),
+            base.font(crate::style::TextRole::Body)
+        );
+        // A size no desktop uses is ignored.
+        desktop.menu_font_size = Some(0.0);
+        let kept = super::with_preferences(base.clone(), desktop, None, false, false, false);
+        assert_eq!(kept, base);
     }
 
     #[test]
@@ -6256,7 +6286,7 @@ mod growth_tests {
                 crate::services::remove_test_config(&config);
             });
             let mut s = crate::app::start("Shown", "dev.gossamer.gui-shown-test").unwrap();
-            s.set_shell(|_m| (), |_k| view(""), std::vec::Vec::new);
+            s.set_shell(|_m| (), |_k| view(""), |_k| Vec::new());
             s.prepare_window("main", "Shown", 300, 120).unwrap();
             let win = s.windows[0].native;
             assert!(!win.is_visible());
@@ -6571,7 +6601,7 @@ mod retained_render_tests {
             let config = crate::services::private_test_config();
             let _cleanup = scopeguard::guard((), |_| crate::services::remove_test_config(&config));
             let mut s = start("Retained tests", "dev.gossamer.retained-tests").unwrap();
-            s.set_shell(|_| {}, |_| Widget::label("Retained"), Vec::new);
+            s.set_shell(|_| {}, |_| Widget::label("Retained"), |_| Vec::new());
             s.open_window("main", "Retained", 320, 200).unwrap();
             let id = s.windows[0].native.id();
             let before = s.windows[0].frames;
@@ -6667,6 +6697,54 @@ mod advance_tests {
             assert!(s.semantics(0).dump().contains("ticks 10"));
             s.advance(50).unwrap();
             assert!(s.semantics(0).dump().contains("ticks 11"));
+            s.shutdown()
+        })
+    }
+}
+
+#[cfg(test)]
+mod window_command_tests {
+    use super::*;
+
+    #[test]
+    fn a_dialog_shows_its_focus_ring_only_when_the_keyboard_opened_it() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _cleanup = scopeguard::guard((), |_| crate::services::remove_test_config(&config));
+            let mut s = start("Focus rings", "dev.gossamer.focus-rings").unwrap();
+            s.set_shell(|_| {}, |_| Widget::label("Content"), |_| Vec::new());
+            s.open_window("main", "Main", 320, 200).unwrap();
+            let info = |id: &str| crate::dialogs::request::info(id, "Info", "Text");
+            s.click_at(10, 10).unwrap();
+            s.open_dialog_in(0, &info("pointer"));
+            assert!(!s.windows[0].focus_visible);
+            s.close_dialog("pointer", &crate::dialogs::Outcome::Accepted);
+            s.press(windowing::Key::A, windowing::Mods::default())
+                .unwrap();
+            s.open_dialog_in(0, &info("keyboard"));
+            assert!(s.windows[0].focus_visible);
+            s.shutdown()
+        })
+    }
+
+    #[test]
+    fn each_window_builds_its_commands_for_its_own_key() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _cleanup = scopeguard::guard((), |_| crate::services::remove_test_config(&config));
+            let mut s = start("Window commands", "dev.gossamer.window-commands").unwrap();
+            s.set_shell(
+                |_| {},
+                Widget::label,
+                |key| vec![Command::new("which", key).checked(key == "second")],
+            );
+            s.open_window("main", "Main", 320, 200).unwrap();
+            s.open_window("second", "Second", 320, 200).unwrap();
+            for (w, key) in [(0, "main"), (1, "second")] {
+                let which = s.windows[w].commands.get("which").unwrap();
+                assert_eq!(which.label, key);
+                assert_eq!(which.checked, i64::from(key == "second"));
+            }
             s.shutdown()
         })
     }

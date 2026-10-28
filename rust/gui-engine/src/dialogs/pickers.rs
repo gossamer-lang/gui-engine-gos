@@ -40,6 +40,7 @@ fn fields(inst: &Instance) -> Vec<PreferenceField> {
                 }
             }
         }
+        DialogRequest::Form { ref fields, .. } => out.extend(fields.iter().cloned()),
         _ => (),
     }
     out
@@ -218,6 +219,9 @@ pub fn actions(inst: &Instance) -> Vec<DialogAction> {
                 ButtonRole::Accept,
             ))
         }
+        DialogRequest::Form { ref accept, .. } => {
+            out.push(DialogAction::new("ok", accept, ButtonRole::Accept))
+        }
         _ => out.push(DialogAction::new("ok", "OK", ButtonRole::Accept)),
     }
     out
@@ -250,8 +254,22 @@ fn editor(inst: &Instance, key: &str, title: &str, text: &str) -> Widget {
         crate::widgets::textinput::InputKind::Line,
     );
     field.label = title.to_string();
-    Widget::column(&[Widget::label(title), Widget::input(&field)], 4)
+    stacked(&[Widget::label(title), Widget::input(&field)], 4)
 }
+
+// A column whose children take its whole width, as a form's fields do.
+pub(crate) fn stacked(children: &[Widget], spacing: i64) -> Widget {
+    Widget::flex(
+        crate::widgets::Axis::Vertical,
+        children,
+        spacing,
+        crate::widgets::MainAlign::Start,
+        crate::widgets::CrossAlign::Stretch,
+    )
+}
+
+// A settings dialog this small reads at a glance; search helps a long one.
+const SEARCHABLE_FIELDS: usize = 12;
 fn shown_fields(inst: &Instance) -> Vec<PreferenceField> {
     match inst.request {
         DialogRequest::Preferences { ref pages, .. } => {
@@ -283,6 +301,7 @@ fn shown_fields(inst: &Instance) -> Vec<PreferenceField> {
                     .clone()
             }
         }
+        DialogRequest::Form { ref fields, .. } => fields.clone(),
         _ => vec![],
     }
 }
@@ -296,7 +315,7 @@ fn field_view(inst: &Instance, field: &PreferenceField) -> Widget {
                 .iter()
                 .map(|p| crate::widgets::completion::CompletionItem::new(&p.0, &p.1))
                 .collect::<Vec<_>>();
-            Widget::column(
+            stacked(
                 &[
                     Widget::label(&field.label),
                     Widget::select(&id, &items, &text, &field.label),
@@ -304,6 +323,7 @@ fn field_view(inst: &Instance, field: &PreferenceField) -> Widget {
                 4,
             )
         }
+        // A number keeps its box's own width; the label column sets none.
         PreferenceKind::Number(min, max) => Widget::column(
             &[
                 Widget::label(&field.label),
@@ -312,9 +332,27 @@ fn field_view(inst: &Instance, field: &PreferenceField) -> Widget {
             ],
             4,
         ),
+        PreferenceKind::Integer(min, max) => Widget::column(
+            &[
+                Widget::label(&field.label),
+                Widget::spin_box(
+                    &id,
+                    text.to_f64().unwrap_or(min as f64),
+                    min as f64,
+                    max as f64,
+                    1.0,
+                    0,
+                )
+                .accessible(&field.label),
+            ],
+            4,
+        ),
         _ => editor(inst, &format!("field:{}", field.key), &field.label, &text),
     };
-    Widget::column(&[control, Widget::muted(&field.help)], 2)
+    if field.help.is_empty() {
+        return control;
+    }
+    stacked(&[control, Widget::muted(&field.help)], 2)
 }
 pub fn body(inst: &Instance, theme: &Theme) -> Widget {
     let mut rows = vec![];
@@ -493,22 +531,31 @@ pub fn body(inst: &Instance, theme: &Theme) -> Widget {
             rows.push(Widget::Custom(preview))
         }
         DialogRequest::Preferences { ref pages, .. } => {
-            rows.push(editor(
-                inst,
-                "search",
-                &crate::localization::tr("Search settings"),
-                &value(inst, "search"),
-            ));
-            let mut nav = vec![];
-            for (i, p) in pages.iter().enumerate() {
-                nav.push(Widget::flat_button(
-                    &cid(inst, &format!("page:{}", i)),
-                    &p.title,
+            if fields(inst).len() > SEARCHABLE_FIELDS {
+                rows.push(editor(
+                    inst,
+                    "search",
+                    &crate::localization::tr("Search settings"),
+                    &value(inst, "search"),
                 ));
             }
-            rows.push(Widget::flow(&nav, 4));
+            if pages.len() > 1 {
+                let mut nav = vec![];
+                for (i, p) in pages.iter().enumerate() {
+                    nav.push(Widget::flat_button(
+                        &cid(inst, &format!("page:{}", i)),
+                        &p.title,
+                    ));
+                }
+                rows.push(Widget::flow(&nav, 4));
+            }
             for field in shown_fields(inst) {
                 rows.push(field_view(inst, &field))
+            }
+        }
+        DialogRequest::Form { ref fields, .. } => {
+            for field in fields {
+                rows.push(field_view(inst, field))
             }
         }
         DialogRequest::Wizard { ref pages, .. } if !pages.is_empty() => {
@@ -524,26 +571,12 @@ pub fn body(inst: &Instance, theme: &Theme) -> Widget {
     if !inst.error.is_empty() {
         rows.push(Widget::text(&inst.error, TextRole::Small, Tone::Danger))
     };
-    let checking = waiting(inst);
     // The drafts being checked stay as they were sent.
-    let content = Widget::scroll(
+    Widget::scroll_to_fit(
         &cid(inst, "content"),
-        Widget::column(&rows, 8).disabled(checking),
+        stacked(&rows, 8).disabled(waiting(inst)),
     )
-    .max_height(600);
-    if !checking {
-        return content;
-    };
-    Widget::column(
-        &[
-            content,
-            crate::widgets::feedback::spinner(
-                &cid(inst, "checking"),
-                &crate::localization::tr("Checking\u{2026}"),
-            ),
-        ],
-        8,
-    )
+    .max_height(600)
 }
 fn validate_fields(inst: &Instance, fields: &[PreferenceField]) -> Option<String> {
     for f in fields {
@@ -566,6 +599,17 @@ fn validate_fields(inst: &Instance, fields: &[PreferenceField]) -> Option<String
                         "{field}: enter a number",
                         1,
                         &crate::hmap! { "field" => f.label.clone() },
+                    ));
+                }
+            },
+            PreferenceKind::Integer(min, max) => match text.parse::<i64>() {
+                Ok(n) if (min..=max).contains(&n) => (),
+                _ => {
+                    return Some(crate::localization::message(
+                        "preferences",
+                        "{field}: enter a whole number from {min} to {max}",
+                        1,
+                        &crate::hmap! { "field" => f.label.clone(), "min" => format!("{}", min), "max" => format!("{}", max) },
                     ));
                 }
             },
@@ -858,8 +902,8 @@ fn is_checked(inst: &Instance) -> bool {
     }
 }
 
-// Whether a check is outstanding.
-fn waiting(inst: &Instance) -> bool {
+/// Whether a check the application was asked for is outstanding.
+pub(crate) fn waiting(inst: &Instance) -> bool {
     !value(inst, "check:step").is_empty()
 }
 
@@ -1034,6 +1078,17 @@ pub fn action(
                 return (n, None, effects.to_vec());
             }
             (n, Some(Outcome::Values(values)), effects.to_vec())
+        }
+        DialogRequest::Form { .. } => {
+            if let Some(why) = validate_fields(&n, &fields(&n)) {
+                n.error = why;
+                return (n, None, effects.to_vec());
+            };
+            (
+                n.clone(),
+                Some(Outcome::Values(draft(&n))),
+                effects.to_vec(),
+            )
         }
         DialogRequest::Wizard { pages, .. } => {
             if action == "back" {
@@ -1608,5 +1663,107 @@ mod tests {
             action(good, "ok", &[]).1,
             Some(Outcome::Date("2026-03-01".to_string()))
         )
+    }
+
+    fn plain(key: &str, kind: PreferenceKind, value: &str) -> PreferenceField {
+        PreferenceField {
+            key: key.to_string(),
+            label: key.to_string(),
+            kind,
+            value: value.to_string(),
+            default: value.to_string(),
+            help: "".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_form_answers_its_fields_under_its_own_accept_button() {
+        let fields = [
+            plain("query", PreferenceKind::Text, "needle"),
+            plain("regex", PreferenceKind::Toggle, "false"),
+        ];
+        let inst = Instance::new(&request::form("find", "Find", &fields, "Find"), "test");
+        let actions = super::actions(&inst);
+        assert!(actions.iter().any(|a| a.id == "ok" && a.label == "Find"));
+        assert_eq!(super::initial_focus(&inst), "dlg:find:field:query");
+        let mut st = StateStore::new();
+        let (checked, _, _) = message(
+            inst,
+            &UiMsg::Toggle("dlg:find:field:regex".to_string(), true),
+            "field:regex",
+            &mut st,
+        );
+        let mut want = HashMap::new();
+        want.insert("query".to_string(), "needle".to_string());
+        want.insert("regex".to_string(), "true".to_string());
+        assert_eq!(action(checked, "ok", &[]).1, Some(Outcome::Values(want)));
+    }
+
+    #[test]
+    fn a_whole_number_field_refuses_fractions_and_values_out_of_range() {
+        let fields = [plain("rows", PreferenceKind::Integer(0, 100), "10")];
+        let inst = Instance::new(&request::form("f", "Rows", &fields, "OK"), "test");
+        let mut st = StateStore::new();
+        for (text, accepted) in [("50", true), ("2.5", false), ("101", false)] {
+            let (n, _, _) = message(
+                inst.clone(),
+                &UiMsg::Text("dlg:f:field:rows".to_string(), text.to_string()),
+                "field:rows",
+                &mut st,
+            );
+            assert_eq!(action(n, "ok", &[]).1.is_some(), accepted, "{text}");
+        }
+    }
+
+    // The dialog's laid-out height in a window `height` tall, and the number
+    // of scrolling viewports in it.
+    fn dialog_height(inst: &Instance, height: i64) -> (i64, usize) {
+        use crate::geometry::{Constraints, Size};
+        let theme = crate::style::Theme::light();
+        let mut cx =
+            crate::widgets::cx::LayoutCx::new(&theme, &StateStore::new(), Size::new(760, height));
+        let view = crate::dialogs::host::view(inst, &theme);
+        let node = view.layout(Constraints::loose(Size::new(760, height)), &mut cx);
+        (
+            node.size().height,
+            format!("{view:?}").matches("Scroll(").count(),
+        )
+    }
+
+    #[test]
+    fn a_form_takes_its_content_height_and_scrolls_once_when_the_window_is_short() {
+        let fields = [
+            plain("query", PreferenceKind::Text, "needle"),
+            plain("regex", PreferenceKind::Toggle, "false"),
+        ];
+        let inst = Instance::new(&request::form("find", "Find", &fields, "Find"), "test");
+        let (tall, viewports) = dialog_height(&inst, 2000);
+        assert!(tall < 600, "{tall}");
+        assert_eq!(viewports, 1);
+        let page = PreferencePage {
+            key: "general".to_string(),
+            title: "General".to_string(),
+            fields: (0..10)
+                .map(|i| plain(&format!("f{i}"), PreferenceKind::Text, "x"))
+                .collect(),
+        };
+        let settings = Instance::new(&request::preferences("p", "Settings", &[page]), "test");
+        let (short, viewports) = dialog_height(&settings, 400);
+        assert!(short <= 400, "{short}");
+        assert_eq!(viewports, 1);
+    }
+
+    #[test]
+    fn a_short_single_page_settings_dialog_shows_no_search_or_page_list() {
+        let page = PreferencePage {
+            key: "general".to_string(),
+            title: "General".to_string(),
+            fields: vec![field()],
+        };
+        let inst = Instance::new(&request::preferences("p", "Settings", &[page]), "test");
+        let shown = format!("{:?}", super::body(&inst, &crate::style::Theme::light()));
+        assert!(!shown.contains("dlg:p:search"), "{shown}");
+        assert!(!shown.contains("dlg:p:page:0"), "{shown}");
+        assert!(shown.contains("dlg:p:field:count"), "{shown}");
     }
 }

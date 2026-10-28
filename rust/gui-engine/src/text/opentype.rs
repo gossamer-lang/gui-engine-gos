@@ -175,26 +175,27 @@ pub fn kern_table(face: &Face, glyphs: &mut [GlyphInfo]) {
 
 /// GDEF offsets of the glyph class definition, the mark attachment class
 /// definition and the mark glyph sets, each -1 when absent.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-struct Gdef {
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Gdef<'a> {
     classes: i64,
     attach: i64,
     mark_sets: i64,
-    data: Vec<u8>,
+    /// The font file the offsets are into.
+    data: &'a [u8],
 }
 
-impl Default for Gdef {
-    fn default() -> Gdef {
+impl Default for Gdef<'_> {
+    fn default() -> Self {
         Gdef {
             classes: -1,
             attach: -1,
             mark_sets: -1,
-            data: vec![],
+            data: &[],
         }
     }
 }
 
-fn gdef_of(face: &Face) -> Gdef {
+fn gdef_of(face: &Face) -> Gdef<'_> {
     let d = face.bytes();
     match face.table("GDEF") {
         Some((g, _)) => {
@@ -210,14 +211,14 @@ fn gdef_of(face: &Face) -> Gdef {
                 classes: if c == 0 { -1 } else { g + c },
                 attach: if a == 0 { -1 } else { g + a },
                 mark_sets: if m == 0 { -1 } else { g + m },
-                data: d.to_vec(),
+                data: d,
             }
         }
         None => Gdef {
             classes: -1,
             attach: -1,
             mark_sets: -1,
-            data: d.to_vec(),
+            data: d,
         },
     }
 }
@@ -226,7 +227,7 @@ fn glyph_class(g: &Gdef, gid: i64) -> i64 {
     if g.classes < 0 {
         0
     } else {
-        class_of(&g.data, g.classes, gid)
+        class_of(g.data, g.classes, gid)
     }
 }
 
@@ -447,19 +448,19 @@ fn skipped(g: &Gdef, flag: i64, gid: i64) -> bool {
     }
     let attach = (flag >> 8) & 0xff;
     if attach != 0 && g.attach >= 0 {
-        return class_of(&g.data, g.attach, gid) != attach;
+        return class_of(g.data, g.attach, gid) != attach;
     }
     false
 }
 
 // Whether mark glyph set `set` of GDEF covers `gid`.
 fn in_mark_set(g: &Gdef, set: i64, gid: i64) -> bool {
-    if g.mark_sets < 0 || set >= be_u16(&g.data, g.mark_sets + 2) {
+    if g.mark_sets < 0 || set >= be_u16(g.data, g.mark_sets + 2) {
         return false;
     };
-    let at = be_u16(&g.data, g.mark_sets + 4 + set * 4) * 65_536
-        + be_u16(&g.data, g.mark_sets + 6 + set * 4);
-    coverage(&g.data, g.mark_sets + at, gid) >= 0
+    let at = be_u16(g.data, g.mark_sets + 4 + set * 4) * 65_536
+        + be_u16(g.data, g.mark_sets + 6 + set * 4);
+    coverage(g.data, g.mark_sets + at, gid) >= 0
 }
 
 fn next_unskipped(g: &Gdef, flag: i64, glyphs: &[GlyphInfo], from: i64) -> i64 {
@@ -1361,11 +1362,12 @@ mod tests {
     fn a_mark_filtering_set_skips_marks_outside_it() {
         // Class definition at 0 (glyphs 10-12 are marks); mark glyph sets at
         // 10 with one set covering glyph 11.
+        let data = words(&[2, 1, 10, 12, 3, 1, 1, 0, 8, 1, 1, 11]);
         let gdef = Gdef {
             classes: 0,
             attach: -1,
             mark_sets: 10,
-            data: words(&[2, 1, 10, 12, 3, 1, 1, 0, 8, 1, 1, 11]),
+            data: &data,
         };
         let flag = USE_MARK_FILTERING_SET;
         assert!(skipped(&gdef, flag, 10));

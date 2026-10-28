@@ -538,7 +538,7 @@ mod session {
                     }
                 },
                 |_| crate::widgets::Widget::label("print"),
-                Vec::new,
+                |_| Vec::new(),
             );
             s.open_window("main", "Print", 200, 100).unwrap();
             let path = std::env::temp_dir().join(format!("gui-export-{}.pdf", std::process::id()));

@@ -222,6 +222,14 @@ fn charge(rows: u16, cols: u16, history: usize) -> Result<usize, String> {
         .ok_or_else(|| "terminal storage overflow".into())
 }
 
+/// One row of a terminal's buffer as text.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Row {
+    pub text: String,
+    /// The row runs on into the next: the program's line continues there.
+    pub wrapped: bool,
+}
+
 /// One cell's text: its character and any combining marks on it, bounded so
 /// a flood of marks cannot grow it without limit.
 pub(crate) fn cell_text(cell: &TermCell) -> String {
@@ -343,6 +351,10 @@ impl Engine {
     pub fn application_cursor(&self) -> bool {
         self.term.mode().contains(TermMode::APP_CURSOR)
     }
+    /// Rows of history kept above the screen.
+    pub fn history(&self) -> usize {
+        self.term.grid().history_size()
+    }
     /// Shows the screen `offset` rows back into the scrollback.
     pub fn scroll(&mut self, offset: usize) {
         let target = offset.min(self.term.grid().history_size());
@@ -391,6 +403,40 @@ impl Engine {
             }
         }
         out.truncate(out.trim_end().len());
+        out
+    }
+    /// Every row of the buffer, the oldest history row first and the
+    /// screen's last row last, wherever the view is scrolled. A wide
+    /// character is one character over two cells, and a row that wraps
+    /// keeps its trailing blanks.
+    pub fn rows(&self) -> Vec<Row> {
+        let grid = self.term.grid();
+        let history = grid.history_size() as i32;
+        let (screen, cols) = self.size();
+        let mut out = Vec::with_capacity(history as usize + usize::from(screen));
+        for at in -history..i32::from(screen) {
+            let line = &grid[Line(at)];
+            let mut text = String::new();
+            for col in 0..cols {
+                let cell = &line[Column(usize::from(col))];
+                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    continue;
+                }
+                let shown = cell_text(cell);
+                if shown.is_empty() {
+                    text.push(' ');
+                } else {
+                    text.push_str(&shown);
+                }
+            }
+            let wrapped = line[Column(usize::from(cols) - 1)]
+                .flags
+                .contains(Flags::WRAPLINE);
+            if !wrapped {
+                text.truncate(text.trim_end().len());
+            }
+            out.push(Row { text, wrapped });
+        }
         out
     }
     /// The text between two visible cell positions, end excluded, as a copy

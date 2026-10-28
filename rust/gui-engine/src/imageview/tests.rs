@@ -160,7 +160,7 @@ mod session {
                         height: 300,
                     })
                 },
-                Vec::new,
+                |_| Vec::new(),
             );
             s.open_window("main", "Images", 400, 300).unwrap();
             // A second load supersedes the first; only its outcome is reported.

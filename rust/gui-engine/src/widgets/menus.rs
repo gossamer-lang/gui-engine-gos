@@ -140,6 +140,10 @@ impl Default for MenuState {
 pub struct MenuBar {
     pub id: String,
     pub menus: Vec<Menu>,
+    /// Joins the bar to the content below it: the bar takes the field
+    /// color a text area or terminal fills with and draws no dividing line.
+    #[serde(default)]
+    pub joined: bool,
 }
 
 /// A widget with a context menu on right-click, Shift+F10, or the Menu key.
@@ -271,8 +275,13 @@ fn visible(items: &[MenuItem], registry: &[Command]) -> Vec<MenuItem> {
 
 // ---- geometry ----
 
+// The height of one line of menu text.
+fn menu_line(theme: &Theme) -> i64 {
+    layout::measure("Mg", &theme.font(TextRole::Menu)).1.ceil() as i64
+}
+
 fn row_h(theme: &Theme) -> i64 {
-    theme.px(36).max(theme.row_height() - theme.px(8))
+    menu_line(theme) + theme.px(12)
 }
 
 fn sep_h(theme: &Theme) -> i64 {
@@ -285,8 +294,8 @@ fn pad(theme: &Theme) -> i64 {
 
 /// The panel size of a menu's items.
 pub fn panel_size(items: &[MenuItem], theme: &Theme, registry: &[Command]) -> Size {
-    let body = theme.font(TextRole::Body);
-    let small = theme.font(TextRole::Small);
+    let body = theme.font(TextRole::Menu);
+    let small = body.clone();
     let mut w = theme.px(200);
     let mut h = pad(theme) * 2;
     for it in visible(items, registry) {
@@ -371,7 +380,7 @@ fn step(items: &[MenuItem], from: i64, dir: i64, registry: &[Command]) -> i64 {
 // ---- menu bar ----
 
 fn title_rects(b: &MenuBar, theme: &Theme, height: i64) -> Vec<Rect> {
-    let body = theme.font(TextRole::Body);
+    let body = theme.font(TextRole::Menu);
     let mut x = theme.px(4);
     let mut out = vec![];
     for m in &b.menus {
@@ -386,7 +395,7 @@ fn title_rects(b: &MenuBar, theme: &Theme, height: i64) -> Vec<Rect> {
 
 pub fn layout_menu_bar(b: &MenuBar, c: Constraints, cx: &mut LayoutCx) -> Node {
     let theme = &cx.theme;
-    let h = theme.px(36).max(theme.control_height() - theme.px(6));
+    let h = menu_line(theme) + theme.px(10);
     let w = if c.has_bounded_width() {
         c.max_width
     } else {
@@ -408,19 +417,23 @@ pub fn layout_menu_bar(b: &MenuBar, c: Constraints, cx: &mut LayoutCx) -> Node {
 pub fn paint_menu_bar(b: &MenuBar, node: &Node, cx: &mut PaintCx) {
     let theme = cx.theme.clone();
     let r = Rect::from_size(node.size());
-    cx.fill(r, theme.surface_alt);
-    cx.fill(
-        Rect::new(
-            0,
-            r.height - theme.border_width(),
-            r.width,
-            theme.border_width(),
-        ),
-        theme.border,
-    );
+    if b.joined {
+        cx.fill(r, theme.field);
+    } else {
+        cx.fill(r, theme.surface_alt);
+        cx.fill(
+            Rect::new(
+                0,
+                r.height - theme.border_width(),
+                r.width,
+                theme.border_width(),
+            ),
+            theme.border,
+        );
+    }
     let st = cx.states.menu(&b.id);
     let focused = cx.is_focused(&b.id);
-    let body = theme.font(TextRole::Body);
+    let body = theme.font(TextRole::Menu);
     let mut i = 0;
     while i < b.menus.len() && i < node.parts.len() {
         let part = node.parts[i];
@@ -663,8 +676,8 @@ pub fn paint_panel(root: &[MenuItem], owner: &str, level: i64, rect: Rect, cx: &
         theme.border_width(),
         theme.border,
     );
-    let body = theme.font(TextRole::Body);
-    let small = theme.font(TextRole::Small);
+    let body = theme.font(TextRole::Menu);
+    let small = body.clone();
     let saved = cx.canvas.clip;
     cx.canvas.push_clip(rect);
     let mut i = 0;
@@ -1367,11 +1380,14 @@ fn native_entries(
 #[cfg(test)]
 mod tests {
     use super::{
-        Menu, item, mnemonic, native_menu_bar, panel_size, radio, separator, step, submenu,
+        Menu, MenuBar, item, layout_menu_bar, menu_line, mnemonic, native_menu_bar, panel_size,
+        radio, separator, step, submenu,
     };
     use crate::commands::Command;
-
+    use crate::geometry::{Constraints, Size};
     use crate::style::Theme;
+    use crate::widgets::cx::LayoutCx;
+    use crate::widgets::state::StateStore;
 
     #[test]
     fn a_menu_bar_maps_onto_native_menus_with_command_state() {
@@ -1450,6 +1466,29 @@ mod tests {
         assert_eq!(step(&items, 0, 1, &reg), 3);
         assert_eq!(step(&items, 3, 1, &reg), 0);
         assert_eq!(step(&items, -1, -1, &reg), 3)
+    }
+
+    #[test]
+    fn the_bar_and_its_rows_follow_the_menu_font() {
+        let reg = vec![Command::new("a", "A")];
+        let standard = Theme::light();
+        let mut desktop = Theme::light();
+        desktop.typography = desktop.typography.with_menu_points(9.0);
+        let bar = MenuBar {
+            id: "menu".into(),
+            menus: vec![Menu::new("&File", &[item("a")])],
+            joined: true,
+        };
+        let height = |theme: &Theme| {
+            let mut cx = LayoutCx::new(theme, &StateStore::default(), Size::new(800, 600));
+            layout_menu_bar(&bar, Constraints::loose(Size::new(800, 600)), &mut cx)
+                .size()
+                .height
+        };
+        assert!(height(&desktop) < height(&standard));
+        assert!(height(&desktop) > menu_line(&desktop));
+        let rows = |theme: &Theme| panel_size(&[item("a")], theme, &reg).height;
+        assert!(rows(&desktop) < rows(&standard));
     }
 
     #[test]

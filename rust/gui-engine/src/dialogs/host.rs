@@ -401,29 +401,31 @@ pub fn panel(inst: &Instance, body: Widget) -> Widget {
     );
     let title = Widget::text(&inst.title(), TextRole::Heading, Tone::Normal).grow(1);
     let header = Widget::row(&[title, close], 8);
-    let file = matches!(inst.request, DialogRequest::File { .. })
-        || matches!(inst.request, DialogRequest::Color { .. })
-        || matches!(inst.request, DialogRequest::Font { .. })
-        || matches!(inst.request, DialogRequest::Date { .. })
-        || matches!(inst.request, DialogRequest::Preferences { .. })
-        || matches!(inst.request, DialogRequest::Wizard { .. });
-    // The browser already scrolls its places and entries. Keep its toolbar in
-    // the bounded body so focusing the list cannot scroll navigation away.
+    // These bodies bound and scroll their own content, so they take what the
+    // header and buttons leave instead of nesting a second viewport.
+    let bounded = matches!(
+        inst.request,
+        DialogRequest::File { .. }
+            | DialogRequest::Color { .. }
+            | DialogRequest::Font { .. }
+            | DialogRequest::Date { .. }
+            | DialogRequest::Preferences { .. }
+            | DialogRequest::Form { .. }
+            | DialogRequest::Wizard { .. }
+            | DialogRequest::Shortcut { .. }
+    );
     let browser = matches!(inst.request, DialogRequest::File { .. });
-    let shortcut = matches!(inst.request, DialogRequest::Shortcut { .. });
-    let mut rows = vec![
-        header,
-        if browser || shortcut {
-            body.grow(1)
-        } else if file {
-            Widget::scroll_to_fit(&inst.cid("body"), body).grow(1)
-        } else {
-            body
-        },
-    ];
+    let mut rows = vec![header, if bounded { body.grow(1) } else { body }];
     let actions = ordered(&actions_of(inst));
     if !actions.is_empty() {
-        let mut buttons = vec![Widget::stretch()];
+        let mut buttons = vec![];
+        if crate::dialogs::pickers::waiting(inst) {
+            buttons.push(crate::widgets::feedback::spinner(
+                &inst.cid("checking"),
+                &crate::localization::tr("Checking\u{2026}"),
+            ))
+        }
+        buttons.push(Widget::stretch());
         for a in actions {
             buttons.push(button_for(inst, &a))
         }
@@ -680,7 +682,7 @@ fn input_body(inst: &Instance, label: &str, spec: &InputSpec) -> Widget {
             if rows.is_empty() {
                 rows.push(Widget::muted("No matches"))
             }
-            Widget::column(
+            crate::dialogs::pickers::stacked(
                 &[
                     Widget::input(&field),
                     Widget::scroll(&inst.cid("list"), Widget::column(&rows, 2)).max_height(320),
@@ -705,7 +707,7 @@ fn input_body(inst: &Instance, label: &str, spec: &InputSpec) -> Widget {
                     &crate::hmap! { "min" => format!("{}", min), "max" => format!("{}", max) },
                 );
             }
-            Widget::column(&[Widget::label(label), Widget::input(&field)], 6)
+            crate::dialogs::pickers::stacked(&[Widget::label(label), Widget::input(&field)], 6)
         }
     }
 }

@@ -532,6 +532,8 @@ pub fn paint_input(t: &TextInput, node: &Node, cx: &mut PaintCx) {
         theme.field
     };
     cx.fill_round(field, radius, bg);
+    // A field shows focus by its accent edge and caret whatever the input
+    // modality, so it draws no separate focus ring.
     let edge = if invalid {
         theme.danger
     } else if focused {
@@ -759,9 +761,6 @@ pub fn paint_input(t: &TextInput, node: &Node, cx: &mut PaintCx) {
             theme.text_muted
         };
         layout::draw(&mut cx.canvas, &l, a.x as f64, a.y as f64, &small, color)
-    }
-    if focused {
-        cx.focus_ring(field, radius)
     }
 }
 

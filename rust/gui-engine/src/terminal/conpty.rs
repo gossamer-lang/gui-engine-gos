@@ -240,6 +240,18 @@ impl Pty {
         self.pid
     }
 
+    /// A console does not say which program holds it, so no job is reported.
+    pub fn busy(&self) -> bool {
+        false
+    }
+
+    /// Windows has no POSIX signals to send to a console program.
+    pub fn signal(&self, signum: i32) -> Result<(), String> {
+        Err(format!(
+            "signal {signum} cannot be sent: Windows has no POSIX signals"
+        ))
+    }
+
     /// Terminates the program, closes the pseudo-console and joins every IO
     /// thread.
     pub fn close(&mut self) -> Result<(), String> {

@@ -345,10 +345,9 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
             col = end.max(col + 1);
         }
     }
+    // The cursor shows focus, filled while the terminal has it and hollow
+    // otherwise, so the terminal draws no focus ring around its screen.
     paint_cursor(&frame, focused, cx, (cw, lh, pad));
-    if focused {
-        cx.focus_ring(r, 0);
-    }
 }
 
 fn paint_cursor(frame: &Frame, focused: bool, cx: &mut PaintCx, (cw, lh, pad): (f64, f64, i64)) {
@@ -453,6 +452,12 @@ fn printable(key: Key, shift: bool) -> Option<char> {
         return Some((b'0' + i as u8) as char);
     }
     (key == Key::Space).then_some(' ')
+}
+
+// A key whose Ctrl+Shift chord the terminal leaves to the application:
+// letters, digits, PageUp and PageDown.
+fn application_chord(key: Key) -> bool {
+    printable(key, false).is_some_and(|c| c != ' ') || key == Key::PageUp || key == Key::PageDown
 }
 
 fn ime_area(v: &View, cx: &mut EventCx) {
@@ -607,6 +612,16 @@ fn key_down(v: &View, key: Key, mods: windowing::Mods, rows: i64, cx: &mut Event
     if mods.ctrl && mods.shift && key == Key::V {
         let _ = super::paste(v.terminal, &crate::services::clipboard::text());
         return redraw(cx);
+    }
+    // The rest of the Ctrl+Shift layer belongs to the application, as in
+    // other desktop terminals, so those strokes reach the window's commands.
+    if mods.ctrl && mods.shift && application_chord(key) {
+        return;
+    }
+    // F10 opens the window's menu bar, as in GNOME Terminal; Shift+F10 opens
+    // a context menu.
+    if key == Key::F10 && !mods.ctrl && !mods.alt {
+        return;
     }
     if mods.shift && !mods.ctrl && (key == Key::PageUp || key == Key::PageDown) {
         let page = if key == Key::PageUp { rows } else { -rows };

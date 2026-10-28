@@ -287,6 +287,7 @@ pub fn paint_numeric(n: &Numeric, node: &Node, cx: &mut PaintCx) {
             let r = Rect::from_size(node.size());
             let e = spin_state(s, &cx.states);
             let invalid = !cx.states.field(&s.id, "invalid", "").is_empty();
+            // Like a text field, a spin box shows focus by its accent edge.
             let focused = cx.is_focused(&s.id);
             cx.fill_round(
                 r,
@@ -380,10 +381,6 @@ pub fn paint_numeric(n: &Numeric, node: &Node, cx: &mut PaintCx) {
                         theme.text
                     },
                 )
-            }
-            if focused {
-                let rad = theme.radius();
-                cx.focus_ring(r, rad)
             }
         }
         Numeric::Slide(s) => {

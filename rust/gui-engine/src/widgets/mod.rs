@@ -1061,6 +1061,17 @@ impl Widget {
         Widget::MenuBar(menus::MenuBar {
             id: id.to_string(),
             menus: menus.to_vec(),
+            joined: false,
+        })
+    }
+
+    /// A menu bar joined to the content below it: it takes the field color
+    /// a text area or terminal fills with, and no line divides the two.
+    pub fn joined_menu_bar(id: &str, menus: &[menus::Menu]) -> Widget {
+        Widget::MenuBar(menus::MenuBar {
+            id: id.to_string(),
+            menus: menus.to_vec(),
+            joined: true,
         })
     }
 
@@ -1085,6 +1096,24 @@ impl Widget {
             workspace: "".to_string(),
             add_button: true,
             detachable: false,
+            joined: false,
+        })
+    }
+
+    /// A tab strip joined to the content below it, as a terminal's tabs are:
+    /// the field color, the desktop's menu text size, no dividing line, and
+    /// no new-tab button.
+    pub fn joined_tabs(id: &str, items: &[tabs::TabItem], active: &str, content: Widget) -> Widget {
+        Widget::Tabs(tabs::Tabs {
+            id: id.to_string(),
+            items: items.to_vec(),
+            active: active.to_string(),
+            content: Box::new(content),
+            pages: HashMap::new(),
+            workspace: "".to_string(),
+            add_button: false,
+            detachable: false,
+            joined: true,
         })
     }
 
@@ -1104,6 +1133,7 @@ impl Widget {
             workspace: "".to_string(),
             add_button: true,
             detachable: true,
+            joined: false,
         })
     }
 
@@ -1126,6 +1156,7 @@ impl Widget {
             workspace: workspace.to_string(),
             add_button: true,
             detachable: true,
+            joined: false,
         })
     }
 

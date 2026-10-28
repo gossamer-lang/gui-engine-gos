@@ -31,6 +31,21 @@ fn a_recorded_stream_scrolls_selects_resizes_and_releases_its_storage() {
     assert_eq!(scroll(id, -1000).unwrap(), 0);
     select(id, Some((Cell { row: 2, col: 0 }, Cell { row: 2, col: 7 }))).unwrap();
     assert_eq!(copy(id).unwrap(), "line 29");
+    // The buffer reads whole, oldest row first, wherever the view is.
+    scroll(id, 5).unwrap();
+    let buffer = rows(id).unwrap();
+    assert_eq!(buffer.len(), 27 + 4);
+    assert_eq!(snapshot(id).unwrap().history, 27);
+    assert_eq!(buffer[0].text, "line 00");
+    assert_eq!(buffer[buffer.len() - 1].text, "界 end");
+    assert!(buffer.iter().all(|row| !row.wrapped));
+    scroll(id, -5).unwrap();
+    feed(id, b"\r\n0123456789012345678901234").unwrap();
+    let wrapped = rows(id).unwrap();
+    let n = wrapped.len();
+    assert!(wrapped[n - 2].wrapped);
+    assert_eq!(wrapped[n - 2].text, "01234567890123456789");
+    assert_eq!(wrapped[n - 1].text, "01234");
     resize(id, 10, 30).unwrap();
     let resized = snapshot(id).unwrap();
     assert_eq!((resized.rows, resized.cols), (10, 30));
@@ -122,7 +137,7 @@ mod session {
                     }
                 },
                 move |_| Widget::Terminal(widget::View::new("term", id, "Shell")),
-                Vec::new,
+                |_| Vec::new(),
             );
             s.open_window("main", "Terminal", 420, 240).unwrap();
             let script = "printf '\\033]2;demo\\007ready\\r\\n'; read line; \
@@ -161,6 +176,153 @@ mod session {
     }
 
     #[test]
+    fn a_program_in_another_character_set_reads_and_writes_through_it() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::app::start("Charset", "dev.gossamer.gui-terminal-charset").unwrap();
+            let id = create(&options(8, 40, 100), crate::app::effects::current_budget()).unwrap();
+            let exited = Rc::new(RefCell::new(false));
+            let heard = exited.clone();
+            s.set_shell(
+                move |m| {
+                    if let UiMsg::Terminal(_, Event::Exited(_)) = m {
+                        *heard.borrow_mut() = true;
+                    }
+                },
+                move |_| Widget::Terminal(widget::View::new("term", id, "Latin-1")),
+                |_| Vec::new(),
+            );
+            s.open_window("main", "Charset", 420, 240).unwrap();
+            assert!(set_encoding(id, "UTF-16LE").is_err());
+            assert!(set_encoding(id, "no-such-set").is_err());
+            set_encoding(id, "ISO-8859-1").unwrap();
+            let script = "printf 'caf\\351\\r\\n'; read line; \
+                      printf 'got:'; printf '%s' \"$line\" | od -An -tx1; exit 0";
+            spawn(
+                id,
+                &Command {
+                    program: "/bin/sh".into(),
+                    args: vec!["-c".into(), script.into()],
+                    ..Command::default()
+                },
+            )
+            .unwrap();
+            assert!(s.focus("term").unwrap());
+            step_until(&mut s, || snapshot(id).unwrap().text.contains("café"));
+            s.type_text("é").unwrap();
+            s.press(windowing::Key::Return, windowing::Mods::default())
+                .unwrap();
+            step_until(&mut s, || *exited.borrow());
+            let shown = snapshot(id).unwrap().text;
+            assert!(shown.contains("got: e9"), "{shown}");
+            s.shutdown();
+        })
+    }
+
+    #[test]
+    fn ctrl_shift_letters_reach_the_window_commands_from_a_focused_terminal() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::app::start("Chords", "dev.gossamer.gui-terminal-chords").unwrap();
+            let id = create(&options(8, 40, 100), crate::app::effects::current_budget()).unwrap();
+            let ran = Rc::new(RefCell::new(Vec::new()));
+            let heard = ran.clone();
+            s.set_shell(
+                move |m| {
+                    if let UiMsg::Command(command) = m {
+                        heard.borrow_mut().push(command);
+                    }
+                },
+                move |_| Widget::Terminal(widget::View::new("term", id, "Chords")),
+                |_| {
+                    vec![
+                        crate::commands::Command::new("tab.new", "New Tab").key("Ctrl+Shift+T"),
+                        crate::commands::Command::new("tab.right", "Move Right")
+                            .key("Ctrl+Shift+PageDown"),
+                    ]
+                },
+            );
+            s.open_window("main", "Chords", 420, 240).unwrap();
+            // A running program, which a stroke the terminal took would reach.
+            spawn(
+                id,
+                &Command {
+                    program: "/bin/sh".into(),
+                    args: vec!["-c".into(), "read line".into()],
+                    ..Command::default()
+                },
+            )
+            .unwrap();
+            assert!(s.focus("term").unwrap());
+            let chord = windowing::Mods {
+                ctrl: true,
+                shift: true,
+                ..windowing::Mods::default()
+            };
+            s.press(windowing::Key::T, chord).unwrap();
+            s.press(windowing::Key::PageDown, chord).unwrap();
+            s.step().unwrap();
+            assert_eq!(
+                *ran.borrow(),
+                vec!["tab.new".to_string(), "tab.right".to_string()]
+            );
+            s.shutdown();
+        })
+    }
+
+    #[test]
+    fn f10_reaches_the_menu_bar_and_typed_arrows_show_no_focus_ring() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::app::start("Menus", "dev.gossamer.gui-terminal-menus").unwrap();
+            let id = create(&options(8, 40, 100), crate::app::effects::current_budget()).unwrap();
+            s.set_shell(
+                |_| {},
+                move |_| {
+                    Widget::column(
+                        &[
+                            Widget::joined_menu_bar(
+                                "menu",
+                                &[crate::widgets::menus::Menu::new("&File", &[])],
+                            ),
+                            Widget::Terminal(widget::View::new("term", id, "Menus")),
+                        ],
+                        0,
+                    )
+                },
+                |_| Vec::new(),
+            );
+            s.open_window("main", "Menus", 420, 240).unwrap();
+            spawn(
+                id,
+                &Command {
+                    program: "/bin/sh".into(),
+                    args: vec!["-c".into(), "read line".into()],
+                    ..Command::default()
+                },
+            )
+            .unwrap();
+            assert!(s.focus("term").unwrap());
+            s.press(windowing::Key::Up, windowing::Mods::default())
+                .unwrap();
+            assert!(!s.windows[0].focus_visible);
+            s.press(windowing::Key::F10, windowing::Mods::default())
+                .unwrap();
+            assert_eq!(s.focused(), "menu");
+            s.shutdown();
+        })
+    }
+
+    #[test]
     fn sustained_output_stays_within_its_queues_and_the_screen_keeps_the_end() {
         crate::testing::on_ui_thread(|| {
             let config = crate::services::private_test_config();
@@ -180,7 +342,7 @@ mod session {
                     }
                 },
                 move |_| Widget::Terminal(widget::View::new("term", id, "Load")),
-                Vec::new,
+                |_| Vec::new(),
             );
             s.open_window("main", "Load", 700, 420).unwrap();
             // The window's own frames are charged once it has drawn; everything

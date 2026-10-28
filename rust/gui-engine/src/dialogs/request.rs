@@ -148,6 +148,8 @@ pub enum PreferenceKind {
     Toggle,
     Text,
     Number(f64, f64),
+    /// A whole number from the first bound to the second.
+    Integer(i64, i64),
     Choice(Vec<(String, String)>),
     Color,
 }
@@ -245,6 +247,14 @@ pub enum DialogRequest {
         pages: Vec<WizardPage>,
         checked: bool,
     },
+    /// A few fields over Cancel and an accept button labelled `accept`,
+    /// answered as `Outcome::Values` keyed by field.
+    Form {
+        id: String,
+        title: String,
+        fields: Vec<PreferenceField>,
+        accept: String,
+    },
     About {
         id: String,
         name: String,
@@ -271,6 +281,7 @@ impl DialogRequest {
             | DialogRequest::File { id, .. }
             | DialogRequest::Preferences { id, .. }
             | DialogRequest::Wizard { id, .. }
+            | DialogRequest::Form { id, .. }
             | DialogRequest::About { id, .. } => id.clone(),
         }
     }
@@ -287,7 +298,8 @@ impl DialogRequest {
             | DialogRequest::Progress { title, .. }
             | DialogRequest::File { title, .. }
             | DialogRequest::Preferences { title, .. }
-            | DialogRequest::Wizard { title, .. } => title.clone(),
+            | DialogRequest::Wizard { title, .. }
+            | DialogRequest::Form { title, .. } => title.clone(),
             DialogRequest::About { name, .. } => crate::localization::message(
                 "about",
                 "About {name}",
@@ -715,6 +727,15 @@ pub fn preferences(id: &str, title: &str, pages: &[PreferencePage]) -> DialogReq
         title: title.to_string(),
         pages: pages.to_vec(),
         checked: false,
+    }
+}
+/// A form of `fields` whose accept button reads `accept`.
+pub fn form(id: &str, title: &str, fields: &[PreferenceField], accept: &str) -> DialogRequest {
+    DialogRequest::Form {
+        id: id.to_string(),
+        title: title.to_string(),
+        fields: fields.to_vec(),
+        accept: accept.to_string(),
     }
 }
 pub fn wizard(id: &str, title: &str, pages: &[WizardPage]) -> DialogRequest {

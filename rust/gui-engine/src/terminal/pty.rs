@@ -277,6 +277,42 @@ impl Pty {
         self.pid
     }
 
+    /// Whether a job other than the program runs in the terminal's
+    /// foreground, as a shell's command does.
+    pub fn busy(&self) -> bool {
+        let Some(fd) = self.master.as_ref().and_then(|m| m.as_raw_fd()) else {
+            return false;
+        };
+        // SAFETY: `fd` is the open master descriptor.
+        let foreground = unsafe { libc::tcgetpgrp(fd) };
+        foreground > 0 && foreground != self.pid as i32
+    }
+
+    /// Sends signal `signum` to the terminal's foreground process group,
+    /// the job the user is running, or to the program itself when the
+    /// terminal has no foreground group.
+    pub fn signal(&self, signum: i32) -> Result<(), String> {
+        if !(1..=64).contains(&signum) {
+            return Err(format!("{signum} is not a signal number"));
+        }
+        let foreground = match self.master.as_ref().and_then(|m| m.as_raw_fd()) {
+            // SAFETY: `fd` is the open master descriptor.
+            Some(fd) => unsafe { libc::tcgetpgrp(fd) },
+            None => -1,
+        };
+        let target = if foreground > 0 {
+            -foreground
+        } else {
+            self.pid as i32
+        };
+        // SAFETY: kill(2) checks the target and signal and reports failure.
+        if unsafe { libc::kill(target, signum) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error().to_string())
+        }
+    }
+
     /// Ends the program's process group and joins every IO thread.
     pub fn close(&mut self) -> Result<(), String> {
         if self.stopping.swap(true, Ordering::AcqRel) {
@@ -413,6 +449,35 @@ mod tests {
             got.exit.is_some()
         });
         assert_eq!(pty.drain(0).exit, Some(Ok(130)));
+        pty.close().unwrap();
+        drop(pty);
+        assert_eq!(budget.usage().0, 0);
+    }
+
+    #[test]
+    fn a_sent_signal_reaches_the_foreground_job_and_not_the_shell() {
+        let budget = Budget::new(8 * 1024 * 1024);
+        let (wake, wakes) = waker();
+        // An interactive shell runs `sleep` as its foreground job; the shell
+        // itself survives the job's SIGTERM and reports its status.
+        // The job is in the foreground before it prints.
+        let script = "set -m; sh -c 'printf ready; exec sleep 20'; echo \"job:$?\"; exit 4";
+        let mut pty = Pty::spawn(&command(script), 24, 80, &budget, wake).unwrap();
+        let mut sent = false;
+        let text = collect(&pty, &wakes, |text, got| {
+            if !sent && text.contains("ready") {
+                let fd = pty.master.as_ref().and_then(|m| m.as_raw_fd()).unwrap();
+                // SAFETY: `fd` is the open master descriptor.
+                assert_ne!(unsafe { libc::tcgetpgrp(fd) }, pty.pid() as i32);
+                assert!(pty.busy());
+                pty.signal(libc::SIGTERM).unwrap();
+                sent = true;
+            }
+            got.eof && got.exit.is_some()
+        });
+        assert!(text.contains("job:143"), "{text}");
+        assert_eq!(pty.drain(0).exit, Some(Ok(4)));
+        assert!(pty.signal(0).is_err());
         pty.close().unwrap();
         drop(pty);
         assert_eq!(budget.usage().0, 0);

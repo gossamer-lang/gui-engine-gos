@@ -1,7 +1,7 @@
 [project]
 id = "github.com/gossamer-lang/gui-engine-gos"
 version = "0.1.0"
-gossamer-version = "^v0.75.5"
+gossamer-version = "^v0.75.6"
 authors = ["Dan Pozmanter"]
 license = "Apache 2.0"
 

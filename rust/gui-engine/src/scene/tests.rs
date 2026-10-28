@@ -342,7 +342,7 @@ mod session {
                     )
                     .padding(24)
                 },
-                Vec::new,
+                |_| Vec::new(),
             );
             s.open_window("main", "Scene", 600, 420).unwrap();
             s.step().unwrap();

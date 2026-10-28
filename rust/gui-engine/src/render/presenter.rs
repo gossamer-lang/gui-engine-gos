@@ -1,5 +1,5 @@
 //! GPU composition with software fallback, sharing the exact raster reference.
-use super::retained::{Primitive, Retained};
+use super::retained::{Primitive, Retained, Scene, Target};
 use crate::{errors, geometry::Rect};
 
 // Software is the permanent default. Only recognized explicit opt-ins may
@@ -50,6 +50,69 @@ impl Conversion<'_> {
     }
 }
 
+/// What a window painted for one frame.
+pub enum Painted {
+    /// The recorded scene, diffed against the one retained.
+    Scene(Scene),
+    /// The whole frame, painted at once because its scene outgrew its budget.
+    Frame(super::Canvas),
+}
+
+fn native(damage: &[Rect]) -> Vec<windowing::display::Rect> {
+    damage
+        .iter()
+        .map(|r| windowing::display::Rect {
+            x: r.x,
+            y: r.y,
+            width: r.width,
+            height: r.height,
+        })
+        .collect()
+}
+
+// Copies `damage` of a whole-frame canvas into the window's surface.
+fn convert(
+    window: windowing::Window,
+    canvas: &super::Canvas,
+    damage: &[Rect],
+) -> Result<(), errors::Error> {
+    window.paint_surface(&native(damage), |pixels, width, height, stride, format| {
+        let screen = Rect::new(0, 0, width.min(canvas.width), height.min(canvas.height));
+        let damage: Vec<Rect> = damage
+            .iter()
+            .map(|r| r.intersect(screen))
+            .filter(|r| r.width > 0 && r.height > 0)
+            .collect();
+        let area: i64 = damage.iter().map(|r| r.width * r.height).sum();
+        let workers = std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .min((area / PIXELS_PER_WORKER) as usize)
+            .max(1);
+        let rows = (height as usize).div_ceil(workers).max(1);
+        let to_native = Conversion {
+            canvas,
+            damage: &damage,
+            stride,
+            offsets: format.rgb_offsets(),
+        };
+        let bands = pixels
+            .chunks_mut(stride as usize * rows)
+            .zip((0..).step_by(rows));
+        if workers == 1 {
+            bands.for_each(|(band, top)| to_native.band(top as i64, band));
+        } else {
+            // Bands are disjoint rows of the surface.
+            std::thread::scope(|scope| {
+                for (band, top) in bands {
+                    let to_native = &to_native;
+                    scope.spawn(move || to_native.band(top as i64, band));
+                }
+            });
+        }
+    })?;
+    Ok(())
+}
+
 #[derive(Default)]
 pub struct WindowRenderer {
     pub retained: Retained,
@@ -72,11 +135,16 @@ impl WindowRenderer {
         self.gpu = None;
         self.retry = 60;
     }
+    /// Shows a frame `width` x `height` in `window` and answers the regions
+    /// it changed. A scene is diffed against the retained one and only its
+    /// damage is painted, straight into the window's surface.
     pub fn present(
         &mut self,
         window: windowing::Window,
-        damage: &[Rect],
-    ) -> Result<(), errors::Error> {
+        width: i64,
+        height: i64,
+        painted: Painted,
+    ) -> Result<Vec<Rect>, errors::Error> {
         let mode = std::env::var("GUI_RENDERER").ok();
         let wants_gpu = gpu_requested(mode.as_deref(), &windowing::video_driver());
         if !wants_gpu {
@@ -86,23 +154,16 @@ impl WindowRenderer {
         if let Some(gpu) = &mut self.gpu {
             gpu.trim_layers(self.retained.budgets.layers);
         }
-        if damage.is_empty() {
-            self.retained.stats.gpu_layer_bytes = self.gpu.as_ref().map_or(0, |g| g.cache_bytes());
-            return Ok(());
-        }
-        let c = &self.retained.canvas;
-        let screen = Rect::new(0, 0, c.width, c.height);
-        let mut full = false;
         if self
             .gpu
             .as_ref()
-            .is_some_and(|gpu| gpu.size() != (c.width, c.height))
+            .is_some_and(|gpu| gpu.size() != (width, height))
         {
             self.gpu = None;
         }
+        let mut full = false;
         if self.gpu.is_none() && wants_gpu && self.retry == 0 {
-            full = true;
-            match windowing::compositor::Compositor::new(window, c.width, c.height) {
+            match windowing::compositor::Compositor::new(window, width, height) {
                 Ok(gpu) => {
                     self.gpu = Some(gpu);
                     full = true;
@@ -110,42 +171,59 @@ impl WindowRenderer {
                 Err(_) => self.retry = 60,
             }
         }
-        let damage = if full {
-            std::slice::from_ref(&screen)
-        } else {
-            damage
+        let screen = Rect::new(0, 0, width, height);
+        let scene = match painted {
+            Painted::Scene(scene) => scene,
+            Painted::Frame(canvas) => {
+                self.retained.purge();
+                self.retained.width = width;
+                self.retained.height = height;
+                let damage = vec![screen];
+                if let Some(gpu) = &mut self.gpu {
+                    if gpu.present(&canvas.pixels, &native(&damage), false).is_ok() {
+                        self.retained.stats.gpu_layer_bytes = gpu.cache_bytes();
+                        return Ok(damage);
+                    }
+                    self.gpu = None;
+                    self.retry = 60;
+                }
+                convert(window, &canvas, &damage)?;
+                return Ok(damage);
+            }
         };
-        let native: Vec<windowing::display::Rect> = damage
-            .iter()
-            .map(|r| windowing::display::Rect {
-                x: r.x,
-                y: r.y,
-                width: r.width,
-                height: r.height,
-            })
-            .collect();
+        let mut damage = self.retained.damage(width, height, &scene);
+        if full {
+            damage = vec![screen];
+        }
+        if damage.is_empty() {
+            self.retained.commit(scene);
+            self.retained.stats.gpu_layer_bytes = self.gpu.as_ref().map_or(0, |g| g.cache_bytes());
+            return Ok(damage);
+        }
         if let Some(gpu) = &mut self.gpu {
-            let result = if self.retained.scene().commands.is_empty() {
-                gpu.present(&c.pixels, &native, false).map(|_| ())
-            } else {
-                Self::compose(gpu, &self.retained, damage)
-            };
-            if result.is_ok() {
+            if Self::compose(gpu, &scene, self.retained.budgets.layers, &damage).is_ok() {
                 self.retained.stats.gpu_layer_bytes = gpu.cache_bytes();
-                return Ok(());
+                self.retained.commit(scene);
+                return Ok(damage);
             }
             // Device loss discards all GPU objects. Software presents this
             // frame in full; a later update retries GPU creation without a loop.
             self.gpu = None;
             self.retry = 60;
-            return self.software(window, std::slice::from_ref(&screen));
+            let damage = vec![screen];
+            self.software(window, &scene, &damage)?;
+            self.retained.commit(scene);
+            return Ok(damage);
         }
         self.retry = self.retry.saturating_sub(1);
-        self.software(window, damage)
+        self.software(window, &scene, &damage)?;
+        self.retained.commit(scene);
+        Ok(damage)
     }
     fn compose(
         gpu: &mut windowing::compositor::Compositor,
-        retained: &Retained,
+        scene: &Scene,
+        layers: usize,
         damage: &[Rect],
     ) -> Result<(), windowing::Error> {
         for d in damage {
@@ -155,7 +233,7 @@ impl WindowRenderer {
                 width: d.width,
                 height: d.height,
             })?;
-            for command in &retained.scene().commands {
+            for command in &scene.commands {
                 let clip = command.bounds.intersect(*d);
                 if clip.width <= 0 || clip.height <= 0 {
                     continue;
@@ -200,7 +278,7 @@ impl WindowRenderer {
                                     width: tile.width,
                                     height: tile.height,
                                 },
-                                retained.budgets.layers,
+                                layers,
                                 || command.layer_pixels(tile),
                             )?;
                         }
@@ -212,50 +290,26 @@ impl WindowRenderer {
         Ok(())
     }
 
-    fn software(&self, window: windowing::Window, damage: &[Rect]) -> Result<(), errors::Error> {
-        let c = &self.retained.canvas;
-        let native: Vec<windowing::display::Rect> = damage
-            .iter()
-            .map(|r| windowing::display::Rect {
-                x: r.x,
-                y: r.y,
-                width: r.width,
-                height: r.height,
-            })
-            .collect();
-        window.paint_surface(&native, |pixels, width, height, stride, format| {
-            let screen = Rect::new(0, 0, width, height);
-            let damage: Vec<Rect> = damage
-                .iter()
-                .map(|r| r.intersect(screen))
-                .filter(|r| r.width > 0 && r.height > 0)
-                .collect();
-            let area: i64 = damage.iter().map(|r| r.width * r.height).sum();
-            let workers = std::thread::available_parallelism()
-                .map_or(1, |n| n.get())
-                .min((area / PIXELS_PER_WORKER) as usize)
-                .max(1);
-            let rows = (height as usize).div_ceil(workers).max(1);
-            let to_native = Conversion {
-                canvas: c,
-                damage: &damage,
-                stride,
-                offsets: format.rgb_offsets(),
-            };
-            let bands = pixels
-                .chunks_mut(stride as usize * rows)
-                .zip((0..).step_by(rows));
-            if workers == 1 {
-                bands.for_each(|(band, top)| to_native.band(top as i64, band));
-            } else {
-                // Bands are disjoint rows of the surface.
-                std::thread::scope(|scope| {
-                    for (band, top) in bands {
-                        let to_native = &to_native;
-                        scope.spawn(move || to_native.band(top as i64, band));
-                    }
-                });
-            }
+    // Paints `damage` of `scene` straight into the window's surface.
+    fn software(
+        &mut self,
+        window: windowing::Window,
+        scene: &Scene,
+        damage: &[Rect],
+    ) -> Result<(), errors::Error> {
+        let retained = &mut self.retained;
+        window.paint_surface(&native(damage), |pixels, width, height, stride, format| {
+            retained.raster(
+                scene,
+                damage,
+                Target {
+                    pixels,
+                    width,
+                    height,
+                    stride,
+                    offsets: format.rgb_offsets(),
+                },
+            )
         })?;
         Ok(())
     }
@@ -263,7 +317,7 @@ impl WindowRenderer {
         let Some(gpu) = &mut self.gpu else {
             return Ok(None);
         };
-        Ok(gpu.present(&self.retained.canvas.pixels, &[], true)?)
+        Ok(gpu.finish(true)?)
     }
     pub fn gpu_name(&self) -> Option<&str> {
         self.gpu.as_ref().map(|g| g.name())

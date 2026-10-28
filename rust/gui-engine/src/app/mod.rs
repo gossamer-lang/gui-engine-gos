@@ -6450,7 +6450,8 @@ mod growth_tests {
             assert_eq!(height(&s), closed);
             // The field's error line below it gets room too.
             let primary = Mods {
-                ctrl: true,
+                ctrl: !crate::input::platform_is_macos(),
+                gui: crate::input::platform_is_macos(),
                 ..Mods::default()
             };
             s.press(Key::A, primary).unwrap();

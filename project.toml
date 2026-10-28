@@ -1,0 +1,15 @@
+[project]
+id = "github.com/gossamer-lang/gui-engine-gos"
+version = "0.1.0"
+gossamer-version = "^v0.75.4"
+authors = ["Dan Pozmanter"]
+license = "Apache 2.0"
+
+[lib]
+name = "gui_engine"
+
+[rust-bindings]
+gui-engine-binding = { path = "rust/binding" }
+
+[dependencies]
+"github.com/gossamer-lang/windowing-gos" = { git = "https://github.com/gossamer-lang/windowing-gos", tag = "v0.1.0" }

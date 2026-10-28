@@ -1,0 +1,4 @@
+# Rasterizer kernels, font-table parsers, and recursive tree walks take their
+# geometry, table offsets, and walk state as plain scalars; a one-use struct
+# per call would only rename the parameters.
+too-many-arguments-threshold = 12

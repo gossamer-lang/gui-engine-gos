@@ -1,0 +1,182 @@
+// The toolkit's sessions over JSON. Values cross as typed-serde JSON text,
+// and Gossamer closures the toolkit calls back cross as registered ids.
+
+use gui_engine_host
+
+/// Keeps `f` for the toolkit to call, answering its id. `f` takes and
+/// answers JSON text.
+pub fn register(f: Fn(String) -> String) -> i64 {
+    gui_engine_host::register(f)
+}
+
+/// Lets callback `id` go.
+pub fn release(id: i64) {
+    gui_engine_host::release(id)
+}
+
+/// Opens a session for application `name` with `app_id`, answering its id.
+pub fn start(name: String, app_id: String) -> Result<i64, String> {
+    gui_engine_host::start(name, app_id)
+}
+
+/// Shuts session `s` down and lets it go.
+pub fn close(s: i64) {
+    gui_engine_host::close(s)
+}
+
+/// Gives session `s` its update, view and commands callbacks.
+pub fn shell(s: i64, update: i64, view: i64, commands: i64) -> Result<(), String> {
+    gui_engine_host::shell(s, update, view, commands)
+}
+
+/// Runs session `s` until its last window closes.
+pub fn run(s: i64) -> Result<(), String> {
+    gui_engine_host::run(s)
+}
+
+/// Calls session method `method` with the JSON array `args`, answering JSON.
+pub fn call(s: i64, method: String, args: String) -> Result<String, String> {
+    gui_engine_host::call(s, method, args)
+}
+
+/// Queues the JSON `effect` for the session to apply.
+pub fn perform(effect: String) -> Result<(), String> {
+    gui_engine_host::perform(effect)
+}
+
+/// Takes every queued effect as a JSON array, oldest first.
+pub fn take_effects() -> String {
+    gui_engine_host::take_effects()
+}
+
+/// Keeps clipboard text in memory instead of the platform clipboard.
+pub fn clipboard_use_memory(memory: bool) {
+    gui_engine_host::clipboard_use_memory(memory)
+}
+
+/// The JSON icon `size` pixels square: the JSON `icon` drawn in the JSON
+/// `foreground` on a rounded tile of the JSON `background`.
+pub fn app_icon_drawn(icon: String, size: i64, background: String, foreground: String) -> Result<String, String> {
+    gui_engine_host::app_icon_drawn(icon, size, background, foreground)
+}
+
+/// The JSON icon `icon` encoded as a PNG file.
+pub fn app_icon_png(icon: String) -> Result<Vec<u8>, String> {
+    gui_engine_host::app_icon_png(icon)
+}
+
+/// A mailbox other goroutines post to session `s` through, by id.
+pub fn mailbox(s: i64) -> Result<i64, String> {
+    gui_engine_host::mailbox(s)
+}
+
+/// Delivers the JSON message `msg` through mailbox `id`.
+pub fn post(id: i64, msg: String) -> Result<(), String> {
+    gui_engine_host::post(id, msg)
+}
+
+/// Lets mailbox `id` go.
+pub fn release_mailbox(id: i64) {
+    gui_engine_host::release_mailbox(id)
+}
+
+/// Claims `app_id`'s single instance, handing the JSON list `files` over
+/// when another process holds it: JSON "forwarded", "alone", or a listener id.
+pub fn claim(app_id: String, files: String) -> Result<String, String> {
+    gui_engine_host::claim(app_id, files)
+}
+
+/// Has session `s` serve listener `listener`'s later launches.
+pub fn serve_instance(s: i64, listener: i64) -> Result<(), String> {
+    gui_engine_host::serve_instance(s, listener)
+}
+
+/// Gives up listener `listener`'s claim.
+pub fn close_listener(listener: i64) {
+    gui_engine_host::close_listener(listener)
+}
+
+/// Runs localization operation `op` on the JSON `args`, answering JSON:
+/// "install" a catalog, "locale", "rtl", "tr" a source text, or "message"
+/// with its context, source, count, and values.
+pub fn localize(op: String, args: String) -> Result<String, String> {
+    gui_engine_host::localize(op, args)
+}
+
+/// Keeps the toolkit's settings and window placements under `root`.
+pub fn set_config_root(root: String) {
+    gui_engine_host::set_config_root(root)
+}
+
+/// Lets text fall back to installed fonts, or keeps it to the bundled ones.
+pub fn use_system_fonts(enabled: bool) {
+    gui_engine_host::use_system_fonts(enabled)
+}
+
+/// Adds desktop-theme icon pixels to the JSON application catalog.
+pub fn apps_with_icons(entries: String, size: i64) -> Result<String, String> {
+    gui_engine_host::apps_with_icons(entries, size)
+}
+
+/// Bounded source analysis, preserving unchanged lines from the JSON document.
+pub fn analyze(document: String, text: String) -> Result<String, String> {
+    gui_engine_host::analyze(document, text)
+}
+
+/// Releases view-owned registrations as native windows are disposed.
+pub fn on_window_disposed(s: i64, callback: i64) -> Result<(), String> {
+    gui_engine_host::on_window_disposed(s, callback)
+}
+
+pub fn callback_count() -> i64 { gui_engine_host::callback_count() }
+
+/// Native persistent document operations, exchanged as bounded handles and revisions.
+pub fn document(method: String, id: i64, args: String) -> Result<String, String> {
+    gui_engine_host::document(method, id, args)
+}
+
+/// Native structured rich-document transactions and immutable snapshots.
+pub fn rich(method: String, id: i64, args: String) -> Result<String, String> { gui_engine_host::rich(method, id, args) }
+
+pub fn rich_preview(id: i64, prefix: String, start: i64, count: i64) -> Result<String, String> {
+    gui_engine_host::rich_preview(id, prefix, start, count)
+}
+
+pub fn rich_input(id: i64, block: i64, owner: String) -> Result<String, String> {
+    gui_engine_host::rich_input(id, block, owner)
+}
+
+/// Media players: GStreamer playback, transport, volume and video frames.
+pub fn media(method: String, id: i64, args: String) -> Result<String, String> {
+    gui_engine_host::media(method, id, args)
+}
+
+/// Image viewers: background decoding, zoom, pan and turns.
+pub fn image_viewer(method: String, id: i64, args: String) -> Result<String, String> {
+    gui_engine_host::image_viewer(method, id, args)
+}
+
+/// Scene canvases: objects, transforms, editing, views and exports.
+pub fn scene(method: String, id: i64, args: String) -> Result<String, String> {
+    gui_engine_host::scene(method, id, args)
+}
+
+/// Charts: series, axes, legends, views and exports.
+pub fn chart(method: String, id: i64, args: String) -> Result<String, String> {
+    gui_engine_host::chart(method, id, args)
+}
+
+/// Pagination, previews, PDF export and the system's printers.
+pub fn printing(method: String, args: String) -> Result<String, String> {
+    gui_engine_host::printing(method, args)
+}
+
+/// Dock layouts: placement, persistence and the widgets of their windows.
+pub fn dock(method: String, args: String) -> Result<String, String> {
+    gui_engine_host::dock(method, args)
+}
+
+/// Terminal screens, native pseudo-terminal programs and their views.
+pub fn terminal(method: String, id: i64, args: String) -> Result<String, String> {
+    gui_engine_host::terminal(method, id, args)
+}

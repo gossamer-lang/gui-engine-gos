@@ -1,0 +1,4 @@
+[env]
+# Sessions drive SDL, whose video calls must come from the main thread; libtest
+# runs tests on the main thread only when it runs them one at a time.
+RUST_TEST_THREADS = "1"

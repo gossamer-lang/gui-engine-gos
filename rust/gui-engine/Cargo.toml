@@ -1,0 +1,42 @@
+[package]
+name = "gui-engine"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+pulldown-cmark = "=0.12.2"
+ropey = "=1.6.1"
+# The program's build links windowing-gos's copy, which its own binding
+# carries; `gos` patches it in. Standalone Cargo runs patch it the same way.
+windowing = { package = "gos-windowing", version = "0.1.0" }
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive", "rc"] }
+jiff = "0.2"
+png = "0.17"
+zune-jpeg = "=0.5.15"
+zune-core = "=0.5.3"
+gif = "=0.14.2"
+libloading = "0.8"
+miniz_oxide = "0.8"
+roxmltree = "0.20"
+serde_json = "1"
+thiserror = "2"
+scopeguard = "1"
+unicase = "2"
+unicode-normalization = "0.1"
+unicode-properties = { version = "0.1", default-features = false, features = ["general-category"] }
+unicode-segmentation = "1"
+alacritty_terminal = { version = "=0.25.1", default-features = false }
+portable-pty = "=0.9.0"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Graphics_Printing", "Win32_Storage_Xps", "Win32_System_IO", "Win32_System_Threading"] }

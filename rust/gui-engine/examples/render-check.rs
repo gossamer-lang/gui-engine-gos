@@ -87,7 +87,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "width,height,backend,operation,p95_ns,p99_ns,damage_pixels,rasterized_pixels,cache_bytes"
     );
     for (width, height) in [(640, 480), (1920, 1080), (3840, 2160)] {
-        let window = app.window("Rendering", width, height, true)?;
+        // The resize measurement grows the window by 8 pixels. A desktop
+        // that keeps windows on its screen (macOS) cannot give a window more
+        // room than the display has, so a size it cannot hold is skipped.
+        let window = app.window("Rendering", width + 8, height + 8, true)?;
+        let _ = window.sync();
+        let held = window.pixel_size();
+        if held != (width + 8, height + 8) {
+            eprintln!(
+                "render-check: skipped {width}x{height}: the display holds a {}x{} window",
+                held.0, held.1
+            );
+            window.close();
+            continue;
+        }
+        resize(&app, window, width, height)?;
         let mut renderer = WindowRenderer::default();
         let damage = renderer.retained.update(
             width,

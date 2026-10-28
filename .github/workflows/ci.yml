@@ -1,0 +1,116 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GOSSAMER_REPO: gossamer-lang/gossamer
+  # The toolchain release CI installs: the one this library requires.
+  GOSSAMER_VERSION: v0.75.5
+  WINDOWING_REPO: gossamer-lang/windowing-gos
+  # The windowing release project.toml depends on. The Rust crates check
+  # against a checkout of the same tag beside this one.
+  WINDOWING_REF: ${{ vars.WINDOWING_REF || 'v0.1.0' }}
+  RUSTUP_TOOLCHAIN: 1.95.0
+  # Every job draws into SDL's offscreen driver, which needs no display.
+  SDL_VIDEO_DRIVER: offscreen
+
+jobs:
+  # The Gossamer package: formatting, lint, and a check for this platform
+  # and for Windows and both macOS architectures.
+  gossamer:
+    name: fmt, lint, check (Gossamer)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install SDL's build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build pkg-config \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
+            libxss-dev libxfixes-dev libxtst-dev libxkbcommon-dev libwayland-dev \
+            wayland-protocols libegl-dev libgl-dev libdecor-0-dev
+      - name: Install the Gossamer toolchain
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/${GOSSAMER_REPO}/main/scripts/install.sh" | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - run: gos --version
+      - name: Fetch the tagged dependencies
+        run: gos fetch
+      - name: Format and lint
+        run: |
+          gos fmt --check .
+          gos lint .
+      - name: Check every target
+        run: |
+          gos check .
+          for target in x86_64-pc-windows-msvc aarch64-apple-darwin x86_64-apple-darwin; do
+            echo "== $target"
+            gos check --target "$target" .
+          done
+
+  # The engine and its binding: formatting, Clippy and the unit suite on
+  # each platform the engine has code for.
+  rust:
+    name: Rust (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-latest
+          - name: macOS
+            os: macos-latest
+          - name: Windows
+            os: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: gui-engine-gos
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ env.WINDOWING_REPO }}
+          path: windowing-gos
+          ref: ${{ env.WINDOWING_REF }}
+      - name: Install SDL's build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build pkg-config \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
+            libxss-dev libxfixes-dev libxtst-dev libxkbcommon-dev libwayland-dev \
+            wayland-protocols libegl-dev libgl-dev libdecor-0-dev
+      - name: Install the Gossamer toolchain (Linux, macOS)
+        if: runner.os != 'Windows'
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/${GOSSAMER_REPO}/main/scripts/install.sh" | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Install the Gossamer toolchain (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          gh release download $env:GOSSAMER_VERSION --repo $env:GOSSAMER_REPO --pattern 'gos-*-windows-x86_64.zip' --dir gos-dist
+          Expand-Archive -Path (Get-ChildItem gos-dist\*.zip).FullName -DestinationPath gos-dist\gos
+          $bin = (Get-ChildItem gos-dist\gos -Recurse -Filter gos.exe | Select-Object -First 1).DirectoryName
+          Add-Content $env:GITHUB_PATH $bin
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: rustfmt, clippy
+      - run: gos --version
+      - name: Format, Clippy and tests
+        working-directory: gui-engine-gos
+        run: tools/check-rust.sh

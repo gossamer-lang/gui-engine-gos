@@ -33,7 +33,7 @@ The toolkit is documented with gui-gos:
 
 ## Requirements
 
-Gossamer 0.75.4 or newer and a Rust toolchain. windowing-gos, which brings
+Gossamer 0.75.5 or newer and a Rust toolchain. windowing-gos, which brings
 SDL 3, comes in as a dependency at its v0.1.0 release, which `gos fetch`
 prepares. On Linux, D-Bus (accessibility, notifications, single instance) is
 spoken directly, so libdbus is not needed.
@@ -50,9 +50,9 @@ Tests run one at a time, because SDL video calls must come from the main
 thread, and use SDL's offscreen video driver, so they need no display.
 
 The engine asks for `gos-windowing` by version. A program's build links the
-copy windowing-gos carries, which `gos` patches in; Cargo runs in this
-checkout take a windowing-gos checkout beside it the same way
-(`.cargo/config.toml`).
+copy windowing-gos carries, which `gos` patches in; Cargo runs in the crates
+under `rust/` take a windowing-gos checkout beside this one the same way
+(`rust/.cargo/config.toml`).
 
 The binding crate needs the Gossamer binding SDK, which is not published on
 crates.io. Pass

@@ -1,0 +1,5 @@
+# The engine asks for gos-windowing by version. A program's build links the
+# copy windowing-gos carries, which `gos` patches in; a Cargo run in the
+# crates here takes the windowing-gos checkout beside this one the same way.
+[patch.crates-io]
+gos-windowing = { path = "../../windowing-gos/rust/gos-windowing" }

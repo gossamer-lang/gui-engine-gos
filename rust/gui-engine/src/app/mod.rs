@@ -4805,7 +4805,7 @@ impl Session {
         // Screen readers present focus only inside the active window.
         root.active = win.active;
         for d in &win.dialogs {
-            let mut dn = tree::semantics(
+            let layer = tree::semantics(
                 &d.root,
                 &d.node,
                 &win.states,
@@ -4813,10 +4813,17 @@ impl Session {
                 &win.focus,
                 &d.title(),
             );
-            dn.role = host::dialog_role(d);
-            dn.modal = d.modality != Modality::Modeless;
-            dn.id = format!("dlg:{}", d.id);
-            root.children.push(dn)
+            // The dialog's panel is the dialog object: it carries the dialog's
+            // id, name, description and bounds. The layer's own frame is not
+            // an object of its own, so the dialog appears once.
+            let id = format!("dlg:{}", d.id);
+            for mut dn in layer.children {
+                if dn.id == id {
+                    dn.role = host::dialog_role(d);
+                    dn.modal = d.modality != Modality::Modeless;
+                }
+                root.children.push(dn)
+            }
         }
         for p in &win.popups {
             let path = self.path_in_layers(w, &p.request.owner);
@@ -5510,6 +5517,48 @@ mod dialog_scope_tests {
         .to_string()
     }
 
+    #[test]
+    fn a_dialog_over_its_window_is_one_accessible_object_with_its_role() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::application(
+                "Dialogs",
+                "dev.gossamer.gui-dialog-semantics-test",
+                Log::default,
+                log_update,
+                log_view,
+            )
+            .size(640, 480)
+            .start()
+            .unwrap();
+            s.open_dialog_in(
+                0,
+                &request::warning("disk", "Disk full", "Free some space."),
+            );
+            s.flush().unwrap();
+            let mut found = vec![];
+            let mut pending = vec![s.semantics(0)];
+            while let Some(n) = pending.pop() {
+                if n.id == "dlg:disk" {
+                    found.push(n.clone());
+                }
+                pending.extend(n.children);
+            }
+            assert_eq!(found.len(), 1, "the dialog appears once");
+            let dialog = &found[0];
+            assert_eq!(dialog.role, crate::accessibility::Role::AlertDialog);
+            assert!(dialog.modal);
+            assert_eq!(dialog.name, "Disk full");
+            assert!(
+                dialog.bounds.width < 640,
+                "the panel, not the window: {:?}",
+                dialog.bounds
+            );
+        });
+    }
     #[test]
     fn shortcut_dialog_captures_ctrl_home_and_keeps_actions_visible_and_clickable() {
         crate::testing::on_ui_thread(|| {

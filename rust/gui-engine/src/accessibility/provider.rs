@@ -3,7 +3,7 @@
 use crate::accessibility::{AccessNode, Role};
 use crate::geometry::Rect;
 use crate::strext::StrExt;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub const ROOT: &str = "/org/a11y/atspi/accessible/root";
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -66,6 +66,7 @@ impl Snapshot {
             self.windows.push(window.to_string())
         };
         let mut seen = vec![];
+        let mut claimed = HashSet::new();
         let object = self.walk(
             window,
             tree,
@@ -78,6 +79,7 @@ impl Snapshot {
                 .position(|key| key == window)
                 .unwrap_or(0)) as i64,
             &mut seen,
+            &mut claimed,
         );
         self.roots.insert(window.to_string(), object);
         let mut removed = vec![];
@@ -103,11 +105,16 @@ impl Snapshot {
         owner: &str,
         index: i64,
         seen: &mut Vec<String>,
+        claimed: &mut HashSet<String>,
     ) -> String {
-        let identity = if input.id.is_empty() {
-            format!("{}:{}:path:{}", window.byte_len(), window, position)
+        // A widget id names one object per window. A node repeating an id
+        // already claimed in this tree is identified by its position, so
+        // every node is its own object and the published graph stays a tree.
+        let by_id = format!("{}:{}:id:{}", window.byte_len(), window, input.id);
+        let identity = if !input.id.is_empty() && claimed.insert(by_id.clone()) {
+            by_id
         } else {
-            format!("{}:{}:id:{}", window.byte_len(), window, input.id)
+            format!("{}:{}:path:{}", window.byte_len(), window, position)
         };
         let path = match self.identities.get(&identity) {
             Some(path) => path.clone(),
@@ -133,6 +140,7 @@ impl Snapshot {
                 &target,
                 i as i64,
                 seen,
+                claimed,
             ));
         }
         let mut node = input.clone();
@@ -601,6 +609,28 @@ mod tests {
         );
         assert_eq!(super::text_segment("", 0, 4), Some(("".to_string(), 0, 0)));
         assert_eq!(super::text_segment("abc", 4, 0), None)
+    }
+    #[test]
+    fn a_repeated_widget_id_publishes_distinct_objects_in_a_tree() {
+        let mut p = Snapshot::new("app");
+        let mut inner = AccessNode::control(Role::Button, "x", "Inner", "press");
+        inner.children = vec![AccessNode::new(Role::Label, "Caption")];
+        let mut outer = AccessNode::control(Role::Group, "x", "Outer", "");
+        outer.children = vec![inner];
+        let mut window = AccessNode::new(Role::TopLevel, "Main");
+        window.children = vec![outer];
+        p.publish("main", &window);
+        let mut visited = std::collections::HashSet::new();
+        let mut pending = vec![p.roots["main"].clone()];
+        while let Some(path) = pending.pop() {
+            assert!(visited.insert(path.clone()), "{path} is reachable twice");
+            pending.extend(p.objects[&path].children.iter().cloned());
+        }
+        assert_eq!(visited.len(), 4);
+        assert_eq!(
+            p.objects[&p.related("main", "x").unwrap()].node.name,
+            "Outer"
+        );
     }
     #[test]
     fn provider_identity_disposal_virtual_actions_and_unicode_offsets() {

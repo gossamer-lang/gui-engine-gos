@@ -1,27 +1,26 @@
-//! VT parsing and screen state: an Alacritty terminal grid that reflows its
-//! lines when it resizes, behind filtered control strings, byte-admitted
-//! storage and bounded device replies.
+//! VT parsing and screen state: a WezTerm terminal core that reflows its
+//! lines when it resizes and packs scrollback lines as they leave the screen,
+//! behind filtered control strings, byte-admitted storage and bounded device
+//! replies.
 
 use std::sync::Arc;
 
-use alacritty_terminal::Term;
-use alacritty_terminal::event::{Event as TermEvent, EventListener, WindowSize};
-use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Line, Point};
-use alacritty_terminal::term::cell::{Cell as TermCell, Flags};
-use alacritty_terminal::term::{Config, Osc52, TermMode};
-use alacritty_terminal::vte::ansi::Processor;
 use parking_lot::Mutex;
+use wezterm_term::color::{ColorAttribute, ColorPalette};
+use wezterm_term::{
+    Alert, AlertHandler, CellAttributes, CursorVisibility, Intensity, Line, StableRowIndex,
+    Terminal, TerminalConfiguration, TerminalSize, Underline,
+};
 
 use crate::memory::{Budget, Lease};
 
 /// One terminal's parser, screen and scrollback, charged to a session budget.
 pub struct Engine {
-    term: Term<Listener>,
-    processor: Processor,
+    term: Terminal,
     notes: Arc<Mutex<Notifications>>,
-    /// The size the listener reports when a program asks for it.
-    size: Arc<Mutex<(u16, u16)>>,
+    /// The top row shown while the view is scrolled back, as a row index that
+    /// stays with its line as output scrolls; None shows the live screen.
+    view_top: Option<StableRowIndex>,
     filter: Filter,
     lease: Lease,
     budget: Budget,
@@ -32,53 +31,50 @@ pub struct Engine {
     charged: usize,
 }
 
-/// A grid size in the form the terminal resizes to.
-struct GridSize {
-    rows: u16,
-    cols: u16,
+/// What the terminal core asks of its host: the scrollback to keep and the
+/// palette. Clipboard access stays off because no clipboard is attached.
+#[derive(Debug)]
+struct Config {
+    history: usize,
 }
 
-impl Dimensions for GridSize {
-    fn total_lines(&self) -> usize {
-        usize::from(self.rows)
+impl TerminalConfiguration for Config {
+    fn scrollback_size(&self) -> usize {
+        self.history
     }
-    fn screen_lines(&self) -> usize {
-        usize::from(self.rows)
-    }
-    fn columns(&self) -> usize {
-        usize::from(self.cols)
+
+    fn color_palette(&self) -> ColorPalette {
+        ColorPalette::default()
     }
 }
 
-/// Receives what the terminal reports while it parses: titles, bells and
-/// the replies a program asked for.
-#[derive(Clone)]
-pub(crate) struct Listener {
-    notes: Arc<Mutex<Notifications>>,
-    size: Arc<Mutex<(u16, u16)>>,
-}
+/// Receives what the terminal reports while it parses: titles and bells.
+struct Alerts(Arc<Mutex<Notifications>>);
 
-impl EventListener for Listener {
-    fn send_event(&self, event: TermEvent) {
-        let mut notes = self.notes.lock();
-        match event {
-            TermEvent::Title(title) => notes.set_title(&title),
-            TermEvent::ResetTitle => notes.set_title(""),
-            TermEvent::Bell => notes.bells = notes.bells.saturating_add(1),
-            TermEvent::PtyWrite(text) => notes.reply(text),
-            TermEvent::TextAreaSizeRequest(format) => {
-                let (rows, cols) = *self.size.lock();
-                notes.reply(format(WindowSize {
-                    num_lines: rows,
-                    num_cols: cols,
-                    cell_width: 0,
-                    cell_height: 0,
-                }));
-            }
-            // Clipboard access is off, colors are the view's, and the session
-            // already redraws on every change.
+impl AlertHandler for Alerts {
+    fn alert(&mut self, alert: Alert) {
+        let mut notes = self.0.lock();
+        match alert {
+            Alert::WindowTitleChanged(title) => notes.set_title(&title),
+            Alert::Bell => notes.bells = notes.bells.saturating_add(1),
+            // Colors are the view's, and the session already redraws on every
+            // change.
             _ => {}
         }
+    }
+}
+
+/// Receives the replies a program asked for, to write back to it.
+struct Replies(Arc<Mutex<Notifications>>);
+
+impl std::io::Write for Replies {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().reply(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -114,13 +110,13 @@ pub struct Notifications {
     pub dropped_replies: usize,
 }
 impl Notifications {
-    fn reply(&mut self, text: String) {
-        if self.replies.len() >= 32 || self.reply_bytes + text.len() > 4096 {
+    fn reply(&mut self, bytes: &[u8]) {
+        if self.replies.len() >= 32 || self.reply_bytes + bytes.len() > 4096 {
             self.dropped_replies += 1;
             return;
         }
-        self.reply_bytes += text.len();
-        self.replies.push_back(text.into_bytes());
+        self.reply_bytes += bytes.len();
+        self.replies.push_back(bytes.to_vec());
     }
     fn set_title(&mut self, title: &str) {
         self.title = title
@@ -206,18 +202,18 @@ fn charge(rows: u16, cols: u16, history: usize) -> Result<usize, String> {
     if rows == 0 || cols == 0 || rows > 256 || cols > 512 || history > 100_000 {
         return Err("terminal dimensions/history exceed limits".into());
     }
-    // Charges what the terminal can hold: the main and alternate grids, the
+    // Charges what the terminal can hold: the main and alternate screens, the
     // copy a resize makes while it reflows, and every history row at full
-    // width, plus the history ring's row headers at twice their count for its
-    // growth. Storage keeps its high-water dimensions, so a shrink returns
-    // nothing.
-    let cell = std::mem::size_of::<TermCell>();
-    let row_header = std::mem::size_of::<Vec<TermCell>>() + 8;
+    // width as cells, which bounds a packed history row too, plus a line
+    // header for every row the history ring reserves. Storage keeps its
+    // high-water dimensions, so a shrink returns nothing.
+    let cell = std::mem::size_of::<wezterm_term::Cell>();
+    let line = std::mem::size_of::<Line>();
     let cells = (usize::from(rows) * 3 + history)
         .checked_mul(usize::from(cols))
         .and_then(|n| n.checked_mul(cell));
     cells
-        .and_then(|n| n.checked_add(history * 2 * row_header))
+        .and_then(|n| n.checked_add((history + usize::from(rows) * 2) * line))
         .and_then(|n| n.checked_add(64 * 1024))
         .ok_or_else(|| "terminal storage overflow".into())
 }
@@ -230,25 +226,88 @@ pub struct Row {
     pub wrapped: bool,
 }
 
-/// One cell's text: its character and any combining marks on it, bounded so
-/// a flood of marks cannot grow it without limit.
-pub(crate) fn cell_text(cell: &TermCell) -> String {
-    let mut text = String::with_capacity(4);
-    if cell
-        .flags
-        .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER | Flags::HIDDEN)
-    {
-        return text;
+/// One column of a line: the cell that starts there, or the second column of
+/// a wide cell to its left.
+#[derive(Clone, Copy)]
+pub(crate) enum Slot<'a> {
+    Cell(&'a str, &'a CellAttributes, bool),
+    Continuation,
+    Blank,
+}
+
+/// The columns of `line` across a `cols`-wide screen; a line keeps no cells
+/// past its last written one, and those columns are blank.
+pub(crate) fn slots(line: &Line, cols: u16) -> Vec<Slot<'_>> {
+    let cols = usize::from(cols);
+    let mut out = vec![Slot::Blank; cols];
+    for cell in line.visible_cells() {
+        let at = cell.cell_index();
+        if at >= cols {
+            break;
+        }
+        let width = cell.width().max(1);
+        out[at] = Slot::Cell(cell.str(), cell.attrs(), width > 1);
+        for spare in out.iter_mut().take(cols).skip(at + 1).take(width - 1) {
+            *spare = Slot::Continuation;
+        }
     }
-    // A tab's first cell keeps '\t' for copying; on screen it is blank like
-    // the rest of the tab's cells.
-    if cell.c != ' ' && cell.c != '\t' {
-        text.push(cell.c);
+    out
+}
+
+/// One cell's text as shown: its character and any combining marks on it,
+/// bounded so a run of marks cannot grow a frame without limit; blank for a
+/// space, a tab's cell, or hidden text.
+pub(crate) fn cell_text(text: &str, attrs: &CellAttributes) -> String {
+    if attrs.invisible() || text == " " || text == "\t" {
+        return String::new();
     }
-    for mark in cell.zerowidth().unwrap_or_default().iter().take(16) {
-        text.push(*mark);
+    text.chars().take(17).collect()
+}
+
+/// A visible row as text: a wide character is one character over two cells,
+/// and blank cells are spaces.
+fn row_text(line: &Line, cols: u16) -> String {
+    let mut text = String::new();
+    for slot in slots(line, cols) {
+        match slot {
+            Slot::Cell(cell, attrs, _) => {
+                let shown = cell_text(cell, attrs);
+                if shown.is_empty() {
+                    text.push(' ');
+                } else {
+                    text.push_str(&shown);
+                }
+            }
+            Slot::Continuation => {}
+            Slot::Blank => text.push(' '),
+        }
     }
     text
+}
+
+/// A color as the frame reports it.
+pub(crate) fn color(value: ColorAttribute) -> super::frame::Color {
+    use super::frame::Color;
+    match value {
+        ColorAttribute::TrueColorWithPaletteFallback(rgb, _)
+        | ColorAttribute::TrueColorWithDefaultFallback(rgb) => {
+            let (r, g, b, _) = rgb.to_srgb_u8();
+            Color::Rgb(r, g, b)
+        }
+        ColorAttribute::PaletteIndex(i) => Color::Indexed(i),
+        ColorAttribute::Default => Color::Default,
+    }
+}
+
+/// Whether a cell's attributes ask for bold, dim, italic, underline, inverse.
+pub(crate) fn styles(attrs: &CellAttributes) -> (bool, bool, bool, bool, bool) {
+    (
+        attrs.intensity() == Intensity::Bold,
+        attrs.intensity() == Intensity::Half,
+        attrs.italic(),
+        attrs.underline() != Underline::None,
+        attrs.reverse(),
+    )
 }
 
 impl Engine {
@@ -267,22 +326,19 @@ impl Engine {
         }
         let lease = budget.reserve(bytes)?;
         let notes = Arc::new(Mutex::new(Notifications::default()));
-        let size = Arc::new(Mutex::new((rows, cols)));
-        let listener = Listener {
-            notes: notes.clone(),
-            size: size.clone(),
-        };
-        let config = Config {
-            scrolling_history: history,
-            osc52: Osc52::Disabled,
-            ..Config::default()
-        };
+        let mut term = Terminal::new(
+            terminal_size(rows, cols),
+            Arc::new(Config { history }),
+            "xterm-256color",
+            env!("CARGO_PKG_VERSION"),
+            Box::new(Replies(notes.clone())),
+        );
+        term.set_notification_handler(Box::new(Alerts(notes.clone())));
         Ok(Self {
             charged: bytes,
-            term: Term::new(config, &GridSize { rows, cols }, listener),
-            processor: Processor::new(),
+            term,
             notes,
-            size,
+            view_top: None,
             filter: Filter::default(),
             lease,
             budget,
@@ -299,7 +355,13 @@ impl Engine {
         }
         let mut passed = Vec::with_capacity(bytes.len());
         self.filter.pass(bytes, &mut passed);
-        self.processor.advance(&mut self.term, &passed);
+        let alternate = self.term.is_alt_screen_active();
+        self.term.advance_bytes(&passed);
+        // The other screen has rows of its own, so a view into the one left
+        // behind no longer applies.
+        if self.term.is_alt_screen_active() != alternate {
+            self.view_top = None;
+        }
         Ok(())
     }
     /// Resizes the screen, rewrapping its lines and history to the new width;
@@ -316,92 +378,82 @@ impl Engine {
         }
         self.lease.resize(bytes)?;
         self.charged = bytes;
-        self.term.resize(GridSize { rows, cols });
-        *self.size.lock() = (rows, cols);
+        let back = self.scrollback();
+        self.term.resize(terminal_size(rows, cols));
+        // Rewrapping renumbers the rows, so the view keeps its distance from
+        // the live screen.
+        self.scroll(back);
         self.max_rows = self.max_rows.max(rows);
         self.max_cols = self.max_cols.max(cols);
         Ok(())
     }
     /// An immutable snapshot of the visible screen.
     pub fn frame(&self) -> Result<super::frame::Frame, String> {
-        super::frame::Frame::capture(&self.term, &self.budget)
+        super::frame::Frame::capture(self, &self.budget)
     }
     /// The screen's rows and columns.
     pub fn size(&self) -> (u16, u16) {
-        (self.term.screen_lines() as u16, self.term.columns() as u16)
+        let screen = self.term.screen();
+        (screen.physical_rows as u16, screen.physical_cols as u16)
     }
     /// How many rows back into the scrollback the view shows.
     pub fn scrollback(&self) -> usize {
-        self.term.grid().display_offset()
+        let Some(top) = self.view_top else { return 0 };
+        let live = self.term.screen().visible_row_to_stable_row(0);
+        (live - top).clamp(0, self.history() as isize) as usize
     }
     /// The cursor's row and column on the visible screen.
     pub fn cursor(&self) -> (u16, u16) {
-        let point = self.term.grid().cursor.point;
-        let row = point.line.0 + self.scrollback() as i32;
-        (row.max(0) as u16, point.column.0 as u16)
+        let cursor = self.term.cursor_pos();
+        let row = cursor.y + self.scrollback() as i64;
+        (row.max(0) as u16, cursor.x as u16)
     }
     /// Whether the cursor is hidden, by the program or by scrolling back.
     pub fn hide_cursor(&self) -> bool {
-        !self.term.mode().contains(TermMode::SHOW_CURSOR) || self.scrollback() > 0
+        self.term.cursor_pos().visibility == CursorVisibility::Hidden || self.scrollback() > 0
     }
     pub fn alternate_screen(&self) -> bool {
-        self.term.mode().contains(TermMode::ALT_SCREEN)
+        self.term.is_alt_screen_active()
     }
     /// Whether arrow keys send application sequences.
     pub fn application_cursor(&self) -> bool {
-        self.term.mode().contains(TermMode::APP_CURSOR)
+        self.term.application_cursor_keys_enabled()
     }
     /// Rows of history kept above the screen.
     pub fn history(&self) -> usize {
-        self.term.grid().history_size()
+        let screen = self.term.screen();
+        screen.scrollback_rows() - screen.physical_rows
     }
     /// Shows the screen `offset` rows back into the scrollback.
     pub fn scroll(&mut self, offset: usize) {
-        let target = offset.min(self.term.grid().history_size());
-        let delta = target as i64 - self.scrollback() as i64;
-        if delta != 0 {
-            self.term.scroll_display(Scroll::Delta(delta as i32));
-        }
+        let target = offset.min(self.history());
+        self.view_top =
+            (target > 0).then(|| self.term.screen().visible_row_to_stable_row(0) - target as isize);
     }
-    /// The grid point at a visible row and column.
-    fn point(&self, row: u16, col: u16) -> Point {
-        Point::new(
-            Line(i32::from(row) - self.scrollback() as i32),
-            Column(usize::from(col)),
-        )
+    /// Calls `f` with the lines the view shows, top first.
+    pub(crate) fn with_visible_lines(&self, f: impl FnMut(&[&Line])) {
+        let screen = self.term.screen();
+        let end = screen.scrollback_rows() - self.scrollback();
+        screen.with_phys_lines(end - screen.physical_rows..end, f);
     }
     /// The visible screen as text: rows without trailing blanks, a wrapped
     /// row running on into the next.
     pub fn text(&self) -> String {
         let (rows, cols) = self.size();
         let mut out = String::new();
-        for row in 0..rows {
-            let line = &self.term.grid()[self.point(row, 0).line];
-            let mut text = String::new();
-            for col in 0..cols {
-                let cell = &line[Column(usize::from(col))];
-                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                    continue;
-                }
-                let shown = cell_text(cell);
-                if shown.is_empty() {
-                    text.push(' ');
+        self.with_visible_lines(|lines| {
+            for (row, line) in lines.iter().enumerate() {
+                let text = row_text(line, cols);
+                if line.last_cell_was_wrapped() {
+                    out.push_str(&text);
                 } else {
-                    text.push_str(&shown);
+                    out.push_str(text.trim_end());
+                    if row + 1 < usize::from(rows) {
+                        out.push('\n');
+                    }
                 }
             }
-            let wrapped = line[Column(usize::from(cols) - 1)]
-                .flags
-                .contains(Flags::WRAPLINE);
-            if wrapped {
-                out.push_str(&text);
-            } else {
-                out.push_str(text.trim_end());
-                if row + 1 < rows {
-                    out.push('\n');
-                }
-            }
-        }
+        });
         out.truncate(out.trim_end().len());
         out
     }
@@ -410,37 +462,22 @@ impl Engine {
     /// character is one character over two cells, and a row that wraps
     /// keeps its trailing blanks.
     pub fn rows(&self) -> Vec<Row> {
-        let grid = self.term.grid();
-        let history = grid.history_size() as i32;
-        let (screen, cols) = self.size();
-        let mut out = Vec::with_capacity(history as usize + usize::from(screen));
-        for at in -history..i32::from(screen) {
-            let line = &grid[Line(at)];
-            let mut text = String::new();
-            for col in 0..cols {
-                let cell = &line[Column(usize::from(col))];
-                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                    continue;
-                }
-                let shown = cell_text(cell);
-                if shown.is_empty() {
-                    text.push(' ');
-                } else {
-                    text.push_str(&shown);
-                }
-            }
-            let wrapped = line[Column(usize::from(cols) - 1)]
-                .flags
-                .contains(Flags::WRAPLINE);
+        let screen = self.term.screen();
+        let cols = screen.physical_cols as u16;
+        let mut out = Vec::with_capacity(screen.scrollback_rows());
+        screen.for_each_phys_line(|_, line| {
+            let mut text = row_text(line, cols);
+            let wrapped = line.last_cell_was_wrapped();
             if !wrapped {
                 text.truncate(text.trim_end().len());
             }
             out.push(Row { text, wrapped });
-        }
+        });
         out
     }
     /// The text between two visible cell positions, end excluded, as a copy
-    /// would take it.
+    /// would take it: a line's trailing blanks are left out, a tab copies as
+    /// a tab, and a wrapped line runs on without a line break.
     pub fn copy(&self, start: (u16, u16), end: (u16, u16)) -> String {
         if end <= start {
             return String::new();
@@ -451,8 +488,51 @@ impl Engine {
         } else {
             (end.0, end.1 - 1)
         };
-        self.term
-            .bounds_to_string(self.point(start.0, start.1), self.point(last.0, last.1))
+        let tabs = self.term.tab_stops_by_column();
+        let mut out = String::new();
+        self.with_visible_lines(|lines| {
+            for row in start.0..=last.0 {
+                let line = lines[usize::from(row)];
+                let slots = slots(line, cols);
+                let from = if row == start.0 { start.1 } else { 0 };
+                let to = if row == last.0 { last.1 } else { cols - 1 };
+                let length = slots
+                    .iter()
+                    .rposition(|s| matches!(s, Slot::Cell(t, _, _) if *t != " "))
+                    .map_or(0, |at| at + 1)
+                    .min(usize::from(to) + 1);
+                let mut from = usize::from(from);
+                // A selection that starts on a wide character's second column
+                // takes the whole character.
+                if from > 0 && matches!(slots.get(from), Some(Slot::Continuation)) {
+                    from -= 1;
+                }
+                let mut tab_mode = false;
+                for (col, slot) in slots.iter().enumerate().take(length).skip(from) {
+                    let text = match slot {
+                        Slot::Cell(text, _, _) => *text,
+                        Slot::Continuation => continue,
+                        Slot::Blank => " ",
+                    };
+                    // A tab's blank cells up to the next tab stop are the tab.
+                    if tab_mode {
+                        if tabs.get(col).copied().unwrap_or(false) || text != " " {
+                            tab_mode = false;
+                        } else {
+                            continue;
+                        }
+                    }
+                    if text == "\t" {
+                        tab_mode = true;
+                    }
+                    out.push_str(text);
+                }
+                if to == cols - 1 && !line.last_cell_was_wrapped() {
+                    out.push('\n');
+                }
+            }
+        });
+        out.strip_suffix('\n').map(str::to_owned).unwrap_or(out)
     }
     /// Input for pasting `text`, bracketed when the program asked for it.
     pub fn paste(&self, text: &str) -> Result<Vec<u8>, String> {
@@ -460,7 +540,7 @@ impl Engine {
             return Err("terminal paste exceeds 64 KiB".into());
         }
         let clean = text.replace(['\x1b', '\0'], "");
-        Ok(if self.term.mode().contains(TermMode::BRACKETED_PASTE) {
+        Ok(if self.term.bracketed_paste_enabled() {
             format!("\x1b[200~{clean}\x1b[201~").into_bytes()
         } else {
             clean.into_bytes()
@@ -493,6 +573,18 @@ impl Engine {
     /// Control strings dropped for being unsupported or oversized.
     pub fn dropped_controls(&self) -> usize {
         self.filter.dropped
+    }
+}
+
+/// The size the terminal core takes: cells only, since the view lays out
+/// pixels and a program asking for them is told nothing.
+fn terminal_size(rows: u16, cols: u16) -> TerminalSize {
+    TerminalSize {
+        rows: usize::from(rows),
+        cols: usize::from(cols),
+        pixel_width: 0,
+        pixel_height: 0,
+        dpi: 0,
     }
 }
 #[cfg(test)]

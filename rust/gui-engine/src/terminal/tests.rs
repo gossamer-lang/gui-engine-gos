@@ -375,7 +375,16 @@ mod session {
                 *exited.borrow()
             });
             assert!(peak <= transport::OUTPUT as i64);
-            assert!(snapshot(id).unwrap().text.contains("row-19999"));
+            let shown = snapshot(id).unwrap();
+            assert!(shown.text.contains("row-19999"));
+            // Twenty thousand rows that never come back are laid out in the
+            // terminal's own cache, which stays within its screen's size.
+            let kept = with_entry(id, |entry| entry.layouts.bytes()).unwrap();
+            let screen = (shown.rows * shown.cols) as usize;
+            assert!(
+                kept > 0 && kept <= screen * widget::LAYOUT_BYTES_PER_CELL,
+                "{kept}"
+            );
             close(id);
             assert_eq!(budget.usage().0, before);
             s.shutdown();

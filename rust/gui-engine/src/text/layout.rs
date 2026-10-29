@@ -337,11 +337,7 @@ pub fn layout(text: &str, style: &TextStyle, options: LayoutOptions) -> TextLayo
     })
 }
 
-pub fn try_layout(
-    text: &str,
-    style: &TextStyle,
-    options: LayoutOptions,
-) -> Result<TextLayout, String> {
+fn check_layout(text: &str, style: &TextStyle, options: &LayoutOptions) -> Result<(), String> {
     if text.len() > FULL_LAYOUT_SOURCE_LIMIT {
         return Err("text exceeds the full-layout byte budget".into());
     }
@@ -353,6 +349,28 @@ pub fn try_layout(
     {
         return Err("text style exceeds layout limits".into());
     }
+    Ok(())
+}
+
+/// A layout of `text` made for the caller alone, outside the shared cache: for
+/// text that seldom repeats, which would only fill that cache, and which the
+/// caller caches to fit its own working set.
+pub fn layout_uncached(text: &str, style: &TextStyle, options: LayoutOptions) -> TextLayout {
+    match check_layout(text, style, &options) {
+        Ok(()) => build_styled(text, style, options, &[], false),
+        Err(error) => TextLayout {
+            error: Some(error),
+            ..Default::default()
+        },
+    }
+}
+
+pub fn try_layout(
+    text: &str,
+    style: &TextStyle,
+    options: LayoutOptions,
+) -> Result<TextLayout, String> {
+    check_layout(text, style, &options)?;
     let cache_key = format!("{}#{}#{}", style.key(), options.key(), text);
     if let Some(found) = CACHE.lock().get(&cache_key) {
         CACHE_HITS.fetch_add(1, Ordering::Relaxed);
@@ -407,7 +425,7 @@ pub fn try_layout_rich(
     if end != text.len() {
         return Err("rich layout spans must cover text".into());
     }
-    Ok(build_styled(text, style, options, spans))
+    Ok(build_styled(text, style, options, spans, true))
 }
 fn rich_span(spans: &[crate::rich::Span], byte: i64) -> Option<&crate::rich::Span> {
     let index = spans.partition_point(|span| span.end <= byte.max(0) as usize);
@@ -557,13 +575,16 @@ struct Run {
 }
 
 fn build(text: &str, style: &TextStyle, options: LayoutOptions) -> TextLayout {
-    build_styled(text, style, options, &[])
+    build_styled(text, style, options, &[], true)
 }
+/// Lays out `text`; `shared` keeps its unstyled paragraphs in the shared
+/// paragraph cache for the next request.
 fn build_styled(
     text: &str,
     style: &TextStyle,
     options: LayoutOptions,
     spans: &[crate::rich::Span],
+    shared: bool,
 ) -> TextLayout {
     let (ascent, descent, line_h) = metrics(style);
     let mut out = TextLayout {
@@ -593,7 +614,7 @@ fn build_styled(
                 ..span.clone()
             })
             .collect::<Vec<_>>();
-        let lines = if spans.is_empty() {
+        let lines = if spans.is_empty() && shared {
             cached_paragraph(paragraph, style, options)
         } else {
             layout_paragraph(
@@ -2214,6 +2235,22 @@ fn draw_glyph(
 #[cfg(test)]
 mod tests {
     use super::{LayoutOptions, PlacedGlyph, TextStyle, draw_glyph, layout, measure};
+
+    #[test]
+    fn an_uncached_layout_leaves_the_shared_caches_alone() {
+        let style = TextStyle::mono(14.0);
+        let options = LayoutOptions::single_line();
+        let text = "a row the shared caches never see 0x5e1f";
+        let laid = super::layout_uncached(text, &style, options);
+        assert!(laid.error.is_none());
+        assert_eq!(laid, layout(text, &style, options));
+        let key = format!("{}#{}#{}", style.key(), options.key(), text);
+        super::CACHE.lock().remove(&key);
+        super::PARAGRAPHS.lock().remove(&key);
+        super::layout_uncached(text, &style, options);
+        assert!(super::CACHE.lock().get(&key).is_none());
+        assert!(super::PARAGRAPHS.lock().get(&key).is_none());
+    }
     use crate::render::Canvas;
     use crate::strext::StrExt;
     use crate::style::color::Color;

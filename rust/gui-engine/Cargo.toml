@@ -29,7 +29,7 @@ unicase = "2"
 unicode-normalization = "0.1"
 unicode-properties = { version = "0.1", default-features = false, features = ["general-category"] }
 unicode-segmentation = "1"
-alacritty_terminal = { version = "=0.25.1", default-features = false }
+wezterm-term = { git = "https://github.com/gossamer-lang/wezterm-lite", tag = "v0.1.0" }
 portable-pty = "=0.9.0"
 encoding_rs = "0.8"
 regex = "1"

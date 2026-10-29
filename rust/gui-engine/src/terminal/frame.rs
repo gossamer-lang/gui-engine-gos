@@ -1,41 +1,11 @@
 //! Immutable byte-admitted viewport snapshots and accessible text coordinates.
-use alacritty_terminal::Term;
-use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::index::{Column, Line};
-use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::vte::ansi::{Color as TermColor, NamedColor};
-
-use super::engine::{Listener, cell_text};
+use super::engine::{Engine, Slot, cell_text, color, slots, styles};
 use crate::memory::{Budget, Lease};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Color {
     Default,
     Indexed(u8),
     Rgb(u8, u8, u8),
-}
-impl From<TermColor> for Color {
-    fn from(value: TermColor) -> Self {
-        use NamedColor::*;
-        match value {
-            TermColor::Spec(rgb) => Self::Rgb(rgb.r, rgb.g, rgb.b),
-            TermColor::Indexed(i) => Self::Indexed(i),
-            TermColor::Named(named) => match named {
-                Foreground | Background | Cursor | BrightForeground | DimForeground => {
-                    Self::Default
-                }
-                // A dim color is its base color; the cell's DIM flag dims it.
-                DimBlack => Self::Indexed(0),
-                DimRed => Self::Indexed(1),
-                DimGreen => Self::Indexed(2),
-                DimYellow => Self::Indexed(3),
-                DimBlue => Self::Indexed(4),
-                DimMagenta => Self::Indexed(5),
-                DimCyan => Self::Indexed(6),
-                DimWhite => Self::Indexed(7),
-                base => Self::Indexed(base as u8),
-            },
-        }
-    }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Cell {
@@ -63,75 +33,70 @@ pub struct Frame {
     _lease: Lease,
 }
 impl Frame {
-    pub(crate) fn capture(term: &Term<Listener>, budget: &Budget) -> Result<Self, String> {
-        let (rows, cols) = (term.screen_lines() as u16, term.columns() as u16);
+    pub(crate) fn capture(engine: &Engine, budget: &Budget) -> Result<Self, String> {
+        let (rows, cols) = engine.size();
         let bytes = usize::from(rows) * usize::from(cols) * 160 + usize::from(rows) * 128 + 4096;
         if bytes > 32 * 1024 * 1024 {
             return Err("terminal viewport exceeds frame budget".into());
         }
         let lease = budget.reserve(bytes)?;
-        let grid = term.grid();
-        let offset = grid.display_offset() as i32;
         let mut cells = Vec::with_capacity(rows.into());
         let mut offsets = Vec::with_capacity(rows.into());
         let mut wrapped = Vec::with_capacity(rows.into());
         let mut text = String::new();
-        for row in 0..rows {
-            let line = &grid[Line(i32::from(row) - offset)];
-            let mut cells_of_row = Vec::with_capacity(cols.into());
-            let mut positions = Vec::with_capacity(usize::from(cols) + 1);
-            let mut previous = text.len();
-            for col in 0..cols {
-                let cell = &line[Column(usize::from(col))];
-                let continuation = cell.flags.contains(Flags::WIDE_CHAR_SPACER);
-                let shown = cell_text(cell);
-                positions.push(if continuation { previous } else { text.len() });
-                if !continuation {
-                    previous = text.len();
-                    if shown.is_empty() {
-                        text.push(' ');
-                    } else {
-                        text.push_str(&shown);
+        engine.with_visible_lines(|lines| {
+            for (row, line) in lines.iter().enumerate() {
+                let mut cells_of_row = Vec::with_capacity(cols.into());
+                let mut positions = Vec::with_capacity(usize::from(cols) + 1);
+                let mut previous = text.len();
+                for slot in slots(line, cols) {
+                    let (shown, continuation, wide, attrs) = match slot {
+                        Slot::Cell(cell, attrs, wide) => {
+                            (cell_text(cell, attrs), false, wide, Some(attrs))
+                        }
+                        Slot::Continuation => (String::new(), true, false, None),
+                        Slot::Blank => (String::new(), false, false, None),
+                    };
+                    positions.push(if continuation { previous } else { text.len() });
+                    if !continuation {
+                        previous = text.len();
+                        if shown.is_empty() {
+                            text.push(' ');
+                        } else {
+                            text.push_str(&shown);
+                        }
                     }
+                    let (bold, dim, italic, underline, inverse) =
+                        attrs.map(styles).unwrap_or_default();
+                    cells_of_row.push(Cell {
+                        text: shown,
+                        continuation,
+                        wide,
+                        fg: attrs.map_or(Color::Default, |a| color(a.foreground())),
+                        bg: attrs.map_or(Color::Default, |a| color(a.background())),
+                        bold,
+                        italic,
+                        underline,
+                        inverse,
+                        dim,
+                    });
                 }
-                cells_of_row.push(Cell {
-                    text: shown,
-                    continuation,
-                    wide: cell.flags.contains(Flags::WIDE_CHAR),
-                    fg: cell.fg.into(),
-                    bg: cell.bg.into(),
-                    bold: cell.flags.contains(Flags::BOLD),
-                    italic: cell.flags.contains(Flags::ITALIC),
-                    underline: cell.flags.intersects(Flags::ALL_UNDERLINES),
-                    inverse: cell.flags.contains(Flags::INVERSE),
-                    dim: cell.flags.contains(Flags::DIM),
-                });
+                positions.push(text.len());
+                if row + 1 < usize::from(rows) {
+                    text.push('\n');
+                }
+                wrapped.push(line.last_cell_was_wrapped());
+                cells.push(cells_of_row);
+                offsets.push(positions);
             }
-            positions.push(text.len());
-            if row + 1 < rows {
-                text.push('\n');
-            }
-            wrapped.push(
-                line[Column(usize::from(cols) - 1)]
-                    .flags
-                    .contains(Flags::WRAPLINE),
-            );
-            cells.push(cells_of_row);
-            offsets.push(positions);
-        }
-        let point = grid.cursor.point;
-        let cursor_row = (point.line.0 + offset).clamp(0, i32::from(rows) - 1) as u16;
+        });
+        let (cursor_row, cursor_col) = engine.cursor();
         Ok(Self {
             rows,
             cols,
-            cursor: (cursor_row, point.column.0 as u16),
-            hide_cursor: !term
-                .mode()
-                .contains(alacritty_terminal::term::TermMode::SHOW_CURSOR)
-                || offset > 0,
-            alternate: term
-                .mode()
-                .contains(alacritty_terminal::term::TermMode::ALT_SCREEN),
+            cursor: (cursor_row.min(rows - 1), cursor_col),
+            hide_cursor: engine.hide_cursor(),
+            alternate: engine.alternate_screen(),
             cells,
             wrapped,
             text,

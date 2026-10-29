@@ -10,6 +10,7 @@ use super::keyboard;
 use super::{Cell, with_entry};
 use crate::accessibility::{AccessNode, Role};
 use crate::geometry::{Constraints, Rect, Size};
+use crate::memory::ByteCache;
 use crate::style::color::Color;
 use crate::style::{TextRole, Theme};
 use crate::text::layout::{self, LayoutOptions, TextStyle};
@@ -55,6 +56,10 @@ impl View {
 
 const PAD: i64 = 4;
 const WHEEL_ROWS: i64 = 3;
+/// Layout bytes kept per screen cell: room for two screens of runs at about
+/// 160 bytes a cell (a glyph's layout plus each run's own), so rows that
+/// scroll or stay put are laid out once.
+pub(super) const LAYOUT_BYTES_PER_CELL: usize = 2 * 160;
 
 /// The family a terminal draws in when its view names none: IBM Plex Mono,
 /// bundled with the toolkit (SIL Open Font License 1.1).
@@ -264,6 +269,15 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
     let pad = theme.px(PAD);
     let origin = cx.abs(r);
     let focused = cx.focus == v.id;
+    // Run layouts are kept per terminal, sized to its screen: output brings
+    // rows that never come back, which the shared layout cache would hold to
+    // its whole budget.
+    let mut layouts = with_entry(v.terminal, |entry| {
+        std::mem::replace(&mut entry.layouts, ByteCache::new(0))
+    })
+    .unwrap_or_else(|| ByteCache::new(0));
+    layouts
+        .set_limit(usize::from(frame.rows()) * usize::from(frame.cols()) * LAYOUT_BYTES_PER_CELL);
     for (row, cells) in frame.cells().iter().enumerate() {
         let row = row as i64;
         let y = pad + (row as f64 * lh) as i64;
@@ -326,15 +340,22 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
                 let mut run = style.clone();
                 run.bold = cell.bold;
                 run.italic = cell.italic;
-                let laid = layout::layout(&text, &run, LayoutOptions::single_line());
-                layout::draw(
-                    &mut cx.canvas,
-                    &laid,
-                    (origin.x + x) as f64,
-                    (origin.y + y) as f64,
-                    &run,
-                    fg,
-                );
+                let key = format!("{}#{}", run.key(), text);
+                if layouts.get(&key).is_none() {
+                    let laid = layout::layout_uncached(&text, &run, LayoutOptions::single_line());
+                    let bytes = key.capacity() + laid.owned_bytes();
+                    layouts.insert(key.clone(), laid, bytes);
+                }
+                let at = ((origin.x + x) as f64, (origin.y + y) as f64);
+                match layouts.get(&key) {
+                    Some(laid) => layout::draw(&mut cx.canvas, laid, at.0, at.1, &run, fg),
+                    // A run too large for the cache is laid out for this paint.
+                    None => {
+                        let laid =
+                            layout::layout_uncached(&text, &run, LayoutOptions::single_line());
+                        layout::draw(&mut cx.canvas, &laid, at.0, at.1, &run, fg);
+                    }
+                }
             }
             if cell.underline {
                 cx.fill(
@@ -345,6 +366,7 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
             col = end.max(col + 1);
         }
     }
+    with_entry(v.terminal, |entry| entry.layouts = layouts);
     // The cursor shows focus, filled while the terminal has it and hollow
     // otherwise, so the terminal draws no focus ring around its screen.
     paint_cursor(&frame, focused, cx, (cw, lh, pad));

@@ -5,7 +5,6 @@ use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::Canvas;
 use crate::geometry::Rect;
@@ -534,6 +533,11 @@ pub struct Retained {
     valid: bool,
     /// The last raster reached only part of the frame.
     partial: bool,
+    /// One tile's pixels for each raster worker to draw a tile it will not
+    /// keep. They belong to the thread that rasters the frame, so a worker
+    /// allocates no tile: a thread's allocator keeps the pages it used after
+    /// the thread ends, until another thread reclaims them.
+    scratch: Vec<Vec<u8>>,
     pub stats: Stats,
 }
 impl Default for Retained {
@@ -554,6 +558,7 @@ impl Retained {
             clock: 0,
             valid: false,
             partial: false,
+            scratch: vec![],
             stats: Stats::default(),
         }
     }
@@ -638,6 +643,9 @@ impl Retained {
                 .0;
             total -= self.tiles.remove(i).pixels.len();
         }
+        // Tiles worth keeping get their own pixels up front, while the layer
+        // budget has room; the rest draw into a worker's scratch tile.
+        let mut room = layer_budget;
         let mut bands: Vec<Vec<Job>> = vec![];
         for y in (0..height).step_by(TILE as usize) {
             let mut band = vec![];
@@ -679,19 +687,23 @@ impl Retained {
                     }
                     history.push(revision);
                 }
+                let bytes = (tile.width * tile.height * 4) as usize;
+                let kept = (admit && bytes <= room).then(|| {
+                    room -= bytes;
+                    vec![0u8; bytes]
+                });
                 band.push(Job {
                     tile,
                     parts,
                     revision,
                     commands,
                     cached,
-                    admit,
+                    kept,
                 });
             }
             bands.push(band);
         }
         let stride = target.stride.max(0) as usize;
-        let room = AtomicUsize::new(layer_budget);
         let tiles = &self.tiles;
         let clock = self.clock;
         let mut work: Vec<(Band, Vec<Job>)> = target
@@ -712,10 +724,10 @@ impl Retained {
                 (band, jobs)
             })
             .collect();
-        let raster = |work: &mut [(Band, Vec<Job>)]| -> Banded {
+        let raster = |(work, scratch): (&mut [(Band, Vec<Job>)], &mut Vec<u8>)| -> Banded {
             let mut done = Banded::default();
             for (band, jobs) in work {
-                band_raster(band, jobs, tiles, clock, &room, &mut done);
+                band_raster(band, jobs, tiles, clock, scratch, &mut done);
             }
             done
         };
@@ -730,12 +742,18 @@ impl Retained {
             .min(fresh)
             .max(1);
         let per = work.len().div_ceil(workers).max(1);
+        let chunks = work.len().div_ceil(per).max(1);
+        let scratch = &mut self.scratch;
+        while scratch.len() < chunks {
+            scratch.push(Vec::with_capacity((TILE * TILE * 4) as usize));
+        }
         let results: Vec<Banded> = if workers == 1 {
-            vec![raster(&mut work)]
+            vec![raster((&mut work, &mut scratch[0]))]
         } else {
             std::thread::scope(|scope| {
                 let handles: Vec<_> = work
                     .chunks_mut(per)
+                    .zip(scratch.iter_mut())
                     .map(|chunk| scope.spawn(|| raster(chunk)))
                     .collect();
                 handles
@@ -807,8 +825,9 @@ struct Job<'a> {
     revision: u64,
     commands: Vec<&'a Command>,
     cached: Option<usize>,
-    /// The tile showed this content before, so its raster is worth keeping.
-    admit: bool,
+    /// The pixels a raster worth keeping goes into: the tile showed this
+    /// content before, and the layer budget had room for it.
+    kept: Option<Vec<u8>>,
 }
 
 /// One band of target rows, from frame row `y`, `rows` of them.
@@ -833,20 +852,22 @@ struct Banded {
 /// order. New rasters of recurring content are kept while `room` lasts.
 fn band_raster(
     band: &mut Band,
-    jobs: &[Job],
+    jobs: &mut [Job],
     tiles: &[Tile],
     clock: u64,
-    room: &AtomicUsize,
+    scratch: &mut Vec<u8>,
     done: &mut Banded,
 ) {
     let (ro, go, bo) = band.offsets;
     let inside = Rect::new(0, band.y, band.width, band.rows);
     for job in jobs {
         let tile = job.tile;
+        let keep = job.kept.is_some();
         let raster: Cow<[u8]> = match job.cached {
             Some(i) => Cow::Borrowed(&tiles[i].pixels),
             None => {
-                let mut canvas = Canvas::new(tile.width, tile.height);
+                let pixels = job.kept.take().unwrap_or_else(|| std::mem::take(scratch));
+                let mut canvas = Canvas::over(tile.width, tile.height, pixels);
                 for c in &job.commands {
                     c.replay(&mut canvas, -tile.x, -tile.y);
                 }
@@ -877,22 +898,16 @@ fn band_raster(
             }
             done.damage_pixels += (part.width * part.height) as u64;
         }
-        if let Cow::Owned(pixels) = raster
-            && job.admit
-        {
-            let len = pixels.len();
-            let kept = room
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
-                    left.checked_sub(len)
-                })
-                .is_ok();
-            if kept {
+        if let Cow::Owned(pixels) = raster {
+            if keep {
                 done.tiles.push(Tile {
                     rect: tile,
                     revision: job.revision,
                     pixels,
                     used: clock,
                 });
+            } else {
+                *scratch = pixels;
             }
         }
     }

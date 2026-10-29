@@ -25,7 +25,8 @@ use encoding_rs::{Decoder, Encoding};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
-use crate::memory::{Budget, Lease};
+use crate::memory::{Budget, ByteCache, Lease};
+use crate::text::layout::TextLayout;
 use crate::widgets::cx::UiMsg;
 use engine::Engine;
 
@@ -158,6 +159,9 @@ struct Entry {
     /// The program's character set, or `None` for UTF-8, which passes
     /// through unchanged.
     charset: Option<Charset>,
+    /// Layouts of the screen's text runs, sized to the screen by the widget
+    /// that paints it.
+    layouts: ByteCache<String, TextLayout>,
 }
 
 /// A non-UTF-8 character set the program reads and writes: its output is
@@ -278,6 +282,7 @@ pub fn create(options: &Options, budget: Budget) -> Result<i64, String> {
             refused: None,
             refusal: None,
             charset: None,
+            layouts: ByteCache::new(0),
         },
     );
     Ok(id)

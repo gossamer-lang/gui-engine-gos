@@ -149,6 +149,27 @@ impl Canvas {
         })
     }
 
+    /// A blank `width` x `height` canvas drawn into `pixels`, reusing their
+    /// allocation.
+    pub(crate) fn over(width: i64, height: i64, mut pixels: Vec<u8>) -> Canvas {
+        let bytes = (width.max(0) * height.max(0) * 4) as usize;
+        pixels.clear();
+        pixels.resize(bytes, 0);
+        Canvas {
+            pixels,
+            width,
+            height,
+            clip: Rect::new(0, 0, width, height),
+            opacity: 255,
+            subtrees: None,
+            paint_error: None,
+            recording: None,
+            recorded_bytes: 0,
+            recording_limit: 0,
+            recording_overflow: false,
+        }
+    }
+
     /// Records primitives without allocating a framebuffer or rasterizing glyphs.
     pub fn recording(width: i64, height: i64, budget: usize) -> Self {
         let mut canvas = Self::new(0, 0);

@@ -93,6 +93,20 @@ impl<K: Ord + Clone, V> ByteCache<K, V> {
         self.bytes -= entry.bytes;
         Some(entry.value)
     }
+    /// Changes the byte limit, evicting the least recently used entries until
+    /// the cache fits it.
+    pub fn set_limit(&mut self, limit: usize) {
+        self.limit = limit;
+        while self.bytes > self.limit {
+            let Some((_, oldest)) = self.ages.pop_first() else {
+                break;
+            };
+            if let Some(entry) = self.entries.remove(oldest.as_ref()) {
+                self.bytes -= entry.bytes;
+            }
+            self.evictions += 1;
+        }
+    }
     pub fn clear(&mut self) {
         self.entries = BTreeMap::new();
         self.ages = BTreeMap::new();
@@ -132,6 +146,24 @@ mod tests {
         assert!(!cache.insert(4, "large", usize::MAX));
         assert_eq!(cache.len(), 2);
         cache.clear();
+        assert_eq!((cache.len(), cache.bytes()), (0, 0));
+    }
+
+    #[test]
+    fn lowering_the_limit_evicts_the_least_recently_used_first() {
+        let mut cache = ByteCache::new(1 << 20);
+        for key in 0..10 {
+            assert!(cache.insert(key, key, 600));
+        }
+        let entry = cache.bytes() / 10;
+        assert_eq!(cache.get(&0), Some(&0));
+        cache.set_limit(3 * entry);
+        assert_eq!(cache.len(), 3);
+        assert!(cache.bytes() <= 3 * entry);
+        assert_eq!(cache.get(&0), Some(&0));
+        assert_eq!(cache.get(&9), Some(&9));
+        assert_eq!(cache.get(&1), None);
+        cache.set_limit(0);
         assert_eq!((cache.len(), cache.bytes()), (0, 0));
     }
 

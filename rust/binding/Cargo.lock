@@ -637,7 +637,7 @@ dependencies = [
 
 [[package]]
 name = "gossamer-binding"
-version = "0.75.6"
+version = "0.75.7"
 dependencies = [
  "gossamer-binding-abi",
  "gossamer-binding-macros",
@@ -649,11 +649,11 @@ dependencies = [
 
 [[package]]
 name = "gossamer-binding-abi"
-version = "0.75.6"
+version = "0.75.7"
 
 [[package]]
 name = "gossamer-binding-macros"
-version = "0.75.6"
+version = "0.75.7"
 dependencies = [
  "proc-macro2",
  "quote",

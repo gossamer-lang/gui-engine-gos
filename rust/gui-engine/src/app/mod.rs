@@ -3458,6 +3458,14 @@ impl Session {
                 Effect::SetMinSize(window, width, height) => {
                     self.set_min_size(&window, width, height)?
                 }
+                Effect::SetFullscreen(window, on) => {
+                    let w = self.find(&window);
+                    if w >= 0
+                        && let Err(e) = self.windows[w as usize].native.set_fullscreen(on)
+                    {
+                        self.log_line(&format!("fullscreen unavailable: {}", e))
+                    }
+                }
                 Effect::FocusIn(window, id) => {
                     let w = self.find(&window);
                     if w >= 0 {
@@ -6794,6 +6802,26 @@ mod window_command_tests {
                 assert_eq!(which.label, key);
                 assert_eq!(which.checked, i64::from(key == "second"));
             }
+            s.shutdown()
+        })
+    }
+
+    #[test]
+    fn a_fullscreen_effect_covers_the_display_with_the_named_window_and_gives_it_back() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _cleanup = scopeguard::guard((), |_| crate::services::remove_test_config(&config));
+            let mut s = start("Fullscreen", "dev.gossamer.fullscreen").unwrap();
+            s.set_shell(|_| {}, Widget::label, |_| Vec::new());
+            s.open_window("main", "Main", 320, 200).unwrap();
+            s.open_window("second", "Second", 320, 200).unwrap();
+            effects::perform(Effect::SetFullscreen("second".into(), true));
+            s.flush().unwrap();
+            assert!(!s.windows[0].native.is_fullscreen());
+            assert!(s.windows[1].native.is_fullscreen());
+            effects::perform(Effect::SetFullscreen("second".into(), false));
+            s.flush().unwrap();
+            assert!(!s.windows[1].native.is_fullscreen());
             s.shutdown()
         })
     }

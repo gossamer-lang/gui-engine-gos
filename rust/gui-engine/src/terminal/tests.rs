@@ -223,7 +223,7 @@ mod session {
     }
 
     #[test]
-    fn ctrl_shift_letters_reach_the_window_commands_from_a_focused_terminal() {
+    fn ctrl_shift_chords_and_f11_reach_the_window_commands_from_a_focused_terminal() {
         crate::testing::on_ui_thread(|| {
             let config = crate::services::private_test_config();
             let _defer = scopeguard::guard((), |_| {
@@ -245,6 +245,9 @@ mod session {
                         crate::commands::Command::new("tab.new", "New Tab").key("Ctrl+Shift+T"),
                         crate::commands::Command::new("tab.right", "Move Right")
                             .key("Ctrl+Shift+PageDown"),
+                        crate::commands::Command::new("view.zoom-in", "Zoom In")
+                            .key("Ctrl+Shift+="),
+                        crate::commands::Command::new("view.fullscreen", "Fullscreen").key("F11"),
                     ]
                 },
             );
@@ -267,10 +270,13 @@ mod session {
             };
             s.press(windowing::Key::T, chord).unwrap();
             s.press(windowing::Key::PageDown, chord).unwrap();
+            s.press(windowing::Key::Char('='), chord).unwrap();
+            s.press(windowing::Key::F11, windowing::Mods::default())
+                .unwrap();
             s.step().unwrap();
             assert_eq!(
                 *ran.borrow(),
-                vec!["tab.new".to_string(), "tab.right".to_string()]
+                ["tab.new", "tab.right", "view.zoom-in", "view.fullscreen"]
             );
             s.shutdown();
         })

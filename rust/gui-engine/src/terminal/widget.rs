@@ -650,6 +650,10 @@ fn key_down(v: &View, key: Key, mods: windowing::Mods, rows: i64, cx: &mut Event
     {
         return;
     }
+    // F11 makes the window fullscreen, as in GNOME Terminal and xfce4-terminal.
+    if key == Key::F11 && !mods.ctrl && !mods.alt && !mods.shift {
+        return;
+    }
     if mods.shift && !mods.ctrl && (key == Key::PageUp || key == Key::PageDown) {
         let page = if key == Key::PageUp { rows } else { -rows };
         let _ = super::scroll(v.terminal, page);

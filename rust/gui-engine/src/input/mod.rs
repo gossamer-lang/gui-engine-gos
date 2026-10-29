@@ -300,8 +300,19 @@ pub fn key_name(key: Key) -> &'static str {
         Key::F11 => "F11",
         Key::F12 => "F12",
         Key::Menu | Key::Application => "Menu",
-        Key::KpPlus => "+",
-        Key::KpMinus => "-",
+        Key::Char('=') => "=",
+        Key::Char('-') => "-",
+        Key::Char(',') => ",",
+        Key::Char('.') => ".",
+        Key::Char('/') => "/",
+        Key::Char(';') => ";",
+        Key::Char('\'') => "'",
+        Key::Char('[') => "[",
+        Key::Char(']') => "]",
+        Key::Char('\\') => "\\",
+        Key::Char('`') => "`",
+        Key::KpPlus => "NumPlus",
+        Key::KpMinus => "NumMinus",
         _ => "?",
     }
 }
@@ -326,12 +337,21 @@ pub fn key_from_name(name: &str) -> Option<Key> {
         "up" => Some(Key::Up),
         "down" => Some(Key::Down),
         "menu" => Some(Key::Menu),
-        "plus" | "+" => Some(Key::KpPlus),
-        "minus" | "-" => Some(Key::KpMinus),
+        "equals" => Some(Key::Char('=')),
+        "minus" => Some(Key::Char('-')),
+        "numplus" | "plus" | "+" => Some(Key::KpPlus),
+        "numminus" => Some(Key::KpMinus),
         _ => None,
     };
     if named.is_some() {
         return named;
+    }
+    // The punctuation keys `key_name` spells, by their character.
+    let mut chars = n.chars();
+    if let (Some(c), None) = (chars.next(), chars.next())
+        && "=-,./;'[]\\`".contains(c)
+    {
+        return Some(Key::Char(c));
     }
     // Letters, digits, and function keys by their label.
     let all = vec![
@@ -414,6 +434,22 @@ mod tests {
         let mut altgr = ctrl();
         altgr.alt_gr = true;
         assert!(!s.matches(windowing::Key::S, altgr))
+    }
+
+    #[test]
+    fn the_equals_and_minus_keys_and_their_keypad_twins_name_themselves_apart() {
+        use windowing::Key;
+        for key in [Key::Char('='), Key::Char('-'), Key::KpPlus, Key::KpMinus] {
+            assert_eq!(super::key_from_name(super::key_name(key)), Some(key));
+        }
+        let zoom = Shortcut::parse("Ctrl+Shift+=").unwrap();
+        let mods = Mods {
+            ctrl: true,
+            shift: true,
+            ..Mods::default()
+        };
+        assert!(zoom.strokes[0].matches(Key::Char('='), mods));
+        assert!(!zoom.strokes[0].matches(Key::KpPlus, mods));
     }
 
     #[test]

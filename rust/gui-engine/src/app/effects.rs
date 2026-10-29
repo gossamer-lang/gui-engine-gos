@@ -40,6 +40,8 @@ pub enum Effect {
     /// Keeps a window at least this many interface units wide and tall,
     /// growing it now when its current or remembered size is smaller.
     SetMinSize(String, i64, i64),
+    /// Makes a window cover its display (true) or go back to its own frame.
+    SetFullscreen(String, bool),
     /// Ends the session (after asking documents, when close is deferred).
     Quit,
     /// Moves keyboard focus to the widget `id` in the main window.

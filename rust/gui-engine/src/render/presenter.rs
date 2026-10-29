@@ -70,6 +70,17 @@ fn native(damage: &[Rect]) -> Vec<windowing::display::Rect> {
         .collect()
 }
 
+// The frame pixels `damage` repaints, counted as the software raster counts
+// the parts it paints, so every backend reports the same damage.
+fn damage_pixels(damage: &[Rect], screen: Rect) -> u64 {
+    damage
+        .iter()
+        .map(|r| r.intersect(screen))
+        .filter(|r| r.width > 0 && r.height > 0)
+        .map(|r| (r.width * r.height) as u64)
+        .sum()
+}
+
 // Copies `damage` of a whole-frame canvas into the window's surface.
 fn convert(
     window: windowing::Window,
@@ -179,6 +190,7 @@ impl WindowRenderer {
                 self.retained.width = width;
                 self.retained.height = height;
                 let damage = vec![screen];
+                self.retained.stats.damage_pixels = damage_pixels(&damage, screen);
                 if let Some(gpu) = &mut self.gpu {
                     if gpu.present(&canvas.pixels, &native(&damage), false).is_ok() {
                         self.retained.stats.gpu_layer_bytes = gpu.cache_bytes();
@@ -202,6 +214,7 @@ impl WindowRenderer {
         }
         if let Some(gpu) = &mut self.gpu {
             if Self::compose(gpu, &scene, self.retained.budgets.layers, &damage).is_ok() {
+                self.retained.stats.damage_pixels = damage_pixels(&damage, screen);
                 self.retained.stats.gpu_layer_bytes = gpu.cache_bytes();
                 self.retained.commit(scene);
                 return Ok(damage);
@@ -326,9 +339,20 @@ impl WindowRenderer {
 
 #[cfg(test)]
 mod tests {
-    use super::{Conversion, gpu_requested};
+    use super::{Conversion, damage_pixels, gpu_requested};
     use crate::geometry::Rect;
     use crate::render::Canvas;
+
+    #[test]
+    fn damage_pixels_count_the_frame_area_each_region_repaints() {
+        let screen = Rect::new(0, 0, 10, 10);
+        let damage = [
+            Rect::new(1, 1, 1, 18),
+            Rect::new(8, 8, 4, 4),
+            Rect::new(20, 0, 2, 2),
+        ];
+        assert_eq!(damage_pixels(&damage, screen), 9 + 4);
+    }
 
     #[test]
     fn damage_converts_into_surface_order_band_by_band() {

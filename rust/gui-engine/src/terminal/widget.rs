@@ -74,7 +74,7 @@ fn ensure_default_font() {
             // The faces are fixed assets well inside the registry's budget;
             // were one refused, the family check below falls back to the
             // bundled monospace face.
-            let _ = crate::text::fonts::register(data);
+            let _ = crate::text::fonts::register_static(data);
         }
     });
 }
@@ -619,8 +619,13 @@ fn key_down(v: &View, key: Key, mods: windowing::Mods, rows: i64, cx: &mut Event
         return;
     }
     // F10 opens the window's menu bar, as in GNOME Terminal; Shift+F10 opens
-    // a context menu.
-    if key == Key::F10 && !mods.ctrl && !mods.alt {
+    // a context menu. Where menus live in the system menu bar (macOS), plain
+    // F10 belongs to the program, as in Terminal.app.
+    if key == Key::F10
+        && !mods.ctrl
+        && !mods.alt
+        && (mods.shift || !windowing::menu::has_native_menu_bar())
+    {
         return;
     }
     if mods.shift && !mods.ctrl && (key == Key::PageUp || key == Key::PageDown) {

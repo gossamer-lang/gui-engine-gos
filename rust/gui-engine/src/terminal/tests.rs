@@ -200,7 +200,7 @@ mod session {
             assert!(set_encoding(id, "no-such-set").is_err());
             set_encoding(id, "ISO-8859-1").unwrap();
             let script = "printf 'caf\\351\\r\\n'; read line; \
-                      printf 'got:'; printf '%s' \"$line\" | od -An -tx1; exit 0";
+                      printf 'got:'; printf '%s' \"$line\" | od -An -tx1 | tr -d ' \\n'; exit 0";
             spawn(
                 id,
                 &Command {
@@ -217,7 +217,7 @@ mod session {
                 .unwrap();
             step_until(&mut s, || *exited.borrow());
             let shown = snapshot(id).unwrap().text;
-            assert!(shown.contains("got: e9"), "{shown}");
+            assert!(shown.contains("got:e9"), "{shown}");
             s.shutdown();
         })
     }
@@ -317,7 +317,14 @@ mod session {
             assert!(!s.windows[0].focus_visible);
             s.press(windowing::Key::F10, windowing::Mods::default())
                 .unwrap();
-            assert_eq!(s.focused(), "menu");
+            // A system menu bar (macOS) leaves no in-window bar to reach, so
+            // F10 stays with the terminal's program.
+            let expected = if windowing::menu::has_native_menu_bar() {
+                "term"
+            } else {
+                "menu"
+            };
+            assert_eq!(s.focused(), expected);
             s.shutdown();
         })
     }

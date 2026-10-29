@@ -13,7 +13,7 @@ use crate::errors;
 
 use crate::text::catalog;
 use crate::text::catalog::FontRecord;
-use crate::text::font::Face;
+use crate::text::font::{Face, FontBytes};
 use crate::text::ucd::EMOJI_PRESENTATION;
 use crate::text::variation;
 
@@ -88,7 +88,8 @@ pub(crate) fn purge_fallback_cache() {
 fn ensure_bundled() {
     BUNDLED.get_or_init(|| {
         for (index, encoded) in [SANS, SANS_BOLD, MONO, MONO_BOLD].iter().enumerate() {
-            let mut face = Face::parse(encoded, 0).expect("bundled fonts parse");
+            let mut face =
+                Face::parse_bytes(FontBytes::Static(encoded), 0).expect("bundled fonts parse");
             face.slot = index as i64;
             FACES.lock().insert(index as i64, face);
         }
@@ -127,9 +128,8 @@ fn add_face_with_lifetime(f: &Face, permanent: bool) -> i64 {
             return index;
         }
     }
-    let bytes = faces.values().map(Face::owned_bytes).sum::<usize>();
     if f.owned_bytes() > FONT_BYTE_LIMIT
-        || bytes.saturating_add(f.owned_bytes()) > REGISTRY_BYTE_LIMIT
+        || faces_bytes(faces.values().chain([f])) > REGISTRY_BYTE_LIMIT
     {
         return -1;
     }
@@ -199,11 +199,20 @@ pub(crate) fn take_face_requests() -> Vec<(FontRecord, bool)> {
         .collect()
 }
 
+// The heap `faces` hold, counting a file several of them share once.
+fn faces_bytes<'a>(faces: impl IntoIterator<Item = &'a Face>) -> usize {
+    let mut files = HashSet::new();
+    faces
+        .into_iter()
+        .map(|f| match f.shared_file() {
+            Some((at, len)) if !files.insert(at) => f.owned_bytes() - len,
+            _ => f.owned_bytes(),
+        })
+        .sum()
+}
+
 pub fn registry_bytes() -> (usize, usize) {
-    (
-        FACES.lock().values().map(Face::owned_bytes).sum(),
-        REGISTRY_BYTE_LIMIT,
-    )
+    (faces_bytes(FACES.lock().values()), REGISTRY_BYTE_LIMIT)
 }
 
 /// The primary face for a family and weight.
@@ -362,21 +371,31 @@ pub fn is_default_ignorable(c: char) -> bool {
 /// Registers font bytes (a TTF/OTF/TTC file's contents) and answers the
 /// ids of the faces it held.
 pub fn register(data: &[u8]) -> Result<Vec<FaceId>, errors::Error> {
+    register_bytes(FontBytes::owned(data.to_vec()))
+}
+
+/// Registers a font file built into the program, read where it lies.
+pub fn register_static(data: &'static [u8]) -> Result<Vec<FaceId>, errors::Error> {
+    register_bytes(FontBytes::Static(data))
+}
+
+// Every face of a collection shares the one copy of its file.
+fn register_bytes(data: FontBytes) -> Result<Vec<FaceId>, errors::Error> {
     ensure_bundled();
     if data.len() > FONT_BYTE_LIMIT {
         return Err(errors::new("font exceeds its byte budget"));
     }
-    let count = Face::count(data);
-    if count > 4096 || data.len().saturating_mul(count as usize) > REGISTRY_BYTE_LIMIT {
+    let count = Face::count(&data);
+    if count > 4096 {
         return Err(errors::new("font collection exceeds its byte budget"));
     }
     // Parse and validate the entire transaction before publishing any face.
     let mut parsed = Vec::new();
-    let mut charge = 0usize;
     for index in 0..count {
-        let face = Face::parse(data, index)?;
-        charge = charge.saturating_add(face.owned_bytes());
-        if face.owned_bytes() > FONT_BYTE_LIMIT || charge > REGISTRY_BYTE_LIMIT {
+        let face = Face::parse_bytes(data.clone(), index)?;
+        if face.owned_bytes() > FONT_BYTE_LIMIT
+            || faces_bytes(parsed.iter().chain([&face])) > REGISTRY_BYTE_LIMIT
+        {
             return Err(errors::new("font collection exceeds its byte budget"));
         }
         parsed.push(face);
@@ -384,7 +403,6 @@ pub fn register(data: &[u8]) -> Result<Vec<FaceId>, errors::Error> {
     let mut faces = FACES.lock();
     let mut pending = BTreeMap::<i64, Face>::new();
     let mut ids = Vec::new();
-    let mut used = faces.values().map(Face::owned_bytes).sum::<usize>();
     for mut candidate in parsed {
         let existing = faces.iter().chain(pending.iter()).find_map(|(&id, face)| {
             candidate.slot = face.slot;
@@ -393,7 +411,7 @@ pub fn register(data: &[u8]) -> Result<Vec<FaceId>, errors::Error> {
         let id = if let Some(id) = existing {
             id
         } else {
-            used = used.saturating_add(candidate.owned_bytes());
+            let used = faces_bytes(faces.values().chain(pending.values()).chain([&candidate]));
             if used > REGISTRY_BYTE_LIMIT {
                 return Err(errors::new("font registry exceeds its byte budget"));
             }
@@ -751,7 +769,7 @@ pub(crate) fn prepare_installed(
         if !active() {
             return Err("font load cancelled or expired".into());
         }
-        let face = Face::parse(&data, r.index).map_err(|e| e.to_string())?;
+        let face = Face::parse_bytes(FontBytes::owned(data), r.index).map_err(|e| e.to_string())?;
         if !active() {
             return Err("font load cancelled or expired".into());
         }
@@ -854,15 +872,22 @@ fn load_named(name: &str, bold: bool) -> Option<i64> {
 
 /// Whether a family is bundled, registered or installed.
 pub fn family_available(name: &str) -> bool {
-    ensure_bundled();
+    if loaded_family(name) {
+        return true;
+    }
+    // Only a family no loaded face has needs the installed catalog.
     ensure_installed();
     let want = name.to_lowercase();
-    find_named(name, false).is_some()
-        || find_named(name, true).is_some()
-        || INSTALLED
-            .lock()
-            .iter()
-            .any(|r| r.family.to_lowercase() == want)
+    INSTALLED
+        .lock()
+        .iter()
+        .any(|r| r.family.to_lowercase() == want)
+}
+
+// Whether a loaded face, bundled or registered, is of family `name`.
+fn loaded_family(name: &str) -> bool {
+    ensure_bundled();
+    find_named(name, false).is_some() || find_named(name, true).is_some()
 }
 
 /// Number of loaded faces, for diagnostics.
@@ -874,6 +899,27 @@ pub fn loaded_count() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{face, face_for, face_for_cluster, primary, shown_as_emoji};
+
+    #[test]
+    fn bundled_faces_are_read_in_place_and_a_shared_file_is_charged_once() {
+        use crate::text::font::{Face, FontBytes};
+        let sans = face(primary(&super::Family::Sans, false));
+        assert!(sans.shared_file().is_none());
+        assert!(sans.owned_bytes() < super::SANS.len());
+        let bytes = FontBytes::owned(super::SANS.to_vec());
+        let a = Face::parse_bytes(bytes.clone(), 0).unwrap();
+        let b = Face::parse_bytes(bytes, 0).unwrap();
+        assert_eq!(
+            super::faces_bytes([&a, &b]),
+            a.owned_bytes() + b.owned_bytes() - super::SANS.len()
+        );
+    }
+
+    #[test]
+    fn a_loaded_family_is_found_without_the_installed_catalog() {
+        assert!(super::loaded_family("DejaVu Sans"));
+        assert!(!super::loaded_family("No Such Family"));
+    }
 
     #[test]
     fn bundled_faces_parse_with_sane_metrics() {

@@ -58,6 +58,51 @@ pub struct ColorGlyph {
     pub bearing_y: i64,
 }
 
+/// A font file's bytes: a file built into the program, read where it lies, or
+/// one loaded at run time, shared by every face it holds.
+#[derive(Clone)]
+pub enum FontBytes {
+    Static(&'static [u8]),
+    Shared(std::sync::Arc<Vec<u8>>),
+}
+
+impl FontBytes {
+    /// Bytes loaded at run time, taken without a copy.
+    pub fn owned(data: Vec<u8>) -> Self {
+        Self::Shared(std::sync::Arc::new(data))
+    }
+
+    /// The heap the bytes occupy; a built-in file occupies none.
+    fn heap_bytes(&self) -> usize {
+        match self {
+            Self::Static(_) => 0,
+            Self::Shared(data) => data.len(),
+        }
+    }
+}
+
+impl std::ops::Deref for FontBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Static(data) => data,
+            Self::Shared(data) => data,
+        }
+    }
+}
+
+impl PartialEq for FontBytes {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl std::fmt::Debug for FontBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "FontBytes({} bytes)", self.len())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Face {
     pub family: String,
@@ -70,7 +115,7 @@ pub struct Face {
     pub descent: i64,
     pub line_gap: i64,
     pub num_glyphs: i64,
-    data: std::sync::Arc<[u8]>,
+    data: FontBytes,
     /// Offset of this face's table directory (non-zero inside a collection).
     base: i64,
     tables: HashMap<String, (i64, i64)>,
@@ -90,9 +135,18 @@ pub struct Face {
 }
 
 impl Face {
+    /// The address and length of the file this face shares with the other
+    /// faces loaded from it, when it was loaded at run time.
+    pub(crate) fn shared_file(&self) -> Option<(usize, usize)> {
+        match &self.data {
+            FontBytes::Static(_) => None,
+            FontBytes::Shared(data) => Some((std::sync::Arc::as_ptr(data) as usize, data.len())),
+        }
+    }
+
     pub(crate) fn owned_bytes(&self) -> usize {
         size_of::<Self>()
-            + self.data.len()
+            + self.data.heap_bytes()
             + self.family.capacity()
             + self.subfamily.capacity()
             + self.tables.capacity() * (size_of::<(String, (i64, i64))>() + 32)
@@ -117,7 +171,7 @@ impl Default for Face {
             descent: 0,
             line_gap: 0,
             num_glyphs: 0,
-            data: std::sync::Arc::default(),
+            data: FontBytes::Static(&[]),
             base: 0,
             tables: HashMap::new(),
             long_loca: false,
@@ -135,7 +189,8 @@ impl Default for Face {
 
 impl Face {
     /// Parses the face at `index` of a font file (index 0 for a single font).
-    fn directory(data: &[u8], index: i64) -> Result<Face, errors::Error> {
+    fn directory(bytes: FontBytes, index: i64) -> Result<Face, errors::Error> {
+        let data: &[u8] = &bytes;
         if data.len() < 12 {
             return Err(errors::new("font data is too short"));
         }
@@ -170,7 +225,7 @@ impl Face {
             i += 1;
         }
         Ok(Face {
-            data: std::sync::Arc::from(data),
+            data: bytes.clone(),
             base,
             tables,
             ..Face::default()
@@ -181,13 +236,18 @@ impl Face {
         data: &[u8],
         index: i64,
     ) -> Result<(String, String, bool, bool), errors::Error> {
-        let mut face = Face::directory(data, index)?;
+        let mut face = Face::directory(FontBytes::owned(data.to_vec()), index)?;
         face.read_head()?;
         face.read_names();
         Ok((face.family, face.subfamily, face.bold, face.italic))
     }
     pub fn parse(data: &[u8], index: i64) -> Result<Face, errors::Error> {
-        let mut face = Face::directory(data, index)?;
+        Self::parse_bytes(FontBytes::owned(data.to_vec()), index)
+    }
+
+    /// Parses the face at `index` of `bytes`, which it shares rather than copies.
+    pub fn parse_bytes(bytes: FontBytes, index: i64) -> Result<Face, errors::Error> {
+        let mut face = Face::directory(bytes, index)?;
         face.read_head()?;
         face.read_metrics()?;
         face.read_cmap()?;
@@ -211,7 +271,7 @@ impl Face {
     /// Reads the names, style, metrics and character map of a single-face
     /// font file whose outline tables may be absent, as a catalog summary.
     pub fn summary(data: &[u8]) -> Result<Face, errors::Error> {
-        let mut face = Face::directory(data, 0)?;
+        let mut face = Face::directory(FontBytes::owned(data.to_vec()), 0)?;
         face.read_head()?;
         face.read_metrics()?;
         face.read_cmap()?;

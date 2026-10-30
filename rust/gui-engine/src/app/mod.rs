@@ -5280,7 +5280,21 @@ impl Session {
     }
 
     /// Runs settled work: messages, effects, mailbox posts, and repaints.
+    /// A window change the desktop applies later, such as fullscreen under
+    /// an X11 window manager, is waited for, so what follows sees the size
+    /// it gave the window.
     pub fn flush(&mut self) -> Result<(), errors::Error> {
+        self.settle()?;
+        for w in 0..self.windows.len() {
+            let native = self.windows[w].native;
+            native.sync()?;
+            // The size event waits in the queue, which flushing does not read.
+            let (pw, ph) = native.pixel_size();
+            let rect = &self.windows[w].node.rect;
+            if (rect.width, rect.height) != (pw, ph) {
+                self.resized(w as i64)
+            }
+        }
         self.settle()
     }
 

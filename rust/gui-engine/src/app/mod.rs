@@ -956,7 +956,7 @@ impl Session {
             // A bounded batch of already-queued events before repainting.
             let mut n = 0;
             while n < 64 && self.held.is_none() {
-                match self.app.poll() {
+                match self.pump(|app| app.poll())? {
                     Some(e2) => {
                         if is_motion(&e2) {
                             self.held = Some(e2);
@@ -972,6 +972,42 @@ impl Session {
         self.fire_timers()?;
         self.settle_paced(true)?;
         Ok(!self.quit && !self.windows.is_empty())
+    }
+
+    // Runs `pump` on the platform's events, repainting meanwhile the window
+    // a live resize changes: the platform's own loop holds the session inside
+    // the pump until the drag ends, and a frame painted then shows together
+    // with the new size.
+    fn pump<R>(&mut self, pump: impl FnOnce(&windowing::App) -> R) -> Result<R, errors::Error> {
+        let app = self.app.clone();
+        let mut failed = None;
+        let answer = app.redrawing(
+            &mut |native| {
+                if failed.is_none() {
+                    failed = self.redraw_live(native).err();
+                }
+            },
+            || pump(&app),
+        );
+        failed.map_or(Ok(answer), Err)
+    }
+
+    // Repaints `native` for a live resize. Its size event waits in the
+    // queue until the drag ends, so a changed size is handled here first.
+    fn redraw_live(&mut self, native: windowing::Window) -> Result<(), errors::Error> {
+        let w = self.find_native(native.id());
+        if w < 0 {
+            return Ok(());
+        }
+        let (pw, ph) = native.pixel_size();
+        let rect = &self.windows[w as usize].node.rect;
+        if (rect.width, rect.height) != (pw, ph) {
+            self.resized(w)
+        }
+        if self.windows[w as usize].dirty || self.windows[w as usize].layout_dirty {
+            self.render(w)?
+        }
+        Ok(())
     }
 
     // Applies messages, effects, task outcomes, rebuilds, and repaints
@@ -1087,7 +1123,7 @@ impl Session {
                 // looks at the accessibility bus each frame.
                 let polled = self.a11y.active() && !self.a11y.watched();
                 if deadline < 0 && !polled {
-                    self.app.wait()?
+                    self.pump(|app| app.wait())??
                 } else {
                     let wait = if polled {
                         if deadline < 0 {
@@ -1098,7 +1134,7 @@ impl Session {
                     } else {
                         (deadline - self.now()).max(0)
                     };
-                    match self.app.wait_timeout(wait)? {
+                    match self.pump(|app| app.wait_timeout(wait))?? {
                         Some(e) => e,
                         None => return Ok(None),
                     }
@@ -1121,7 +1157,7 @@ impl Session {
         let mut ly = y;
         let mut tdx = dx;
         let mut tdy = dy;
-        while let Some(next) = self.app.poll() {
+        while let Some(next) = self.pump(|app| app.poll())? {
             match next {
                 windowing::Event::PointerMoved {
                     window: w2,
@@ -1609,12 +1645,7 @@ impl Session {
             | windowing::Event::PixelSizeChanged { window, .. } => {
                 let w = self.find_native(*window);
                 if w >= 0 {
-                    self.invalidate(w, "window resized");
-                    // A window that grows for its popups is resized only by
-                    // the session, to show them; it places them again instead.
-                    if self.windows[w as usize].grow_base <= 0 {
-                        self.close_all_popups(w)
-                    }
+                    self.resized(w)
                 }
             }
             windowing::Event::ScaleChanged { window, scale } => {
@@ -3971,6 +4002,15 @@ impl Session {
     }
 
     // Marks window `w` for layout, noting `cause` for the inspector.
+    fn resized(&mut self, w: i64) {
+        self.invalidate(w, "window resized");
+        // A window that grows for its popups is resized only by the session,
+        // to show them; it places them again instead.
+        if self.windows[w as usize].grow_base <= 0 {
+            self.close_all_popups(w)
+        }
+    }
+
     fn invalidate(&mut self, w: i64, cause: &str) {
         self.windows[w as usize].layout_dirty = true;
         let entry = format!("{} ms: {}", self.now(), cause);

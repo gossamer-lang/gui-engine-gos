@@ -119,6 +119,11 @@ pub struct WindowState {
     pub layer_focus: HashMap<String, String>,
     pub commands: CommandTable,
     pub dirty: bool,
+    /// Terminal output arrived that the window has not painted yet; the event
+    /// loop paints it at most once per `OUTPUT_FRAME_MS`.
+    pub output_dirty: bool,
+    /// Session time of the window's last paint, in milliseconds.
+    pub presented: Option<i64>,
     pub layout_dirty: bool,
     pub caret_on: bool,
     pub active: bool,
@@ -288,6 +293,9 @@ pub struct ResourceUsage {
 const LOG_LIMIT: i64 = 400;
 
 const FRAME_MS: i64 = 33;
+/// The shortest time between two paints driven by terminal output alone, so
+/// a program writing fast is parsed in large runs rather than painted per read.
+const OUTPUT_FRAME_MS: i64 = 16;
 // How long a held toast waits before its timeout is looked at again.
 const TOAST_RECHECK_MS: i64 = 1000;
 // Assistive technology hears at most one announcement per interval, so a
@@ -645,6 +653,8 @@ impl Session {
             layer_focus: HashMap::new(),
             commands: CommandTable::new(&[]),
             dirty: true,
+            output_dirty: false,
+            presented: None,
             layout_dirty: true,
             caret_on: true,
             active: true,
@@ -936,7 +946,7 @@ impl Session {
     /// Handles everything that is ready, then waits for and handles one
     /// event. Answers false when the session should end.
     pub fn step(&mut self) -> Result<bool, errors::Error> {
-        self.settle()?;
+        self.settle_paced(true)?;
         if self.quit || self.windows.is_empty() {
             return Ok(false);
         }
@@ -960,13 +970,19 @@ impl Session {
             }
         }
         self.fire_timers()?;
-        self.settle()?;
+        self.settle_paced(true)?;
         Ok(!self.quit && !self.windows.is_empty())
     }
 
     // Applies messages, effects, task outcomes, rebuilds, and repaints
     // until nothing more is pending.
     fn settle(&mut self) -> Result<(), errors::Error> {
+        self.settle_paced(false)
+    }
+
+    // `settle`, painting terminal output no more often than `OUTPUT_FRAME_MS`
+    // when `paced`.
+    fn settle_paced(&mut self, paced: bool) -> Result<(), errors::Error> {
         self.check_memory()?;
         let mut rounds = 0;
         loop {
@@ -998,8 +1014,12 @@ impl Session {
             let (media_changed, media_events) = crate::media::pump(&self.budget);
             self.pending.extend(media_events);
             self.schedule_media_tick();
-            if terminals_changed | images_changed | media_changed | crate::chart::pump(&self.budget)
-            {
+            if terminals_changed {
+                for window in &mut self.windows {
+                    window.output_dirty = true;
+                }
+            }
+            if images_changed | media_changed | crate::chart::pump(&self.budget) {
                 for window in &mut self.windows {
                     window.dirty = true;
                 }
@@ -1022,6 +1042,17 @@ impl Session {
         while w < self.windows.len() {
             self.mark_tree(w as i64);
             self.fit_growing_window(w as i64);
+            let now = self.now();
+            let window = &mut self.windows[w];
+            if window.output_dirty
+                && (!paced
+                    || window
+                        .presented
+                        .is_none_or(|at| now - at >= OUTPUT_FRAME_MS))
+            {
+                window.output_dirty = false;
+                window.dirty = true;
+            }
             if self.windows[w].dirty || self.windows[w].layout_dirty {
                 self.render(w as i64)?;
                 // Rendering measures the view; a growing window fits it now.
@@ -1131,8 +1162,17 @@ impl Session {
                 .any(|w| w.key == timer.window && w.occluded)
     }
 
+    // When the earliest window holding unpainted terminal output may paint it.
+    fn output_due(&self) -> Option<i64> {
+        self.windows
+            .iter()
+            .filter(|w| w.output_dirty)
+            .map(|w| w.presented.map_or(self.now(), |at| at + OUTPUT_FRAME_MS))
+            .min()
+    }
+
     fn next_deadline(&self) -> i64 {
-        let mut best = -1;
+        let mut best = self.output_due().unwrap_or(-1);
         for t in &self.timers {
             if self.visual_timer_paused(t) {
                 continue;
@@ -4684,6 +4724,8 @@ impl Session {
             .or_default()
             .present(native, pw, ph, painted)?;
         self.windows[w as usize].dirty = false;
+        self.windows[w as usize].output_dirty = false;
+        self.windows[w as usize].presented = Some(self.now());
         if !damage.is_empty() {
             self.windows[w as usize].frames += 1;
         }
@@ -5138,14 +5180,16 @@ impl Session {
                 .timers
                 .iter()
                 .filter(|t| !self.visual_timer_paused(t))
-                .map(|t| (t.deadline - now).max(0))
+                .map(|t| t.deadline)
+                .chain(self.output_due())
+                .map(|deadline| (deadline - now).max(0))
                 .filter(|offset| *offset <= left)
                 .min();
             let step = next.unwrap_or(left);
             self.clock_held = Some(now + step);
             left -= step;
             self.fire_timers()?;
-            self.settle()?;
+            self.settle_paced(true)?;
             if next.is_none() || left == 0 {
                 return Ok(());
             }
@@ -6754,6 +6798,57 @@ mod advance_tests {
             assert!(s.semantics(0).dump().contains("ticks 10"));
             s.advance(50).unwrap();
             assert!(s.semantics(0).dump().contains("ticks 11"));
+            s.shutdown()
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_output_waits_for_the_output_frame_after_the_last_paint() {
+        use crate::terminal::{self, Command, Options};
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _cleanup = scopeguard::guard((), |_| crate::services::remove_test_config(&config));
+            let mut s = start("Paced", "dev.gossamer.gui-output-frame-test").unwrap();
+            let options = Options {
+                rows: 8,
+                cols: 40,
+                scrollback: 100,
+                byte_limit: 1 << 20,
+            };
+            let id = terminal::create(&options, effects::current_budget()).unwrap();
+            s.set_shell(
+                |_| {},
+                move |_| Widget::Terminal(terminal::widget::View::new("term", id, "Paced")),
+                |_| Vec::new(),
+            );
+            s.clock_held = Some(s.now());
+            s.open_window("main", "Paced", 420, 240).unwrap();
+            // Opening queues the window's size, focus and shown events; their
+            // repaint comes before the program writes anything.
+            while let Some(event) = s.app.poll() {
+                s.handle(&event).unwrap();
+            }
+            s.flush().unwrap();
+            let painted = s.windows[0].frames;
+            let command = Command {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "echo first; read line".into()],
+                ..Command::default()
+            };
+            terminal::spawn(id, &command).unwrap();
+            while !terminal::snapshot(id).unwrap().text.contains("first") {
+                assert!(s.step().unwrap(), "the session ended");
+            }
+            // The clock has not moved since the window painted.
+            assert!(s.windows[0].output_dirty);
+            assert_eq!(s.windows[0].frames, painted);
+            s.advance(OUTPUT_FRAME_MS - 1).unwrap();
+            assert_eq!(s.windows[0].frames, painted);
+            s.advance(1).unwrap();
+            assert_eq!(s.windows[0].frames, painted + 1);
+            assert!(!s.windows[0].output_dirty);
+            terminal::close(id);
             s.shutdown()
         })
     }

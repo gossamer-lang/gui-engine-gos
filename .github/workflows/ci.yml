@@ -12,7 +12,7 @@ permissions:
 env:
   GOSSAMER_REPO: gossamer-lang/gossamer
   # The toolchain release CI installs: the one this library requires.
-  GOSSAMER_VERSION: v0.75.7
+  GOSSAMER_VERSION: v0.75.8
   WINDOWING_REPO: gossamer-lang/windowing-gos
   # The windowing release project.toml depends on. The Rust crates check
   # against a checkout of the same tag beside this one.

@@ -284,10 +284,9 @@ mod session {
                 while !snapshot(id).unwrap().text.contains(&shown) {
                     assert!(s.step().unwrap(), "the session ended");
                 }
-                let before = s.windows[0].frames;
-                while s.windows[0].frames == before {
-                    assert!(s.step().unwrap(), "the session ended");
-                }
+                // Each batch is painted, as output that arrives across frames is.
+                s.windows[0].dirty = true;
+                s.flush().unwrap();
             }
             let rows = snapshot(id).unwrap().rows as usize;
             let held = with_entry(id, |e| e.layouts.len()).unwrap();
@@ -332,10 +331,8 @@ mod session {
             while !snapshot(id).unwrap().text.contains("shown") {
                 assert!(s.step().unwrap(), "the session ended");
             }
-            let painted = s.windows[0].frames;
-            while s.windows[0].frames == painted {
-                assert!(s.step().unwrap(), "the session ended");
-            }
+            s.windows[0].dirty = true;
+            s.flush().unwrap();
             let canvas = s.capture().unwrap();
             let theme = s.windows[0].theme.clone();
             let (cw, lh, _) = widget::metrics(&widget::View::new("term", id, "Cells"), &theme);
@@ -413,10 +410,10 @@ mod session {
             );
             s.open_window("main", "Links", 420, 240).unwrap();
             feed(id, b"  https://example.org/x now").unwrap();
-            // A link is found where the screen shows it, so wait for a paint.
-            step_until(&mut s, || {
-                with_entry(id, |e| !e.links.is_empty()) == Some(true)
-            });
+            // A link is found where the screen shows it, so paint the screen.
+            s.windows[0].dirty = true;
+            s.flush().unwrap();
+            assert_eq!(with_entry(id, |e| e.links.len()), Some(1));
             let shown = snapshot(id).unwrap();
             let r = s.rect_of("term").unwrap();
             // The grid fills the view inside a padding narrower than a cell.

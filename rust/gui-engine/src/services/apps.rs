@@ -1195,14 +1195,44 @@ pub fn launch(entry: &AppEntry, files: &[String]) -> Result<(), errors::Error> {
         argv = wrapped;
     }
     let mut cmd = Command::new(&argv[0]);
-    let mut i = 1;
-    while i < argv.len() {
-        cmd.arg(&argv[i]);
-        i += 1;
+    cmd.args(&argv[1..]);
+    detach(&mut cmd);
+    let mut child = cmd.spawn()?;
+    if cfg!(unix) {
+        // The spawned process is the intermediate, which exits at once.
+        child.wait()?;
     }
-    let _ = cmd.spawn()?;
     Ok(())
 }
+
+// The program outlives the launcher and is never its child: a second fork
+// hands it to init (or the session's subreaper), which reaps it when it
+// exits, and setsid keeps it out of the launcher's session and its signals.
+// std's exec-error pipe reaches the grandchild, so a failed exec still fails
+// `spawn`.
+#[cfg(unix)]
+fn detach(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: the hook runs in the forked child before exec and calls only
+    // async-signal-safe functions (setsid, fork, _exit) and reads errno.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            match libc::fork() {
+                -1 => Err(std::io::Error::last_os_error()),
+                0 => Ok(()),
+                _ => libc::_exit(0),
+            }
+        });
+    }
+}
+
+// A Windows process has no parent that must reap it; dropping the handle
+// releases it.
+#[cfg(not(unix))]
+fn detach(_: &mut Command) {}
 
 // ---- favorites and recent launches ----
 
@@ -1585,5 +1615,42 @@ mod tests {
         assert_eq!(h.favorites, vec!["c"]);
         save_history("dev.gossamer.gui-apps-test", &h).unwrap();
         assert_eq!(load_history("dev.gossamer.gui-apps-test").unwrap(), h)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_launched_program_is_not_a_child_of_the_launcher() {
+        use std::io::BufRead;
+        use std::os::fd::FromRawFd;
+
+        // The program inherits the write end, which has no close-on-exec.
+        let mut ends = [0; 2];
+        // SAFETY: ends has room for the two descriptors pipe writes.
+        assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0);
+        let mut entry = named("sh", "Shell");
+        entry.exec = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "echo $PPID >&$0".to_string(),
+            ends[1].to_string(),
+        ];
+        super::launch(&entry, &[]).unwrap();
+        // SAFETY: both descriptors came from pipe above and are owned here.
+        let read = unsafe {
+            libc::close(ends[1]);
+            fs::File::from_raw_fd(ends[0])
+        };
+        let mut parent = String::new();
+        std::io::BufReader::new(read)
+            .read_line(&mut parent)
+            .unwrap();
+        let parent: u32 = parent.trim().parse().unwrap();
+        assert_ne!(parent, std::process::id());
+    }
+
+    #[test]
+    fn launching_a_missing_program_fails() {
+        let entry = named("gui-launch-test-no-such-program", "Missing");
+        assert!(super::launch(&entry, &[]).is_err());
     }
 }

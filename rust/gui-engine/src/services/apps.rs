@@ -116,13 +116,21 @@ impl AppIcon {
 }
 
 /// Whether `entry` matches every word of `query` in its name, generic name,
-/// comment or keywords (case-insensitive).
+/// comment, keywords, command or id (case-insensitive).
 pub fn matches_query(entry: &AppEntry, query: &str) -> bool {
     let mut fields = vec![
         entry.name.clone(),
         entry.generic_name.clone(),
         entry.comment.clone(),
     ];
+    // People also type the name a program is installed under, which the
+    // display name often omits (`gnome-terminal`, `org.gnome.Terminal` for
+    // "Terminal").
+    for name in entry.exec.first().into_iter().chain([&entry.id]) {
+        if let Some(stem) = std::path::Path::new(name).file_stem() {
+            fields.push(stem.to_string_lossy().into_owned())
+        }
+    }
     for k in &entry.keywords {
         fields.push(k.to_string())
     }
@@ -1495,6 +1503,20 @@ mod tests {
         );
         assert!(matches_query(&e, "plain edit"));
         assert!(!matches_query(&e, "browser"))
+    }
+
+    #[test]
+    fn a_program_is_found_by_its_command_and_desktop_id() {
+        let mut e = named("org.gnome.Terminal.desktop", "Terminal");
+        e.exec = vec![
+            "/usr/bin/gnome-terminal".to_string(),
+            "--window".to_string(),
+        ];
+        assert!(matches_query(&e, "gnome-terminal"));
+        assert!(matches_query(&e, "gnome term"));
+        assert!(matches_query(&e, "org.gnome.terminal"));
+        assert!(!matches_query(&e, "desktop"));
+        assert!(!matches_query(&e, "window"))
     }
 
     #[test]

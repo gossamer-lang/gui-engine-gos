@@ -222,10 +222,11 @@ pub fn call(s: &mut Session, method: &str, a: &str) -> Result<String, String> {
         "set_active" => res(s.set_active(args::<(bool,)>(a)?.0)),
         "rect_of" => out(s.rect_of(&args::<(String,)>(a)?.0)),
         "click" => res(s.click(&args::<(String,)>(a)?.0)),
-        "click_at" | "hover" | "press_pointer" | "release_pointer" => {
+        "click_at" | "right_click_at" | "hover" | "press_pointer" | "release_pointer" => {
             let (x, y): (i64, i64) = args(a)?;
             res(match method {
                 "click_at" => s.click_at(x, y),
+                "right_click_at" => s.right_click_at(x, y),
                 "hover" => s.hover(x, y),
                 "press_pointer" => s.press_pointer(x, y),
                 _ => s.release_pointer(x, y),

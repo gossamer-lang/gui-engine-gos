@@ -107,6 +107,24 @@ impl<K: Ord + Clone, V> ByteCache<K, V> {
             self.evictions += 1;
         }
     }
+    /// A point in the cache's use order; entries got or inserted after it
+    /// are newer than it.
+    pub fn mark(&self) -> u64 {
+        self.clock
+    }
+    /// Evicts every entry not got or inserted since `mark`.
+    pub fn evict_unused_since(&mut self, mark: u64) {
+        while let Some(entry) = self.ages.first_entry() {
+            if *entry.key() > mark {
+                break;
+            }
+            let oldest = entry.remove();
+            if let Some(entry) = self.entries.remove(oldest.as_ref()) {
+                self.bytes -= entry.bytes;
+            }
+            self.evictions += 1;
+        }
+    }
     pub fn clear(&mut self) {
         self.entries = BTreeMap::new();
         self.ages = BTreeMap::new();

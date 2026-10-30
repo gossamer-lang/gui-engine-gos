@@ -7,7 +7,7 @@ use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
 use crate::errors;
 
@@ -81,8 +81,24 @@ static FALLBACK: crate::memory::SharedCache<(i64, Vec<char>), i64> =
 // Whether installed fonts may supply named families and missing glyphs.
 static SYSTEM_FONTS: AtomicBool = AtomicBool::new(true);
 
-pub(crate) fn purge_fallback_cache() {
+// Counts changes to the faces text may be drawn with, so layouts kept
+// outside the shared caches know to lay out again.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// The font registry's generation: it changes whenever a face or the
+/// installed catalog arrives or leaves, which can change any fallback.
+pub fn generation() -> u64 {
+    GENERATION.load(Ordering::Acquire)
+}
+
+// Every fallback answer may differ once the faces change.
+fn faces_changed() {
     FALLBACK.lock().clear();
+    GENERATION.fetch_add(1, Ordering::AcqRel);
+}
+
+pub(crate) fn purge_fallback_cache() {
+    faces_changed();
 }
 
 fn ensure_bundled() {
@@ -161,7 +177,7 @@ pub fn unregister(ids: &[FaceId]) {
         }
     }
     drop(faces);
-    FALLBACK.lock().clear();
+    faces_changed();
     LOADED_SYSTEM.lock().clear();
 }
 
@@ -183,7 +199,7 @@ pub(crate) fn end_session() {
     CATALOG_REQUESTED.store(false, Ordering::Release);
     *FACE_REQUESTS.lock() = BTreeMap::new();
     LOADED_SYSTEM.lock().clear();
-    FALLBACK.lock().clear();
+    faces_changed();
 }
 
 pub(crate) fn take_catalog_request() -> bool {
@@ -438,7 +454,7 @@ fn register_bytes(data: FontBytes) -> Result<Vec<FaceId>, errors::Error> {
     drop(automatic);
     drop(colors);
     drop(faces);
-    FALLBACK.lock().clear();
+    faces_changed();
     Ok(ids)
 }
 
@@ -552,6 +568,8 @@ pub fn adopt_installed(records: &[FontRecord]) {
     CATALOG_PENDING.store(false, Ordering::Release);
     CATALOG_REQUESTED.store(false, Ordering::Release);
     *INSTALLED.lock() = records.to_vec();
+    // Characters no loaded face covered may now have an installed one.
+    faces_changed();
 }
 
 /// Family names of the faces loaded so far and of the installed catalog when

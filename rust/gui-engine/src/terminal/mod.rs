@@ -9,6 +9,7 @@ pub mod api;
 pub mod engine;
 pub mod frame;
 pub mod keyboard;
+pub mod links;
 mod transport;
 pub mod widget;
 
@@ -104,6 +105,11 @@ pub enum Event {
     /// The screen could not take the size of its view within its byte limit,
     /// and keeps the size it has.
     Refused(String),
+    /// The link under the pointer when a button last pressed on the screen,
+    /// or empty when the press was off any link.
+    LinkPointed(String),
+    /// The user asked to open a link: Ctrl+click, or Command+click on macOS.
+    LinkActivated(String),
 }
 
 /// The state of a terminal an application reads.
@@ -162,6 +168,15 @@ struct Entry {
     /// Layouts of the screen's text runs, sized to the screen by the widget
     /// that paints it.
     layouts: ByteCache<String, TextLayout>,
+    /// The font registry generation `layouts` were made in.
+    layouts_generation: u64,
+    /// The links the screen showed when the widget last painted it.
+    links: Vec<links::Link>,
+    /// The link under the pointer, which the screen underlines.
+    hovered: Option<Arc<str>>,
+    /// The link under the pointer when it last pressed a button, which the
+    /// application hears of for its context menu.
+    pointed: Option<Arc<str>>,
 }
 
 /// A non-UTF-8 character set the program reads and writes: its output is
@@ -283,6 +298,10 @@ pub fn create(options: &Options, budget: Budget) -> Result<i64, String> {
             refusal: None,
             charset: None,
             layouts: ByteCache::new(0),
+            layouts_generation: 0,
+            links: Vec::new(),
+            hovered: None,
+            pointed: None,
         },
     );
     Ok(id)

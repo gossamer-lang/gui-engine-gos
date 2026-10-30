@@ -257,20 +257,26 @@ fn item_shortcut(it: &MenuItem, registry: &[Command]) -> String {
     }
 }
 
+// The entries a menu shows: hidden commands are left out, and so is any
+// separator that would then open or close the menu or follow another.
 fn visible(items: &[MenuItem], registry: &[Command]) -> Vec<MenuItem> {
-    items
-        .iter()
-        .filter(|it| match it {
+    let mut out: Vec<MenuItem> = Vec::with_capacity(items.len());
+    for it in items {
+        let shown = match it {
             MenuItem::Action { command: cmd, .. } | MenuItem::Radio { command: cmd, .. } => {
-                match command(registry, &(*cmd).to_string()) {
-                    Some(c) => c.visible,
-                    None => true,
-                }
+                command(registry, &(*cmd).to_string()).is_none_or(|c| c.visible)
             }
+            MenuItem::Separator => out.last().is_some_and(|last| *last != MenuItem::Separator),
             _ => true,
-        })
-        .cloned()
-        .collect::<Vec<_>>()
+        };
+        if shown {
+            out.push(it.clone());
+        }
+    }
+    if out.last() == Some(&MenuItem::Separator) {
+        out.pop();
+    }
+    out
 }
 
 // ---- geometry ----
@@ -639,6 +645,20 @@ fn level_items(
 }
 
 /// Paints the panel of `level` of a menu whose top items are `root`.
+/// The size the open menu `owner` needs at `level` for the entries the
+/// registry shows now.
+pub fn panel_extent(
+    root: &[MenuItem],
+    owner: &str,
+    level: i64,
+    theme: &Theme,
+    states: &StateStore,
+    registry: &[Command],
+) -> Size {
+    let s = states.menu(owner);
+    panel_size(&level_items(root, &s, level, registry), theme, registry)
+}
+
 pub fn paint_panel(root: &[MenuItem], owner: &str, level: i64, rect: Rect, cx: &mut PaintCx) {
     let theme = cx.theme.clone();
     let s = cx.states.menu(owner);
@@ -1370,9 +1390,19 @@ fn native_entries(
             }
             MenuItem::Separator | MenuItem::Header(_) => {
                 in_radio_run = false;
-                out.push(windowing::MenuEntry::Separator)
+                // Entries left out may leave a separator at an end or after
+                // another, which the menu does not show.
+                if out
+                    .last()
+                    .is_some_and(|last| !matches!(last, windowing::MenuEntry::Separator))
+                {
+                    out.push(windowing::MenuEntry::Separator)
+                }
             }
         }
+    }
+    if matches!(out.last(), Some(windowing::MenuEntry::Separator)) {
+        out.pop();
     }
     out
 }
@@ -1388,6 +1418,33 @@ mod tests {
     use crate::style::Theme;
     use crate::widgets::cx::LayoutCx;
     use crate::widgets::state::StateStore;
+
+    #[test]
+    fn hidden_entries_take_their_separators_with_them() {
+        let reg = vec![
+            Command::new("a", "A").visible(false),
+            Command::new("b", "B"),
+            Command::new("c", "C").visible(false),
+        ];
+        let items = [
+            item("a"),
+            separator(),
+            item("b"),
+            separator(),
+            item("c"),
+            separator(),
+        ];
+        assert_eq!(super::visible(&items, &reg), vec![item("b")]);
+        let mut commands = vec![];
+        let native = super::native_entries(&items, &reg, &mut commands, &mut 0);
+        assert_eq!(native.len(), 1, "{native:?}");
+        let shown = vec![
+            Command::new("a", "A"),
+            Command::new("b", "B"),
+            Command::new("c", "C"),
+        ];
+        assert_eq!(super::visible(&items, &shown).len(), 5);
+    }
 
     #[test]
     fn a_menu_bar_maps_onto_native_menus_with_command_state() {

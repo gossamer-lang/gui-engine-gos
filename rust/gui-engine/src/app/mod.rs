@@ -1680,7 +1680,10 @@ impl Session {
                 let w = self.find_native(*window);
                 if w >= 0 {
                     self.windows[w as usize].active = false;
-                    self.windows[w as usize].occluded = true
+                    self.windows[w as usize].occluded = true;
+                    if matches!(e, windowing::Event::Minimized { .. }) {
+                        self.release_pixels(w)
+                    }
                 }
             }
             windowing::Event::DialogClosed { dialog, choice } => {
@@ -2896,6 +2899,56 @@ impl Session {
         }
     }
 
+    // A minimized window shows nothing until it is restored, which repaints
+    // it whole, so its surface, raster caches and GPU target are let go.
+    fn release_pixels(&mut self, w: i64) {
+        let key = self.windows[w as usize].key.clone();
+        if let Some(renderer) = self.renderers.get_mut(&key) {
+            renderer.purge();
+            renderer.invalidate();
+        }
+        self.frame_leases.remove(&key);
+        if let Err(e) = self.windows[w as usize].native.release_surface() {
+            self.log_line(&format!("window surface kept: {}", e))
+        }
+        self.windows[w as usize].dirty = true;
+    }
+
+    // A menu's entries follow the command registry, which the application
+    // may change while the menu is open, so each open menu takes the size its
+    // entries need now.
+    fn measure_menus(&mut self, w: i64) {
+        let area = Rect::new(
+            0,
+            0,
+            self.windows[w as usize].node.rect.width,
+            self.windows[w as usize].node.rect.height,
+        );
+        let rtl = self.windows[w as usize].theme.rtl;
+        for i in 0..self.windows[w as usize].popups.len() {
+            let request = self.windows[w as usize].popups[i].request.clone();
+            let path = self.path_in_layers(w, &request.owner);
+            let win = &self.windows[w as usize];
+            let Some(size) = path.last().and_then(|owner| {
+                owner.widget.menu_extent(
+                    &request,
+                    &owner.theme,
+                    &win.states,
+                    &win.commands.commands,
+                )
+            }) else {
+                continue;
+            };
+            if size != request.size {
+                let rect = popup::place(request.anchor, size, area, request.placement, rtl);
+                let open = &mut self.windows[w as usize].popups[i];
+                open.request.size = size;
+                open.rect = rect;
+                self.windows[w as usize].dirty = true;
+            }
+        }
+    }
+
     fn close_all_popups(&mut self, w: i64) {
         self.windows[w as usize].popup_focus = None;
         self.windows[w as usize].popups = vec![];
@@ -3097,7 +3150,12 @@ impl Session {
                 }
                 continue;
             }
-            if let UiMsg::FontReady(_) = &m {
+            // A face that arrived, or the installed catalog, can cover text
+            // drawn so far with another face or none.
+            if matches!(m, UiMsg::FontReady(_) | UiMsg::FontsLoaded(..)) {
+                if let UiMsg::FontsLoaded(_, records) = &m {
+                    crate::text::fonts::adopt_installed(records);
+                }
                 crate::text::layout::purge_caches();
                 for window in &mut self.windows {
                     window.layout_dirty = true;
@@ -3109,9 +3167,7 @@ impl Session {
             {
                 crate::text::fonts::catalog_failed();
             }
-            if let UiMsg::FontsLoaded(_, records) = &m {
-                crate::text::fonts::adopt_installed(records);
-            }
+
             if let UiMsg::Worked(owner, request, revision, outcome) = &m {
                 if let crate::services::work::Outcome::RichImported(record) = outcome {
                     record.adopt();
@@ -4716,6 +4772,7 @@ impl Session {
         {
             self.layout(w)
         }
+        self.measure_menus(w);
         self.check_memory()?;
         let key = self.windows[w as usize].key.clone();
         let caches = self
@@ -5013,6 +5070,14 @@ impl Session {
         self.settle()?;
         self.pointer_down(self.driven(), x, y, MouseButton::Left, 1, Mods::default());
         self.pointer_up(self.driven(), x, y, MouseButton::Left, Mods::default());
+        self.settle()
+    }
+
+    /// Right-clicks window pixel (`x`, `y`) of the main window.
+    pub fn right_click_at(&mut self, x: i64, y: i64) -> Result<(), errors::Error> {
+        self.settle()?;
+        self.pointer_down(self.driven(), x, y, MouseButton::Right, 1, Mods::default());
+        self.pointer_up(self.driven(), x, y, MouseButton::Right, Mods::default());
         self.settle()
     }
 
@@ -5495,6 +5560,108 @@ mod popup_tests {
             8,
         )
         .padding(8)
+    }
+
+    #[test]
+    fn text_is_laid_out_again_when_the_installed_fonts_arrive() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::application(
+                "Fonts",
+                "dev.gossamer.gui-fonts-arrive-test",
+                || 0,
+                |m: i64, _msg: UiMsg| m,
+                view,
+            )
+            .size(420, 320)
+            .start()
+            .unwrap();
+            s.flush().unwrap();
+            assert!(!s.windows[0].layout_dirty);
+            s.pending
+                .push(UiMsg::FontsLoaded("gui:font-catalog".into(), vec![]));
+            s.deliver_messages();
+            assert!(s.windows[0].layout_dirty && s.windows[0].dirty);
+            s.shutdown();
+        })
+    }
+
+    #[test]
+    fn a_minimized_window_lets_its_pixels_go_and_paints_again_when_restored() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::application(
+                "Minimized",
+                "dev.gossamer.gui-minimized-test",
+                || 0,
+                |m: i64, _msg: UiMsg| m,
+                view,
+            )
+            .size(420, 320)
+            .start()
+            .unwrap();
+            s.flush().unwrap();
+            let shown = s.budget.usage().0;
+            assert!(s.frame_leases.contains_key("main"));
+            let id = s.windows[0].native.id();
+            s.inject(&windowing::Event::Minimized { window: id })
+                .unwrap();
+            s.flush().unwrap();
+            assert!(!s.frame_leases.contains_key("main"));
+            assert!(s.budget.usage().0 < shown, "minimizing kept {shown} bytes");
+            let painted = s.windows[0].frames;
+            s.inject(&windowing::Event::Restored { window: id })
+                .unwrap();
+            s.flush().unwrap();
+            assert!(s.frame_leases.contains_key("main"));
+            assert!(
+                s.windows[0].frames > painted,
+                "the restored window did not paint"
+            );
+            s.shutdown();
+        })
+    }
+
+    #[test]
+    fn an_open_menu_takes_the_size_its_entries_need_when_the_commands_change() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::app::start("Measured", "dev.gossamer.gui-menu-measure").unwrap();
+            let shown = std::rc::Rc::new(std::cell::Cell::new(false));
+            let copy_shown = shown.clone();
+            s.set_shell(
+                |_| {},
+                |_| view(&0),
+                move |_| {
+                    vec![
+                        crate::commands::Command::new("edit.copy", "Copy")
+                            .visible(copy_shown.get()),
+                        crate::commands::Command::new("edit.paste", "Paste"),
+                    ]
+                },
+            );
+            s.open_window("main", "Measured", 420, 320).unwrap();
+            let r = s.rect_of("target").unwrap();
+            s.right_click_at(r.x + 4, r.y + 4).unwrap();
+            let one = s.windows[0].popups[0].rect.height;
+            assert!(!s.semantics(0).dump().contains("menuitem \"Copy\""));
+            shown.set(true);
+            s.rebuild(0);
+            s.flush().unwrap();
+            let three = s.windows[0].popups[0].rect.height;
+            assert!(three > one, "the menu kept {one} px for three entries");
+            assert!(s.semantics(0).dump().contains("menuitem \"Copy\""));
+            s.shutdown();
+        })
     }
 
     #[test]

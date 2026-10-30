@@ -5,16 +5,19 @@
 use serde::{Deserialize, Serialize};
 use windowing::{Key, MouseButton};
 
+use std::sync::Arc;
+
 use super::frame::{Color as CellColor, Frame};
 use super::keyboard;
-use super::{Cell, with_entry};
+use super::links::Link;
+use super::{Cell, Event as TerminalEvent, with_entry};
 use crate::accessibility::{AccessNode, Role};
 use crate::geometry::{Constraints, Rect, Size};
 use crate::memory::ByteCache;
 use crate::style::color::Color;
 use crate::style::{TextRole, Theme};
 use crate::text::layout::{self, LayoutOptions, TextStyle};
-use crate::widgets::cx::{Event, EventCx, LayoutCx, Node, PaintCx};
+use crate::widgets::cx::{Event, EventCx, LayoutCx, Node, PaintCx, UiMsg};
 use crate::widgets::state::StateStore;
 
 /// A view of terminal `terminal`, which keeps its screen while the view
@@ -54,11 +57,12 @@ impl View {
     }
 }
 
-const PAD: i64 = 4;
+pub(super) const PAD: i64 = 4;
 const WHEEL_ROWS: i64 = 3;
 /// Layout bytes kept per screen cell: room for two screens of runs at about
-/// 160 bytes a cell (a glyph's layout plus each run's own), so rows that
-/// scroll or stay put are laid out once.
+/// 160 bytes a cell (a glyph's layout plus each run's own), the screen the
+/// last paint drew and the one a paint draws, so rows that scroll or stay
+/// put are laid out once.
 pub(super) const LAYOUT_BYTES_PER_CELL: usize = 2 * 160;
 
 /// The family a terminal draws in when its view names none: IBM Plex Mono,
@@ -86,7 +90,7 @@ fn ensure_default_font() {
 
 /// The grid's cell width and line height in pixels, and the text style, for
 /// a view in a theme.
-fn metrics(v: &View, theme: &Theme) -> (f64, f64, TextStyle) {
+pub(super) fn metrics(v: &View, theme: &Theme) -> (f64, f64, TextStyle) {
     let mut style = theme.font(TextRole::Mono);
     let points = if v.font_size > 0.0 {
         v.font_size
@@ -129,6 +133,74 @@ fn cell_at(v: &View, theme: &Theme, x: i64, y: i64, rows: i64, cols: i64) -> Cel
         row: row.clamp(0, rows - 1),
         col: col.clamp(0, cols),
     }
+}
+
+/// The cell a local point falls in, or None off the screen's cells.
+fn cell_under(v: &View, theme: &Theme, x: i64, y: i64) -> Option<(u16, u16)> {
+    let (cw, lh, _) = metrics(v, theme);
+    let pad = theme.px(PAD) as f64;
+    let col = ((x as f64 - pad) / cw).floor();
+    let row = ((y as f64 - pad) / lh).floor();
+    (col >= 0.0 && row >= 0.0 && col < f64::from(u16::MAX) && row < f64::from(u16::MAX))
+        .then_some((row as u16, col as u16))
+}
+
+/// The link at a local point, as the screen last painted it.
+fn link_under(v: &View, theme: &Theme, x: i64, y: i64) -> Option<Arc<str>> {
+    let (row, col) = cell_under(v, theme, x, y)?;
+    with_entry(v.terminal, |e| {
+        e.links
+            .iter()
+            .find(|l| l.contains(row, col))
+            .map(|l| l.uri.clone())
+    })
+    .flatten()
+}
+
+/// Whether a press with `mods` opens the link under it: Command on macOS,
+/// where Ctrl+click is a right click, and Ctrl elsewhere.
+fn opens_link(mods: windowing::Mods) -> bool {
+    if cfg!(target_os = "macos") {
+        mods.gui
+    } else {
+        mods.ctrl
+    }
+}
+
+/// Underlines the link under the pointer, and tells whether that changed.
+fn hover(v: &View, link: Option<Arc<str>>, cx: &mut EventCx) {
+    if link.is_some() {
+        cx.cursor = Some(windowing::SystemCursor::Pointer);
+    }
+    let changed = with_entry(v.terminal, |e| {
+        let changed = e.hovered != link;
+        e.hovered = link;
+        changed
+    });
+    if changed == Some(true) {
+        cx.redraw = true;
+    }
+}
+
+/// Records the link under a press, and tells the application when it is
+/// another than the last press found.
+fn point(v: &View, link: Option<Arc<str>>, cx: &mut EventCx) {
+    let changed = with_entry(v.terminal, |e| {
+        let changed = e.pointed != link;
+        e.pointed = link.clone();
+        changed
+    });
+    if changed == Some(true) {
+        let uri = link.as_deref().unwrap_or_default().to_string();
+        cx.emit(&UiMsg::Terminal(
+            v.terminal,
+            TerminalEvent::LinkPointed(uri),
+        ));
+    }
+}
+
+fn hovered_at(hovered: &[&Link], row: u16, col: usize) -> bool {
+    hovered.iter().any(|l| l.contains(row, col as u16))
 }
 
 pub fn layout_terminal(v: &View, c: Constraints, cx: &mut LayoutCx) -> Node {
@@ -260,11 +332,25 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
     let captured = with_entry(v.terminal, |entry| {
         // The screen follows the view's size; the program hears of it.
         super::follow_view(entry, rows as u16, cols as u16);
-        entry.engine.frame().map(|frame| (frame, entry.selection))
+        let frame = entry.engine.frame()?;
+        entry.links = frame.links().to_vec();
+        if entry
+            .hovered
+            .as_ref()
+            .is_some_and(|uri| !entry.links.iter().any(|l| &l.uri == uri))
+        {
+            entry.hovered = None;
+        }
+        Ok::<_, String>((frame, entry.selection, entry.hovered.clone()))
     });
-    let Some(Ok((frame, selection))) = captured else {
+    let Some(Ok((frame, selection, hovered))) = captured else {
         return;
     };
+    let hovered: Vec<&Link> = frame
+        .links()
+        .iter()
+        .filter(|l| hovered.as_ref() == Some(&l.uri))
+        .collect();
     let (cw, lh, style) = metrics(v, &theme);
     let pad = theme.px(PAD);
     let origin = cx.abs(r);
@@ -272,19 +358,33 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
     // Run layouts are kept per terminal, sized to its screen: output brings
     // rows that never come back, which the shared layout cache would hold to
     // its whole budget.
+    let generation = crate::text::fonts::generation();
     let mut layouts = with_entry(v.terminal, |entry| {
+        // Faces that arrived since may draw these runs differently.
+        if entry.layouts_generation != generation {
+            entry.layouts.clear();
+            entry.layouts_generation = generation;
+        }
         std::mem::replace(&mut entry.layouts, ByteCache::new(0))
     })
     .unwrap_or_else(|| ByteCache::new(0));
     layouts
         .set_limit(usize::from(frame.rows()) * usize::from(frame.cols()) * LAYOUT_BYTES_PER_CELL);
+    let painted_from = layouts.mark();
     for (row, cells) in frame.cells().iter().enumerate() {
+        let screen_row = row as u16;
         let row = row as i64;
         let y = pad + (row as f64 * lh) as i64;
         let mut col = 0;
         while col < cells.len() {
             let cell = &cells[col];
+            // The second column of a wide cell is drawn with the cell.
+            if cell.continuation {
+                col += 1;
+                continue;
+            }
             let selected = in_selection(selection, row, col as i64);
+            let lit = hovered_at(&hovered, screen_row, col);
             let (mut fg, mut bg) = (
                 resolve(&cell.fg, foreground, dark),
                 resolve(&cell.bg, background, dark),
@@ -302,7 +402,8 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
             }
             // ASCII cells of one style draw as one run; any other cell draws
             // alone at its column, so fallback fonts cannot shift the grid.
-            let ascii = |c: &super::frame::Cell| c.text.len() <= 1 && c.text.is_ascii();
+            let ascii =
+                |c: &super::frame::Cell| !c.continuation && c.text.len() <= 1 && c.text.is_ascii();
             let mut end = col + 1;
             if ascii(cell) {
                 while end < cells.len()
@@ -315,6 +416,7 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
                     && cells[end].underline == cell.underline
                     && cells[end].dim == cell.dim
                     && in_selection(selection, row, end as i64) == selected
+                    && hovered_at(&hovered, screen_row, end) == lit
                 {
                     end += 1;
                 }
@@ -336,28 +438,41 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
                     }
                 })
                 .collect();
+            // Blank cells draw no ink, and backgrounds and underlines fill
+            // their cells, so a run is laid out only up to its last glyph.
+            let text = text.trim_end_matches(' ');
             if !text.trim().is_empty() {
                 let mut run = style.clone();
                 run.bold = cell.bold;
                 run.italic = cell.italic;
-                let key = format!("{}#{}", run.key(), text);
-                if layouts.get(&key).is_none() {
-                    let laid = layout::layout_uncached(&text, &run, LayoutOptions::single_line());
-                    let bytes = key.capacity() + laid.owned_bytes();
-                    layouts.insert(key.clone(), laid, bytes);
+                let mut key = format!("{}#{}", run.key(), text);
+                lay_out(&mut layouts, &key, text, &run);
+                let mut at = ((origin.x + x) as f64, (origin.y + y) as f64);
+                // A glyph wider than its cells, such as an emoji a program
+                // counts as one cell, is drawn smaller and centered on its
+                // row, so it stays inside them.
+                if !ascii(cell)
+                    && let Some(drawn) = layouts.get(&key).map(|l| l.width)
+                    && drawn > width as f64
+                {
+                    run.size *= width as f64 / drawn;
+                    key = format!("{}#{}", run.key(), text);
+                    lay_out(&mut layouts, &key, text, &run);
+                    if let Some(height) = layouts.get(&key).map(|l| l.height) {
+                        at.1 += ((lh - height) / 2.0).max(0.0);
+                    }
                 }
-                let at = ((origin.x + x) as f64, (origin.y + y) as f64);
                 match layouts.get(&key) {
                     Some(laid) => layout::draw(&mut cx.canvas, laid, at.0, at.1, &run, fg),
                     // A run too large for the cache is laid out for this paint.
                     None => {
                         let laid =
-                            layout::layout_uncached(&text, &run, LayoutOptions::single_line());
+                            layout::layout_uncached(text, &run, LayoutOptions::single_line());
                         layout::draw(&mut cx.canvas, &laid, at.0, at.1, &run, fg);
                     }
                 }
             }
-            if cell.underline {
+            if cell.underline || lit {
                 cx.fill(
                     Rect::new(x, y + lh as i64 - theme.px(2), width, theme.px(1).max(1)),
                     fg,
@@ -366,10 +481,27 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
             col = end.max(col + 1);
         }
     }
+    // A row the screen no longer shows only comes back by scrolling back,
+    // which lays it out again, so the cache keeps the runs this paint drew.
+    layouts.evict_unused_since(painted_from);
     with_entry(v.terminal, |entry| entry.layouts = layouts);
     // The cursor shows focus, filled while the terminal has it and hollow
     // otherwise, so the terminal draws no focus ring around its screen.
     paint_cursor(&frame, focused, cx, (cw, lh, pad));
+}
+
+// Lays out `text` in `run` under `key` unless the cache holds it.
+fn lay_out(
+    layouts: &mut ByteCache<String, layout::TextLayout>,
+    key: &str,
+    text: &str,
+    run: &TextStyle,
+) {
+    if layouts.get(&key.to_string()).is_none() {
+        let laid = layout::layout_uncached(text, run, LayoutOptions::single_line());
+        let bytes = key.len() + laid.owned_bytes();
+        layouts.insert(key.to_string(), laid, bytes);
+    }
 }
 
 fn paint_cursor(frame: &Frame, focused: bool, cx: &mut PaintCx, (cw, lh, pad): (f64, f64, i64)) {
@@ -512,9 +644,24 @@ pub fn terminal_event(v: &View, node: &Node, ev: &Event, _st: &mut StateStore, c
             y,
             button,
             clicks,
-            ..
+            mods,
         } => {
             cx.focus_on(&v.id);
+            let link = link_under(v, &cx.theme, *x, *y);
+            point(v, link.clone(), cx);
+            if let (MouseButton::Left, Some(uri)) = (button, &link)
+                && opens_link(*mods)
+            {
+                cx.emit(&UiMsg::Terminal(
+                    v.terminal,
+                    TerminalEvent::LinkActivated(uri.to_string()),
+                ));
+                return cx.consume();
+            }
+            // A right press goes on to the context menu around the terminal.
+            if *button == MouseButton::Right {
+                return;
+            }
             let at = cell_at(v, &cx.theme, *x, *y, rows, cols);
             match button {
                 MouseButton::Left if *clicks >= 3 => {
@@ -554,6 +701,13 @@ pub fn terminal_event(v: &View, node: &Node, ev: &Event, _st: &mut StateStore, c
                 redraw(cx);
             }
         }
+        Event::PointerMove {
+            x,
+            y,
+            pressed: false,
+            ..
+        } => hover(v, link_under(v, &cx.theme, *x, *y), cx),
+        Event::PointerLeave => hover(v, None, cx),
         Event::PointerUp { .. } => {
             cx.release_pointer();
             let collapsed = with_entry(v.terminal, |e| e.selection.is_some_and(|(a, b)| a == b));
@@ -599,6 +753,12 @@ pub fn terminal_event(v: &View, node: &Node, ev: &Event, _st: &mut StateStore, c
                     )),
                 )
                 .is_ok(),
+                // A menu opened from the keyboard is about no link; the
+                // command goes on to the context menu around the terminal.
+                "gui.context-menu" => {
+                    point(v, None, cx);
+                    false
+                }
                 _ => false,
             };
             if used {

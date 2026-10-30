@@ -98,6 +98,32 @@ fn a_screen_that_cannot_take_its_view_reports_why_once() {
     close_budget(&budget);
 }
 
+#[test]
+fn links_are_found_across_wrapped_rows_and_marked_links_keep_their_target() {
+    let id = create(&options(6, 20, 10), Budget::new(64 * 1024 * 1024)).unwrap();
+    feed(
+        id,
+        b"see https://example.org/a/long/path, then\r\n\x1b]8;;https://marked.example/\x1b\\here\x1b]8;;\x1b\\ and https://x.example/q",
+    )
+    .unwrap();
+    let links = with_entry(id, |e| e.engine.frame().unwrap().links().to_vec()).unwrap();
+    let runs: Vec<(u16, u16, u16, &str)> = links
+        .iter()
+        .map(|l| (l.row, l.start, l.end, &*l.uri))
+        .collect();
+    assert_eq!(
+        runs,
+        [
+            (3, 0, 4, "https://marked.example/"),
+            (0, 4, 20, "https://example.org/a/long/path"),
+            (1, 0, 15, "https://example.org/a/long/path"),
+            (3, 9, 20, "https://x.example/q"),
+            (4, 0, 8, "https://x.example/q"),
+        ]
+    );
+    close(id);
+}
+
 #[cfg(unix)]
 mod session {
     use super::*;
@@ -218,6 +244,216 @@ mod session {
             step_until(&mut s, || *exited.borrow());
             let shown = snapshot(id).unwrap().text;
             assert!(shown.contains("got:e9"), "{shown}");
+            s.shutdown();
+        })
+    }
+
+    #[test]
+    fn the_layout_cache_keeps_the_screen_it_shows_and_not_the_output_that_scrolled_past() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::app::start("Flood", "dev.gossamer.gui-terminal-flood").unwrap();
+            let id = create(&options(8, 40, 100), crate::app::effects::current_budget()).unwrap();
+            s.set_shell(
+                |_| {},
+                move |_| Widget::Terminal(widget::View::new("term", id, "Flood")),
+                |_| vec![],
+            );
+            s.open_window("main", "Flood", 900, 600).unwrap();
+            // Each line of input prints the next batch of output.
+            spawn(
+                id,
+                &Command {
+                    program: "/bin/sh".into(),
+                    args: vec![
+                        "-c".into(),
+                        "i=0; while read x; do j=0; while [ $j -lt 30 ]; do echo output line $i; \
+                         i=$((i+1)); j=$((j+1)); done; echo batch $i; done"
+                            .into(),
+                    ],
+                    ..Command::default()
+                },
+            )
+            .unwrap();
+            for batch in 1..=40 {
+                input(id, b"\r").unwrap();
+                let shown = format!("batch {}", batch * 30);
+                while !snapshot(id).unwrap().text.contains(&shown) {
+                    assert!(s.step().unwrap(), "the session ended");
+                }
+                let before = s.windows[0].frames;
+                while s.windows[0].frames == before {
+                    assert!(s.step().unwrap(), "the session ended");
+                }
+            }
+            let rows = snapshot(id).unwrap().rows as usize;
+            let held = with_entry(id, |e| e.layouts.len()).unwrap();
+            assert!(
+                held <= rows,
+                "{held} run layouts kept for a {rows}-row screen"
+            );
+            close(id);
+            s.shutdown();
+        })
+    }
+
+    #[test]
+    fn text_after_a_wide_cell_keeps_its_column_and_an_overwide_glyph_stays_in_its_cell() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::app::start("Cells", "dev.gossamer.gui-terminal-cells").unwrap();
+            let id = create(&options(8, 40, 100), crate::app::effects::current_budget()).unwrap();
+            s.set_shell(
+                |_| {},
+                move |_| Widget::Terminal(widget::View::new("term", id, "Cells")),
+                |_| vec![],
+            );
+            s.open_window("main", "Cells", 420, 240).unwrap();
+            // A wide CJK cell, then an arrow one cell wide whose glyph is
+            // wider; each row is followed by one showing the bracket alone.
+            spawn(
+                id,
+                &Command {
+                    program: "/bin/sh".into(),
+                    args: vec![
+                        "-c".into(),
+                        "printf '\\347\\225\\214]\\n  ]\\n\\342\\237\\267]\\n ]\\nshown\\n'; read x".into(),
+                    ],
+                    ..Command::default()
+                },
+            )
+            .unwrap();
+            while !snapshot(id).unwrap().text.contains("shown") {
+                assert!(s.step().unwrap(), "the session ended");
+            }
+            let painted = s.windows[0].frames;
+            while s.windows[0].frames == painted {
+                assert!(s.step().unwrap(), "the session ended");
+            }
+            let canvas = s.capture().unwrap();
+            let theme = s.windows[0].theme.clone();
+            let (cw, lh, _) = widget::metrics(&widget::View::new("term", id, "Cells"), &theme);
+            let r = s.rect_of("term").unwrap();
+            let pad = theme.px(widget::PAD);
+            let background = theme.field;
+            // The mean x and the count of ink pixels in row `row` between
+            // columns `from` and `to`.
+            let ink = |row: i64, from: f64, to: f64| -> Option<(f64, f64)> {
+                let top = r.y + pad + (row as f64 * lh) as i64;
+                let (mut sum, mut n) = (0.0, 0.0);
+                for y in top..top + lh as i64 {
+                    let left = r.x + pad + (from * cw) as i64;
+                    for x in left..r.x + pad + (to * cw) as i64 {
+                        let at = ((y * canvas.width + x) * 4) as usize;
+                        let p = &canvas.pixels[at..at + 3];
+                        let far = (i64::from(p[0]) - i64::from(background.r)).abs()
+                            + (i64::from(p[1]) - i64::from(background.g)).abs()
+                            + (i64::from(p[2]) - i64::from(background.b)).abs();
+                        if far > 96 {
+                            sum += x as f64;
+                            n += 1.0;
+                        }
+                    }
+                }
+                (n > 0.0).then(|| (sum / n, n))
+            };
+            let bracket = ink(1, 2.0, 3.0).expect("the lone bracket shows").0;
+            let after_wide = ink(0, 2.0, 3.0)
+                .expect("the bracket after the wide cell shows")
+                .0;
+            assert!(
+                (bracket - after_wide).abs() <= 1.0,
+                "{after_wide} against {bracket}"
+            );
+            assert!(ink(2, 0.0, 1.0).is_some(), "the arrow shows");
+            // Past the arrow's own cell only the bracket has ink.
+            let alone = ink(3, 1.0, 2.0).expect("the lone bracket shows").1;
+            let beside = ink(2, 1.0, 2.0)
+                .expect("the bracket beside the arrow shows")
+                .1;
+            assert!(
+                beside <= alone + 2.0,
+                "the arrow spills: {beside} ink pixels against {alone}"
+            );
+            close(id);
+            s.shutdown();
+        })
+    }
+
+    #[test]
+    fn a_link_opens_on_its_click_chord_and_a_right_click_reaches_the_context_menu() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::app::start("Links", "dev.gossamer.gui-terminal-links").unwrap();
+            let id = create(&options(8, 40, 100), crate::app::effects::current_budget()).unwrap();
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let heard = events.clone();
+            s.set_shell(
+                move |m| {
+                    if let UiMsg::Terminal(_, event) = m {
+                        heard.borrow_mut().push(event);
+                    }
+                },
+                move |_| {
+                    Widget::Terminal(widget::View::new("term", id, "Links")).context_menu(
+                        "ctx",
+                        &[crate::widgets::menus::labeled("edit.copy", "Copy")],
+                    )
+                },
+                |_| vec![crate::commands::Command::new("edit.copy", "Copy")],
+            );
+            s.open_window("main", "Links", 420, 240).unwrap();
+            feed(id, b"  https://example.org/x now").unwrap();
+            // A link is found where the screen shows it, so wait for a paint.
+            step_until(&mut s, || {
+                with_entry(id, |e| !e.links.is_empty()) == Some(true)
+            });
+            let shown = snapshot(id).unwrap();
+            let r = s.rect_of("term").unwrap();
+            // The grid fills the view inside a padding narrower than a cell.
+            let cell_width = r.width as f64 / shown.cols as f64;
+            let row_height = r.height as f64 / shown.rows as f64;
+            let at = |col: f64, row: f64| {
+                (
+                    r.x + (col * cell_width) as i64 + 4,
+                    r.y + (row * row_height) as i64 + 4 + (row_height / 2.0) as i64,
+                )
+            };
+            let (lx, ly) = at(8.0, 0.0);
+            s.hover(lx, ly).unwrap();
+            assert_eq!(s.cursor(), Some(windowing::SystemCursor::Pointer));
+            s.click_at(lx, ly).unwrap();
+            let chord = windowing::Mods {
+                ctrl: !cfg!(target_os = "macos"),
+                gui: cfg!(target_os = "macos"),
+                ..windowing::Mods::default()
+            };
+            s.click_with(lx, ly, chord).unwrap();
+            let link = "https://example.org/x".to_string();
+            assert_eq!(
+                *events.borrow(),
+                [Event::LinkPointed(link.clone()), Event::LinkActivated(link)]
+            );
+            let (ox, oy) = at(2.0, 4.0);
+            s.right_click_at(ox, oy).unwrap();
+            assert_eq!(
+                events.borrow().last(),
+                Some(&Event::LinkPointed(String::new()))
+            );
+            assert!(
+                s.semantics(0).dump().contains("menuitem"),
+                "{}",
+                s.semantics(0).dump()
+            );
             s.shutdown();
         })
     }

@@ -1791,6 +1791,31 @@ impl Widget {
     }
 
     /// Paints a popup this widget opened.
+    /// The size an open menu popup of this widget needs for the entries the
+    /// registry shows now, or None when the popup is not a menu.
+    pub fn menu_extent(
+        &self,
+        popup: &PopupRequest,
+        theme: &Theme,
+        states: &StateStore,
+        registry: &[crate::commands::Command],
+    ) -> Option<Size> {
+        let (items, id) = match self {
+            Widget::MenuBar(b) => (menus::bar_menu_items(b, states), &b.id),
+            Widget::ContextMenu(m) => (m.items.clone(), &m.id),
+            Widget::Button(b) if !b.menu.is_empty() => (b.menu.clone(), &b.id),
+            _ => return None,
+        };
+        Some(menus::panel_extent(
+            &items,
+            id,
+            popup.level,
+            theme,
+            states,
+            registry,
+        ))
+    }
+
     pub fn popup_paint(&self, popup: &PopupRequest, rect: Rect, cx: &mut PaintCx) {
         match self {
             Widget::MenuBar(b) => menus::paint_panel(

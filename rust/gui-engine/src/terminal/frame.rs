@@ -1,5 +1,6 @@
 //! Immutable byte-admitted viewport snapshots and accessible text coordinates.
 use super::engine::{Engine, Slot, cell_text, color, slots, styles};
+use super::links::{self, Link};
 use crate::memory::{Budget, Lease};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Color {
@@ -28,6 +29,7 @@ pub struct Frame {
     alternate: bool,
     cells: Vec<Vec<Cell>>,
     wrapped: Vec<bool>,
+    links: Vec<Link>,
     text: String,
     offsets: Vec<Vec<usize>>,
     _lease: Lease,
@@ -43,12 +45,14 @@ impl Frame {
         let mut cells = Vec::with_capacity(rows.into());
         let mut offsets = Vec::with_capacity(rows.into());
         let mut wrapped = Vec::with_capacity(rows.into());
+        let mut marked = Vec::new();
         let mut text = String::new();
         engine.with_visible_lines(|lines| {
             for (row, line) in lines.iter().enumerate() {
                 let mut cells_of_row = Vec::with_capacity(cols.into());
                 let mut positions = Vec::with_capacity(usize::from(cols) + 1);
                 let mut previous = text.len();
+                let mut uris: Vec<Option<&str>> = Vec::with_capacity(cols.into());
                 for slot in slots(line, cols) {
                     let (shown, continuation, wide, attrs) = match slot {
                         Slot::Cell(cell, attrs, wide) => {
@@ -66,6 +70,11 @@ impl Frame {
                             text.push_str(&shown);
                         }
                     }
+                    let uri = match slot {
+                        Slot::Continuation => uris.last().copied().flatten(),
+                        _ => attrs.and_then(|a| a.hyperlink()).map(|h| h.uri()),
+                    };
+                    uris.push(uri);
                     let (bold, dim, italic, underline, inverse) =
                         attrs.map(styles).unwrap_or_default();
                     cells_of_row.push(Cell {
@@ -81,6 +90,7 @@ impl Frame {
                         dim,
                     });
                 }
+                marked.extend(links::marked(row as u16, &uris));
                 positions.push(text.len());
                 if row + 1 < usize::from(rows) {
                     text.push('\n');
@@ -90,6 +100,8 @@ impl Frame {
                 offsets.push(positions);
             }
         });
+        let mut found = links::found(&cells, &wrapped, &marked);
+        marked.append(&mut found);
         let (cursor_row, cursor_col) = engine.cursor();
         Ok(Self {
             rows,
@@ -99,6 +111,7 @@ impl Frame {
             alternate: engine.alternate_screen(),
             cells,
             wrapped,
+            links: marked,
             text,
             offsets,
             _lease: lease,
@@ -127,6 +140,10 @@ impl Frame {
     }
     pub fn text(&self) -> &str {
         &self.text
+    }
+    /// The links on the screen, marked by the program or found in its text.
+    pub fn links(&self) -> &[Link] {
+        &self.links
     }
     pub fn byte_offset(&self, row: u16, col: u16) -> usize {
         self.offsets[usize::from(row.min(self.rows - 1))][usize::from(col.min(self.cols))]

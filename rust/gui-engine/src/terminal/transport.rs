@@ -215,14 +215,20 @@ pub(crate) fn check_command(program: &str, args: &[String]) -> Result<(), String
     Ok(())
 }
 
-pub(crate) fn pty_size(rows: u16, cols: u16) -> Result<portable_pty::PtySize, String> {
+/// The size a program reads from its terminal: `rows` by `cols` cells of
+/// `cell` pixels each.
+pub(crate) fn pty_size(
+    rows: u16,
+    cols: u16,
+    cell: (u16, u16),
+) -> Result<portable_pty::PtySize, String> {
     if rows == 0 || rows > 256 || cols == 0 || cols > 512 {
         return Err("invalid terminal dimensions".into());
     }
     Ok(portable_pty::PtySize {
         rows,
         cols,
-        pixel_width: 0,
-        pixel_height: 0,
+        pixel_width: cols.saturating_mul(cell.0),
+        pixel_height: rows.saturating_mul(cell.1),
     })
 }

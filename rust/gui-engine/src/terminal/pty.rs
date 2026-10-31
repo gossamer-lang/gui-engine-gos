@@ -132,13 +132,14 @@ impl Pty {
         command: &Command,
         rows: u16,
         cols: u16,
+        cell: (u16, u16),
         budget: &Budget,
         wake: Arc<dyn Fn() + Send + Sync>,
     ) -> Result<Self, String> {
         check_command(&command.program, &command.args)?;
         let slot = Slot::acquire()?;
         let notify = Arc::new(Notify::new(wake));
-        let dimensions = pty_size(rows, cols)?;
+        let dimensions = pty_size(rows, cols, cell)?;
         let lease =
             budget.reserve(3 * INPUT + 2 * OUTPUT + 3 * STACK + 4 * CHUNK + BATCH + 64 * 1024)?;
         let pair = portable_pty::native_pty_system()
@@ -328,11 +329,13 @@ impl Pty {
         self.input.push(bytes.to_vec(), false).map(|_| ())
     }
 
-    pub fn resize(&self, rows: u16, cols: u16) -> Result<(), String> {
+    /// Tells the program its screen's size, in cells and in the pixels of a
+    /// `cell`.
+    pub fn resize(&self, rows: u16, cols: u16, cell: (u16, u16)) -> Result<(), String> {
         self.master
             .as_ref()
             .ok_or("the terminal is closed")?
-            .resize(pty_size(rows, cols)?)
+            .resize(pty_size(rows, cols, cell)?)
             .map_err(|e| e.to_string())
     }
 
@@ -501,8 +504,8 @@ mod tests {
         let (wake, wakes) = waker();
         let script = "test -t 0 || exit 8; printf 'ready\\r\\n'; read word; \
                       printf 'got:%s\\r\\n' \"$word\"; stty size; exit 7";
-        let mut pty = Pty::spawn(&command(script), 12, 44, &budget, wake).unwrap();
-        pty.resize(18, 66).unwrap();
+        let mut pty = Pty::spawn(&command(script), 12, 44, (0, 0), &budget, wake).unwrap();
+        pty.resize(18, 66, (0, 0)).unwrap();
         let mut sent = false;
         let text = collect(&pty, &wakes, |text, got| {
             if !sent && text.contains("ready") {
@@ -527,6 +530,7 @@ mod tests {
             &command("printf ready; exec sleep 20"),
             24,
             80,
+            (0, 0),
             &budget,
             wake,
         )
@@ -553,7 +557,7 @@ mod tests {
         // itself survives the job's SIGTERM and reports its status.
         // The job is in the foreground before it prints.
         let script = "set -m; sh -c 'printf ready; exec sleep 20'; echo \"job:$?\"; exit 4";
-        let mut pty = Pty::spawn(&command(script), 24, 80, &budget, wake).unwrap();
+        let mut pty = Pty::spawn(&command(script), 24, 80, (0, 0), &budget, wake).unwrap();
         let mut sent = false;
         let text = collect(&pty, &wakes, |text, got| {
             if !sent && text.contains("ready") {
@@ -579,7 +583,7 @@ mod tests {
         let budget = Budget::new(8 * 1024 * 1024);
         let (wake, wakes) = waker();
         let script = "trap '' HUP; while :; do printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'; done";
-        let mut pty = Pty::spawn(&command(script), 24, 80, &budget, wake).unwrap();
+        let mut pty = Pty::spawn(&command(script), 24, 80, (0, 0), &budget, wake).unwrap();
         // The reader waits once it has queued a batch; nothing drains it.
         {
             let mut state = pty.output.state.lock();
@@ -601,7 +605,8 @@ mod tests {
     fn idle_reader_cancellation_leaves_no_threads_or_reservations() {
         let budget = Budget::new(8 * 1024 * 1024);
         for _ in 0..20 {
-            let mut pty = Pty::spawn(&command("read x"), 8, 20, &budget, Arc::new(|| {})).unwrap();
+            let mut pty =
+                Pty::spawn(&command("read x"), 8, 20, (0, 0), &budget, Arc::new(|| {})).unwrap();
             pty.close().unwrap();
             drop(pty);
             assert_eq!(budget.usage().0, 0);

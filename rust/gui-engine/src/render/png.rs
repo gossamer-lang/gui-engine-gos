@@ -46,10 +46,11 @@ pub fn decode_with_limit(bytes: &[u8], limit: usize) -> Option<Image> {
     let rgba_bytes = (info.width as usize)
         .checked_mul(info.height as usize)?
         .checked_mul(4)?;
-    if rgba_bytes > limit || reader.output_buffer_size() > limit {
+    let frame_bytes = reader.output_buffer_size()?;
+    if rgba_bytes > limit || frame_bytes > limit {
         return None;
     }
-    let mut buf = vec![0; reader.output_buffer_size()];
+    let mut buf = vec![0; frame_bytes];
     let info = reader.next_frame(&mut buf).ok()?;
     let data = &buf[..info.buffer_size()];
     let rgba = match info.color_type {

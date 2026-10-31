@@ -1,4 +1,8 @@
 //! Immutable byte-admitted viewport snapshots and accessible text coordinates.
+use std::sync::Arc;
+
+use wezterm_term::image::ImageData;
+
 use super::engine::{Engine, Slot, cell_text, color, slots, styles};
 use super::links::{self, Link};
 use crate::memory::{Budget, Lease};
@@ -59,6 +63,21 @@ pub struct Cell {
     pub inverse: bool,
     pub dim: bool,
 }
+/// The part of an image one cell shows: the stretch between two corners,
+/// each a fraction of the image's width and height.
+#[derive(Clone, Debug)]
+pub struct Piece {
+    pub row: u16,
+    pub col: u16,
+    pub image: Arc<ImageData>,
+    pub top_left: (f32, f32),
+    pub bottom_right: (f32, f32),
+    /// Below the text when negative.
+    pub z: i32,
+    /// Pixels left clear at the cell's left, top, right and bottom, in the
+    /// cell size the terminal core placed the image with.
+    pub padding: (u16, u16, u16, u16),
+}
 pub struct Frame {
     rows: u16,
     cols: u16,
@@ -68,6 +87,7 @@ pub struct Frame {
     cells: Vec<Vec<Cell>>,
     wrapped: Vec<bool>,
     links: Vec<Link>,
+    images: Vec<Piece>,
     text: String,
     offsets: Vec<Vec<usize>>,
     _lease: Lease,
@@ -84,6 +104,7 @@ impl Frame {
         let mut offsets = Vec::with_capacity(rows.into());
         let mut wrapped = Vec::with_capacity(rows.into());
         let mut marked = Vec::new();
+        let mut images = Vec::new();
         let mut text = String::new();
         engine.with_visible_lines(|lines| {
             for (row, line) in lines.iter().enumerate() {
@@ -91,7 +112,21 @@ impl Frame {
                 let mut positions = Vec::with_capacity(usize::from(cols) + 1);
                 let mut previous = text.len();
                 let mut uris: Vec<Option<&str>> = Vec::with_capacity(cols.into());
-                for slot in slots(line, cols) {
+                for (col, slot) in slots(line, cols).into_iter().enumerate() {
+                    if let Slot::Cell(_, attrs, _) = &slot {
+                        for image in attrs.images().unwrap_or_default() {
+                            let (top_left, bottom_right) = (image.top_left(), image.bottom_right());
+                            images.push(Piece {
+                                row: row as u16,
+                                col: col as u16,
+                                image: Arc::clone(image.image_data()),
+                                top_left: (*top_left.x, *top_left.y),
+                                bottom_right: (*bottom_right.x, *bottom_right.y),
+                                z: image.z_index(),
+                                padding: image.padding(),
+                            });
+                        }
+                    }
                     let (shown, continuation, wide, attrs) = match slot {
                         Slot::Cell(cell, attrs, wide) => {
                             (cell_text(cell, attrs), false, wide, Some(attrs))
@@ -150,6 +185,7 @@ impl Frame {
             cells,
             wrapped,
             links: marked,
+            images,
             text,
             offsets,
             _lease: lease,
@@ -182,6 +218,11 @@ impl Frame {
     /// The links on the screen, marked by the program or found in its text.
     pub fn links(&self) -> &[Link] {
         &self.links
+    }
+    /// The parts of images the screen's cells show, row by row, in each
+    /// cell's z order.
+    pub fn images(&self) -> &[Piece] {
+        &self.images
     }
     pub fn byte_offset(&self, row: u16, col: u16) -> usize {
         self.offsets[usize::from(row.min(self.rows - 1))][usize::from(col.min(self.cols))]

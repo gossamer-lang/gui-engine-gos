@@ -4,6 +4,7 @@
 //! replies.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use parking_lot::Mutex;
 use wezterm_term::color::{ColorAttribute, ColorPalette};
@@ -31,14 +32,24 @@ pub struct Engine {
     history: usize,
     byte_limit: usize,
     charged: usize,
+    /// The session's charge for the images the screen holds.
+    images: Lease,
+    /// The pixel size of a cell as the view draws it; zero until it has.
+    cell: (u16, u16),
 }
 
-/// What the terminal core asks of its host: the scrollback to keep and the
-/// palette its view shows, which a program's color queries answer from.
+/// The most memory one terminal's images may take, while the session's
+/// budget has room for them.
+pub(crate) const IMAGE_LIMIT: usize = 32 * 1024 * 1024;
+
+/// What the terminal core asks of its host: the scrollback to keep, the
+/// palette its view shows, which a program's color queries answer from, and
+/// the memory its images may take.
 #[derive(Debug)]
 struct Config {
     history: usize,
     palette: Mutex<ColorPalette>,
+    image_limit: AtomicUsize,
 }
 
 impl TerminalConfiguration for Config {
@@ -48,6 +59,14 @@ impl TerminalConfiguration for Config {
 
     fn color_palette(&self) -> ColorPalette {
         self.palette.lock().clone()
+    }
+
+    fn enable_kitty_graphics(&self) -> bool {
+        true
+    }
+
+    fn image_memory_limit(&self) -> usize {
+        self.image_limit.load(Ordering::Relaxed)
     }
 }
 
@@ -127,6 +146,8 @@ impl std::io::Write for Replies {
 struct Filter {
     state: FilterState,
     string: Vec<u8>,
+    /// The string held is an OSC, which BEL also ends.
+    osc: bool,
     overflow: bool,
     dropped: usize,
 }
@@ -137,8 +158,9 @@ enum FilterState {
     #[default]
     Ground,
     Escape,
-    Osc,
-    OscEscape,
+    /// Inside an OSC, DCS or APC string, held until it ends.
+    Text,
+    TextEscape,
     Ignored,
     IgnoredEscape,
 }
@@ -180,12 +202,38 @@ impl Notifications {
     }
 }
 const OSC_LIMIT: usize = 4096;
+/// The longest image a program may send in one string: a sixel (DCS), a
+/// kitty graphics command (APC) or an iTerm2 file (OSC 1337).
+const IMAGE_STRING_LIMIT: usize = 16 * 1024 * 1024;
 /// The longest clipboard write (OSC 52) the filter holds: base64 of about
 /// 768 KiB of text.
 const CLIPBOARD_LIMIT: usize = 1024 * 1024;
 impl Filter {
-    /// The bytes of `input` the parser may see, in order: OSC strings only
-    /// when complete and bounded, and no DCS, APC, SOS or PM payloads.
+    /// The longest the string being held may grow.
+    fn string_limit(&self) -> usize {
+        let held = &self.string;
+        if held.starts_with(b"\x1b]52;") {
+            CLIPBOARD_LIMIT
+        } else if held.starts_with(b"\x1bP")
+            || held.starts_with(b"\x1b_")
+            || held.starts_with(b"\x1b]1337;File=")
+        {
+            IMAGE_STRING_LIMIT
+        } else {
+            OSC_LIMIT
+        }
+    }
+
+    /// Forgets the string held, returning the room an image took.
+    fn end_string(&mut self) {
+        self.string.clear();
+        if self.string.capacity() > OSC_LIMIT {
+            self.string = Vec::new();
+        }
+    }
+
+    /// The bytes of `input` the parser may see, in order: OSC, DCS and APC
+    /// strings only when complete and bounded, and no SOS or PM payloads.
     fn pass(&mut self, input: &[u8], out: &mut Vec<u8>) {
         use FilterState::*;
         let mut at = 0;
@@ -212,13 +260,14 @@ impl Filter {
                 }
                 Escape => match byte {
                     0x1b => Escape,
-                    b']' => {
+                    b']' | b'P' | b'_' => {
                         self.string.clear();
-                        self.string.extend_from_slice(b"\x1b]");
+                        self.string.extend_from_slice(&[0x1b, byte]);
+                        self.osc = byte == b']';
                         self.overflow = false;
-                        Osc
+                        Text
                     }
-                    b'P' | b'X' | b'^' | b'_' => {
+                    b'X' | b'^' => {
                         self.dropped += 1;
                         Ignored
                     }
@@ -227,19 +276,16 @@ impl Filter {
                         Ground
                     }
                 },
-                Osc | OscEscape if byte == 0x18 || byte == 0x1a => {
-                    self.string.clear();
+                Text | TextEscape if byte == 0x18 || byte == 0x1a => {
+                    self.end_string();
                     Ground
                 }
-                Osc | OscEscape => {
-                    let done = byte == 7 || (self.state == OscEscape && byte == b'\\');
+                Text | TextEscape => {
+                    // BEL ends only an OSC; every string ends at ST.
+                    let done =
+                        (self.osc && byte == 7) || (self.state == TextEscape && byte == b'\\');
                     if !self.overflow {
-                        let limit = if self.string.starts_with(b"\x1b]52;") {
-                            CLIPBOARD_LIMIT
-                        } else {
-                            OSC_LIMIT
-                        };
-                        if self.string.len() < limit {
+                        if self.string.len() < self.string_limit() {
                             self.string.push(byte);
                         } else {
                             self.string.clear();
@@ -251,12 +297,12 @@ impl Filter {
                         if !self.overflow {
                             out.extend_from_slice(&self.string);
                         }
-                        self.string.clear();
+                        self.end_string();
                         Ground
                     } else if byte == 0x1b {
-                        OscEscape
+                        TextEscape
                     } else {
-                        Osc
+                        Text
                     }
                 }
                 Ignored | IgnoredEscape
@@ -407,9 +453,11 @@ impl Engine {
         let config = Arc::new(Config {
             history,
             palette: Mutex::new(ColorPalette::default()),
+            image_limit: AtomicUsize::new(IMAGE_LIMIT),
         });
+        let images = budget.reserve(0)?;
         let mut term = Terminal::new(
-            terminal_size(rows, cols),
+            terminal_size(rows, cols, (0, 0)),
             config.clone(),
             "xterm-256color",
             env!("CARGO_PKG_VERSION"),
@@ -431,6 +479,8 @@ impl Engine {
             max_cols: cols,
             history,
             byte_limit,
+            images,
+            cell: (0, 0),
         })
     }
     /// Parses program output into the screen.
@@ -442,6 +492,7 @@ impl Engine {
         self.filter.pass(bytes, &mut passed);
         let alternate = self.term.is_alt_screen_active();
         self.term.advance_bytes(&passed);
+        self.charge_images();
         // The other screen has rows of its own, so a view into the one left
         // behind no longer applies.
         if self.term.is_alt_screen_active() != alternate {
@@ -449,9 +500,29 @@ impl Engine {
         }
         Ok(())
     }
+    /// Charges the session for the images the screen holds. Past what the
+    /// session can take, the screen's image limit falls to its charge, so its
+    /// next image takes the place of older ones.
+    fn charge_images(&mut self) {
+        let held = self.term.image_memory();
+        if held == self.images.bytes() {
+            return;
+        }
+        let limit = if self.images.resize(held).is_ok() {
+            IMAGE_LIMIT
+        } else {
+            self.images.bytes()
+        };
+        self.config.image_limit.store(limit, Ordering::Relaxed);
+    }
+    /// The bytes the screen's images take.
+    pub fn image_bytes(&self) -> usize {
+        self.images.bytes()
+    }
     /// Resizes the screen, rewrapping its lines and history to the new width;
-    /// storage keeps the largest size it has reached.
-    pub fn resize(&mut self, rows: u16, cols: u16) -> Result<(), String> {
+    /// storage keeps the largest size it has reached. `cell` is the pixel size
+    /// a cell is drawn at, which places images and which programs may ask.
+    pub fn resize(&mut self, rows: u16, cols: u16, cell: (u16, u16)) -> Result<(), String> {
         charge(rows, cols, self.history)?;
         let bytes = charge(
             rows.max(self.max_rows),
@@ -464,7 +535,8 @@ impl Engine {
         self.lease.resize(bytes)?;
         self.charged = bytes;
         let back = self.scrollback();
-        self.term.resize(terminal_size(rows, cols));
+        self.term.resize(terminal_size(rows, cols, cell));
+        self.cell = cell;
         // Rewrapping renumbers the rows, so the view keeps its distance from
         // the live screen.
         self.scroll(back);
@@ -475,6 +547,10 @@ impl Engine {
     /// An immutable snapshot of the visible screen.
     pub fn frame(&self) -> Result<super::frame::Frame, String> {
         super::frame::Frame::capture(self, &self.budget)
+    }
+    /// The pixel size of a cell as the view last drew it.
+    pub fn cell(&self) -> (u16, u16) {
+        self.cell
     }
     /// The screen's rows and columns.
     pub fn size(&self) -> (u16, u16) {
@@ -782,14 +858,14 @@ fn directory_of(location: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
-/// The size the terminal core takes: cells only, since the view lays out
-/// pixels and a program asking for them is told nothing.
-fn terminal_size(rows: u16, cols: u16) -> TerminalSize {
+/// The size the terminal core takes, in cells and in the pixels of a `cell`
+/// the view draws.
+fn terminal_size(rows: u16, cols: u16, cell: (u16, u16)) -> TerminalSize {
     TerminalSize {
         rows: usize::from(rows),
         cols: usize::from(cols),
-        pixel_width: 0,
-        pixel_height: 0,
+        pixel_width: usize::from(cols) * usize::from(cell.0),
+        pixel_height: usize::from(rows) * usize::from(cell.1),
         dpi: 0,
     }
 }
@@ -809,8 +885,8 @@ mod tests {
         )
         .unwrap();
         // A maximized window on a 4K display at 1.5x is about 86 x 320 cells.
-        e.resize(86, 320).unwrap();
-        e.resize(256, 512).unwrap();
+        e.resize(86, 320, (0, 0)).unwrap();
+        e.resize(256, 512, (0, 0)).unwrap();
         assert_eq!(e.size(), (256, 512));
     }
     #[test]
@@ -830,7 +906,7 @@ mod tests {
         let mut e = Engine::new(4, 40, 100, 16 * 1024 * 1024, budget).unwrap();
         let long = format!("start-{}-end", "x".repeat(50));
         e.process(format!("{long}\r\nnext").as_bytes()).unwrap();
-        e.resize(4, 20).unwrap();
+        e.resize(4, 20, (0, 0)).unwrap();
         // The line rewraps into three rows of twenty; rows above the cursor's
         // move into the scrollback to keep it in place, as in VTE.
         let narrow = e.text();
@@ -839,7 +915,7 @@ mod tests {
         let earlier = e.text();
         assert!(earlier.starts_with("start-"), "{earlier:?}");
         e.scroll(0);
-        e.resize(4, 80).unwrap();
+        e.resize(4, 80, (0, 0)).unwrap();
         let wide = e.text();
         assert_eq!(wide.lines().next(), Some(long.as_str()), "{wide:?}");
     }
@@ -880,10 +956,12 @@ mod tests {
         e.process(b"\x07safe").unwrap();
         assert!(e.text().contains("safe"));
         e.process(b"\x1bP").unwrap();
-        for _ in 0..100 {
+        for _ in 0..IMAGE_STRING_LIMIT / 8192 + 1 {
             e.process(&[b'B'; 8192]).unwrap();
         }
+        assert!(e.filter.string.capacity() <= IMAGE_STRING_LIMIT * 2);
         e.process(b"\x1b\\").unwrap();
+        assert!(e.filter.string.capacity() <= OSC_LIMIT);
         e.process(format!("\r\nx{}", "\u{301}".repeat(100_000)).as_bytes())
             .unwrap();
         let frame = e.frame().unwrap();
@@ -989,12 +1067,12 @@ mod tests {
         let mut e = Engine::new(24, 80, 1000, 16 * 1024 * 1024, budget).unwrap();
         e.process(b"preserved").unwrap();
         let old = e.charged_bytes();
-        assert!(e.resize(256, 512).is_err());
+        assert!(e.resize(256, 512, (0, 0)).is_err());
         assert_eq!(e.size(), (24, 80));
         assert_eq!(e.charged_bytes(), old);
-        e.resize(32, 100).unwrap();
+        e.resize(32, 100, (0, 0)).unwrap();
         let high = e.charged_bytes();
-        e.resize(8, 20).unwrap();
+        e.resize(8, 20, (0, 0)).unwrap();
         assert_eq!(e.charged_bytes(), high);
         assert!(e.text().contains("preserved"));
     }

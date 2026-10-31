@@ -86,6 +86,7 @@ impl Pty {
         command: &Command,
         rows: u16,
         cols: u16,
+        cell: (u16, u16),
         budget: &Budget,
         wake: Arc<dyn Fn() + Send + Sync>,
     ) -> Result<Self, String> {
@@ -95,7 +96,7 @@ impl Pty {
         let lease =
             budget.reserve(3 * INPUT + 2 * OUTPUT + 4 * STACK + 4 * CHUNK + BATCH + 64 * 1024)?;
         let pair = portable_pty::native_pty_system()
-            .openpty(pty_size(rows, cols)?)
+            .openpty(pty_size(rows, cols, cell)?)
             .map_err(|e| e.to_string())?;
         let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
         let mut writer = pair.master.take_writer().map_err(|e| e.to_string())?;
@@ -223,11 +224,13 @@ impl Pty {
         self.input.push(bytes.to_vec(), false).map(|_| ())
     }
 
-    pub fn resize(&self, rows: u16, cols: u16) -> Result<(), String> {
+    /// Tells the program its screen's size, in cells and in the pixels of a
+    /// `cell`.
+    pub fn resize(&self, rows: u16, cols: u16, cell: (u16, u16)) -> Result<(), String> {
         self.master
             .as_ref()
             .ok_or("the terminal is closed")?
-            .resize(pty_size(rows, cols)?)
+            .resize(pty_size(rows, cols, cell)?)
             .map_err(|e| e.to_string())
     }
 
@@ -326,6 +329,7 @@ mod tests {
             &command,
             24,
             80,
+            (0, 0),
             &budget,
             Arc::new(move || {
                 let _ = send.send(());
@@ -374,7 +378,7 @@ mod tests {
             ..Command::default()
         };
         for _ in 0..5 {
-            let mut pty = Pty::spawn(&command, 24, 80, &budget, Arc::new(|| {})).unwrap();
+            let mut pty = Pty::spawn(&command, 24, 80, (0, 0), &budget, Arc::new(|| {})).unwrap();
             pty.close().unwrap();
             assert!(exited(&pty.process));
             drop(pty);

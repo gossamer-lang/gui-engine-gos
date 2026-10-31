@@ -82,7 +82,7 @@ fn a_screen_that_cannot_take_its_view_reports_why_once() {
     let id = create(&small, budget.clone()).unwrap();
     for _ in 0..2 {
         with(id, |entry| {
-            follow_view(entry, 200, 500);
+            follow_view(entry, 200, 500, (0, 0));
             Ok(())
         })
         .unwrap();
@@ -788,4 +788,80 @@ mod session {
             s.shutdown();
         })
     }
+}
+
+/// A red sixel `width` by `bands * 6` pixels.
+fn red_sixel(width: usize, bands: usize) -> Vec<u8> {
+    let band = format!("#1!{width}~-");
+    format!("\x1bPq#1;2;100;0;0{}\x1b\\", band.repeat(bands)).into_bytes()
+}
+
+fn paint(view: &widget::View, size: crate::geometry::Size) -> crate::render::Canvas {
+    let theme = crate::style::Theme::default();
+    let states = crate::widgets::state::StateStore::new();
+    let mut cx = crate::widgets::cx::PaintCx::new(
+        &crate::render::Canvas::new(size.width, size.height),
+        &theme,
+        &states,
+    );
+    widget::paint_terminal(view, &crate::widgets::cx::Node::leaf(size), &mut cx);
+    cx.canvas
+}
+
+fn pixel(canvas: &crate::render::Canvas, x: i64, y: i64) -> [u8; 4] {
+    let at = ((y * canvas.width + x) * 4) as usize;
+    [
+        canvas.pixels[at],
+        canvas.pixels[at + 1],
+        canvas.pixels[at + 2],
+        canvas.pixels[at + 3],
+    ]
+}
+
+#[test]
+fn a_sixel_paints_its_cells_and_is_charged_while_the_screen_shows_it() {
+    let budget = Budget::new(64 * 1024 * 1024);
+    let id = create(&options(10, 40, 100), budget.clone()).unwrap();
+    let view = widget::View::new("term", id, "Images");
+    let size = crate::geometry::Size::new(480, 320);
+    // The first paint sizes the screen and the pixels of its cells.
+    paint(&view, size);
+    let (_, cell) = with(id, |entry| Ok((entry.engine.size(), entry.engine.cell()))).unwrap();
+    assert!(cell.0 > 0 && cell.1 > 0);
+    let before = snapshot(id).unwrap().reserved_bytes;
+    feed(id, &red_sixel(40, 7)).unwrap();
+    let canvas = paint(&view, size);
+    let pad = crate::style::Theme::default().px(widget::PAD);
+    assert_eq!(pixel(&canvas, pad + 3, pad + 3), [255, 0, 0, 255]);
+    let held = snapshot(id).unwrap().reserved_bytes - before;
+    assert_eq!(held, 40 * 42 * 4);
+    // Clearing the screen and its history lets the image go.
+    feed(id, b"\x1b[2J\x1b[3J").unwrap();
+    let canvas = paint(&view, size);
+    assert_ne!(pixel(&canvas, pad + 3, pad + 3), [255, 0, 0, 255]);
+    assert_eq!(snapshot(id).unwrap().reserved_bytes, before);
+    close(id);
+}
+
+#[test]
+fn image_strings_reach_the_screen_and_other_strings_do_not() {
+    let budget = Budget::new(64 * 1024 * 1024);
+    let id = create(&options(10, 40, 100), budget).unwrap();
+    let view = widget::View::new("term", id, "Images");
+    paint(&view, crate::geometry::Size::new(480, 320));
+    let images = |id| with(id, |entry| Ok(entry.engine.frame()?.images().len())).unwrap();
+    // A 2x2 red kitty image sent as RGBA.
+    feed(id, b"\x1b_Ga=T,f=32,s=2,v=2;/wAA//8AAP//AAD//wAA/w==\x1b\\").unwrap();
+    assert!(images(id) > 0);
+    feed(id, b"\x1b[2J\x1b[3J\x1b[H").unwrap();
+    // An 11x11 PNG sent as an iTerm2 file.
+    let png = "iVBORw0KGgoAAAANSUhEUgAAAAsAAAALCAYAAACprHcmAAAACXBIWXMAAAGKAAABigEzlzBYAAAAOUlEQVQYlZXOwQ0AMAzCQEdi7yaT0xWAN7JuDCac2PQKYxflycOoICOKtPIuqFCg4/LzKxiz6xjyAYh9DR1sLUN1AAAAAElFTkSuQmCC";
+    feed(id, format!("\x1b]1337;File=inline=1:{png}\x07").as_bytes()).unwrap();
+    assert!(images(id) > 0);
+    feed(id, b"\x1b[2J\x1b[3J\x1b[H").unwrap();
+    // SOS and PM payloads never reach the parser.
+    feed(id, b"\x1bXhidden\x1b\\\x1b^hidden\x1b\\shown").unwrap();
+    let text = snapshot(id).unwrap().text;
+    assert!(text.contains("shown") && !text.contains("hidden"));
+    close(id);
 }

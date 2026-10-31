@@ -8,6 +8,7 @@
 pub mod api;
 pub mod engine;
 pub mod frame;
+mod images;
 pub mod keyboard;
 pub mod links;
 mod transport;
@@ -194,6 +195,11 @@ struct Entry {
     focused: bool,
     /// Stretches of the buffer the application highlights, in buffer rows.
     highlights: Vec<Span>,
+    /// The pixels of the images the screen last showed, so a paint draws
+    /// the same pixels the last one did.
+    pictures: images::Pictures,
+    /// When an animated image the screen shows next changes frame.
+    animation_due: Option<i64>,
 }
 
 /// A stretch of a terminal's buffer, its end excluded, in rows counted from
@@ -330,6 +336,8 @@ pub fn create(options: &Options, budget: Budget) -> Result<i64, String> {
             synchronized: false,
             focused: false,
             highlights: Vec::new(),
+            pictures: images::Pictures::default(),
+            animation_due: None,
         },
     );
     Ok(id)
@@ -439,7 +447,15 @@ pub fn spawn(id: i64, command: &Command) -> Result<(), String> {
             return Err("the terminal already runs a program".into());
         }
         let (rows, cols) = entry.engine.size();
-        entry.transport = Some(Transport::spawn(command, rows, cols, &entry.budget, wake)?);
+        let cell = entry.engine.cell();
+        entry.transport = Some(Transport::spawn(
+            command,
+            rows,
+            cols,
+            cell,
+            &entry.budget,
+            wake,
+        )?);
         entry.exit = None;
         entry.exit_reported = false;
         Ok(())
@@ -501,13 +517,17 @@ pub fn paste(id: i64, text: &str) -> Result<(), String> {
 pub fn resize(id: i64, rows: i64, cols: i64) -> Result<(), String> {
     let rows = dimension(rows, 256, "rows")?;
     let cols = dimension(cols, 512, "columns")?;
-    with(id, |entry| resize_entry(entry, rows, cols))
+    with(id, |entry| {
+        let cell = entry.engine.cell();
+        resize_entry(entry, rows, cols, cell)
+    })
 }
 
-/// Resizes the screen to its view, keeping a refusal to report from the pump:
-/// the screen then keeps its size, and the application hears why.
-fn follow_view(entry: &mut Entry, rows: u16, cols: u16) {
-    match resize_entry(entry, rows, cols) {
+/// Resizes the screen to its view, whose cells are `cell` pixels, keeping a
+/// refusal to report from the pump: the screen then keeps its size, and the
+/// application hears why.
+fn follow_view(entry: &mut Entry, rows: u16, cols: u16, cell: (u16, u16)) {
+    match resize_entry(entry, rows, cols, cell) {
         Ok(()) => entry.refused = None,
         Err(why) if entry.refused != Some((rows, cols)) => {
             entry.refused = Some((rows, cols));
@@ -517,13 +537,13 @@ fn follow_view(entry: &mut Entry, rows: u16, cols: u16) {
     }
 }
 
-fn resize_entry(entry: &mut Entry, rows: u16, cols: u16) -> Result<(), String> {
-    if entry.engine.size() == (rows, cols) {
+fn resize_entry(entry: &mut Entry, rows: u16, cols: u16, cell: (u16, u16)) -> Result<(), String> {
+    if entry.engine.size() == (rows, cols) && entry.engine.cell() == cell {
         return Ok(());
     }
-    entry.engine.resize(rows, cols)?;
+    entry.engine.resize(rows, cols, cell)?;
     if let Some(transport) = &entry.transport {
-        transport.resize(rows, cols)?;
+        transport.resize(rows, cols, cell)?;
     }
     entry.selection = None;
     entry.revision += 1;
@@ -611,7 +631,7 @@ pub fn snapshot(id: i64) -> Result<Snapshot, String> {
             scrolled: entry.scrolled as i64,
             history: entry.engine.history() as i64,
             selection: entry.selection,
-            reserved_bytes: entry.engine.charged_bytes() as i64,
+            reserved_bytes: (entry.engine.charged_bytes() + entry.engine.image_bytes()) as i64,
             pid: i64::from(pid),
             busy: entry
                 .transport
@@ -646,6 +666,15 @@ pub(crate) fn close_budget(budget: &Budget) {
 
 /// Parses output waiting for `budget`'s terminals on the session's thread,
 /// answering whether any screen changed and the events applications hear.
+/// When the next animated image any terminal shows changes frame.
+pub(crate) fn animation_due() -> Option<i64> {
+    TERMINALS
+        .lock()
+        .values()
+        .filter_map(|entry| entry.animation_due)
+        .min()
+}
+
 pub(crate) fn pump(budget: &Budget) -> (bool, Vec<UiMsg>) {
     let mut changed = false;
     let mut events = Vec::new();

@@ -10,6 +10,7 @@ use windowing::{Key, MouseButton};
 use std::sync::Arc;
 
 use super::frame::{Color as CellColor, Frame};
+use super::images;
 use super::keyboard;
 use super::links::{Link, Place, place};
 use super::{Cell, Event as TerminalEvent, Span, with_entry};
@@ -471,9 +472,12 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
     let (rows, cols) = grid(v, &theme, node.size());
     let wanted = palette(v, &theme);
     let focused = cx.focus == v.id;
+    let (cw, lh, style) = metrics(v, &theme);
+    // Programs place images in whole pixels per cell.
+    let cell = (pixels_of(cw), pixels_of(lh));
     let captured = with_entry(v.terminal, |entry| {
         // The screen follows the view's size; the program hears of it.
-        super::follow_view(entry, rows as u16, cols as u16);
+        super::follow_view(entry, rows as u16, cols as u16, cell);
         // A paint follows every change of focus, so the program hears of
         // each one here.
         super::focus(entry, focused && cx.active);
@@ -513,9 +517,27 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
         .iter()
         .filter(|l| hovered.as_ref() == Some(&l.uri))
         .collect();
-    let (cw, lh, style) = metrics(v, &theme);
     let pad = theme.px(PAD);
     let origin = cx.abs(r);
+    let mut pictures =
+        with_entry(v.terminal, |entry| std::mem::take(&mut entry.pictures)).unwrap_or_default();
+    let mut used = images::Used::default();
+    let image_grid = images::Grid {
+        x: (origin.x + pad) as f64,
+        y: (origin.y + pad) as f64,
+        cell_width: cw,
+        cell_height: lh,
+        placed: cell,
+    };
+    let below = images::paint(
+        &mut cx.canvas,
+        frame.images(),
+        true,
+        image_grid,
+        &mut pictures,
+        &mut used,
+        cx.now,
+    );
     // Run layouts are kept per terminal, sized to its screen: output brings
     // rows that never come back, which the shared layout cache would hold to
     // its whole budget.
@@ -651,10 +673,32 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
     // A row the screen no longer shows only comes back by scrolling back,
     // which lays it out again, so the cache keeps the runs this paint drew.
     layouts.evict_unused_since(painted_from);
-    with_entry(v.terminal, |entry| entry.layouts = layouts);
+    let above = images::paint(
+        &mut cx.canvas,
+        frame.images(),
+        false,
+        image_grid,
+        &mut pictures,
+        &mut used,
+        cx.now,
+    );
+    pictures.keep(&used);
+    with_entry(v.terminal, |entry| {
+        entry.layouts = layouts;
+        entry.pictures = pictures;
+        entry.animation_due = match (below, above) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+    });
     // The cursor shows focus, filled while the terminal has it and hollow
     // otherwise, so the terminal draws no focus ring around its screen.
     paint_cursor(&frame, focused, shown(colors.cursor_bg), cx, (cw, lh, pad));
+}
+
+// The whole pixels a cell `length` long spans.
+fn pixels_of(length: f64) -> u16 {
+    length.round().clamp(1.0, f64::from(u16::MAX)) as u16
 }
 
 // Lays out `text` in `run` under `key` unless the cache holds it.

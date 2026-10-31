@@ -1046,6 +1046,9 @@ impl Session {
             }
             self.drain_inbox();
             let (terminals_changed, terminal_events) = crate::terminal::pump(&self.budget);
+            // An animated image whose frame is due repaints like new output.
+            let terminals_changed = terminals_changed
+                || crate::terminal::animation_due().is_some_and(|due| due <= self.now());
             let (images_changed, image_events) = crate::imageview::pump(&self.budget);
             let (media_changed, media_events) = crate::media::pump(&self.budget);
             self.pending.extend(media_events);
@@ -1209,6 +1212,11 @@ impl Session {
 
     fn next_deadline(&self) -> i64 {
         let mut best = self.output_due().unwrap_or(-1);
+        if let Some(due) = crate::terminal::animation_due()
+            && (best < 0 || due < best)
+        {
+            best = due;
+        }
         for t in &self.timers {
             if self.visual_timer_paused(t) {
                 continue;

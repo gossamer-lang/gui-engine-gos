@@ -884,16 +884,28 @@ fn band_raster(
             for row in part.y..part.y + part.height {
                 let src = ((row - tile.y) * tile.width + part.x - tile.x) as usize * 4;
                 let dst = (row - band.y) as usize * band.stride + part.x as usize * 4;
-                for (d, s) in band.pixels[dst..dst + len]
-                    .as_chunks_mut::<4>()
-                    .0
-                    .iter_mut()
-                    .zip(raster[src..src + len].as_chunks::<4>().0)
-                {
-                    d[ro] = s[0];
-                    d[go] = s[1];
-                    d[bo] = s[2];
-                    d[3] = 255;
+                let into = band.pixels[dst..dst + len].as_chunks_mut::<4>().0;
+                let from = raster[src..src + len].as_chunks::<4>().0;
+                // The common byte orders as whole-pixel moves, which vectorize.
+                match (ro, go, bo) {
+                    (0, 1, 2) => {
+                        for (d, s) in into.iter_mut().zip(from) {
+                            *d = [s[0], s[1], s[2], 255];
+                        }
+                    }
+                    (2, 1, 0) => {
+                        for (d, s) in into.iter_mut().zip(from) {
+                            *d = [s[2], s[1], s[0], 255];
+                        }
+                    }
+                    _ => {
+                        for (d, s) in into.iter_mut().zip(from) {
+                            d[ro] = s[0];
+                            d[go] = s[1];
+                            d[bo] = s[2];
+                            d[3] = 255;
+                        }
+                    }
                 }
             }
             done.damage_pixels += (part.width * part.height) as u64;

@@ -326,6 +326,8 @@ pub enum UiMsg {
     Timer(String),
     /// The user asked to close the window; the application decides.
     CloseRequested(String),
+    /// The window gained (true) or lost keyboard focus.
+    WindowFocus(String, bool),
     /// Files were dropped on the widget `id`.
     Dropped(String, Vec<String>),
     /// A completion provider of `id` needs results for `query`

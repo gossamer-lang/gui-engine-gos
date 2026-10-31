@@ -13,7 +13,7 @@ use portable_pty::{Child, CommandBuilder, MasterPty};
 
 use super::Command;
 use super::transport::{
-    CHUNK, Drain, INPUT, Notify, OUTPUT, Queue, STACK, Slot, check_command, pty_size,
+    BATCH, CHUNK, Drain, INPUT, Notify, OUTPUT, Queue, STACK, Slot, check_command, pty_size,
 };
 use crate::memory::{Budget, Lease};
 
@@ -34,8 +34,48 @@ pub struct Pty {
     _lease: Lease,
 }
 
+/// The working directory of process `pid`.
+#[cfg(target_os = "linux")]
+fn process_cwd(pid: i32) -> Option<String> {
+    std::fs::read_link(format!("/proc/{pid}/cwd"))
+        .ok()?
+        .into_os_string()
+        .into_string()
+        .ok()
+}
+
+/// The working directory of process `pid`.
+#[cfg(target_os = "macos")]
+fn process_cwd(pid: i32) -> Option<String> {
+    // SAFETY: the record is plain old data, which all zeros initializes.
+    let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+    // SAFETY: `info` is a writable record of `size` bytes.
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            (&raw mut info).cast(),
+            size,
+        )
+    };
+    if read != size {
+        return None;
+    }
+    // SAFETY: the kernel writes a NUL-terminated path into the record.
+    let path = unsafe { std::ffi::CStr::from_ptr(info.pvi_cdir.vip_path.as_ptr().cast()) };
+    path.to_str().ok().map(str::to_owned)
+}
+
+/// Other systems name no process's directory to an unprivileged reader.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_cwd(_pid: i32) -> Option<String> {
+    None
+}
+
 /// Waits until `fd` is ready for `events` or `cancel` is readable; answers
-/// false for cancellation.
+/// false for cancellation. The thread hands back the memory it freed first.
 fn readiness(fd: i32, cancel: i32, events: i16) -> Result<bool, String> {
     let mut fds = [
         libc::pollfd {
@@ -50,10 +90,16 @@ fn readiness(fd: i32, cancel: i32, events: i16) -> Result<bool, String> {
         },
     ];
     loop {
+        let bound = windowing::idle::thread_idle().map_or(-1, |due| {
+            i32::try_from(due.as_micros().div_ceil(1000)).unwrap_or(i32::MAX)
+        });
         // SAFETY: `fds` holds two initialized pollfd records; the PTY
         // descriptor stays open until both IO threads have joined and the
         // cancel descriptor is owned by the calling thread.
-        let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+        let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, bound) };
+        if result == 0 {
+            continue;
+        }
         if result < 0 {
             let error = std::io::Error::last_os_error();
             if error.kind() == std::io::ErrorKind::Interrupted {
@@ -67,6 +113,10 @@ fn readiness(fd: i32, cancel: i32, events: i16) -> Result<bool, String> {
         return Ok(fds[0].revents != 0);
     }
 }
+
+/// How long a reader lets a streaming program's output gather between
+/// passes: short against a frame, long against the program's writes.
+const STREAM_GATHER: std::time::Duration = std::time::Duration::from_micros(250);
 
 fn would_block(error: &std::io::Error) -> bool {
     matches!(
@@ -89,7 +139,8 @@ impl Pty {
         let slot = Slot::acquire()?;
         let notify = Arc::new(Notify::new(wake));
         let dimensions = pty_size(rows, cols)?;
-        let lease = budget.reserve(3 * INPUT + 2 * OUTPUT + 3 * STACK + 4 * CHUNK + 64 * 1024)?;
+        let lease =
+            budget.reserve(3 * INPUT + 2 * OUTPUT + 3 * STACK + 4 * CHUNK + BATCH + 64 * 1024)?;
         let pair = portable_pty::native_pty_system()
             .openpty(dimensions)
             .map_err(|e| e.to_string())?;
@@ -155,19 +206,44 @@ impl Pty {
                 .stack_size(STACK)
                 .spawn(move || {
                     let mut buffer = [0; CHUNK];
-                    while !stop.load(Ordering::Acquire) {
+                    // Output is read once the owner has taken what was queued:
+                    // meanwhile the kernel holds what the program writes, and
+                    // one pass collects it whole rather than a write at a time.
+                    'reading: while !stop.load(Ordering::Acquire) && out.wait_empty() {
                         if readiness(fd, signal.as_raw_fd(), libc::POLLIN) != Ok(true) {
                             break;
                         }
-                        match reader.read(&mut buffer) {
-                            Ok(0) => break,
-                            Ok(n) => match out.push(buffer[..n].to_vec(), true) {
+                        let mut batch = Vec::new();
+                        let ended = loop {
+                            match reader.read(&mut buffer) {
+                                Ok(0) => break true,
+                                Ok(n) => {
+                                    batch.extend_from_slice(&buffer[..n]);
+                                    if batch.len() >= BATCH {
+                                        break false;
+                                    }
+                                }
+                                Err(error) if would_block(&error) => break false,
+                                Err(_) => break true,
+                            }
+                        };
+                        let streaming = !batch.is_empty();
+                        if streaming {
+                            match out.push(batch, true) {
                                 Ok(true) => wake.fire(),
                                 Ok(false) => (),
-                                Err(_) => break,
-                            },
-                            Err(error) if would_block(&error) => (),
-                            Err(_) => break,
+                                Err(_) => break 'reading,
+                            }
+                        }
+                        if ended {
+                            break;
+                        }
+                        // The kernel hands a terminal's output over a write at
+                        // a time, at a fixed cost a read. While a program
+                        // streams, a moment's pause lets it gather, so a pass
+                        // reads it in fewer, fuller reads.
+                        if streaming {
+                            thread::sleep(STREAM_GATHER);
                         }
                     }
                     out.finish(true, None);
@@ -286,6 +362,21 @@ impl Pty {
         // SAFETY: `fd` is the open master descriptor.
         let foreground = unsafe { libc::tcgetpgrp(fd) };
         foreground > 0 && foreground != self.pid as i32
+    }
+
+    /// The working directory of the job in the terminal's foreground, or of
+    /// the program when none runs there or its directory cannot be read.
+    pub fn cwd(&self) -> Option<String> {
+        let foreground = self
+            .master
+            .as_ref()
+            .and_then(|m| m.as_raw_fd())
+            // SAFETY: `fd` is the open master descriptor.
+            .map(|fd| unsafe { libc::tcgetpgrp(fd) })
+            .filter(|pgid| *pgid > 0);
+        foreground
+            .and_then(process_cwd)
+            .or_else(|| process_cwd(self.pid as i32))
     }
 
     /// Sends signal `signum` to the terminal's foreground process group,
@@ -489,10 +580,10 @@ mod tests {
         let (wake, wakes) = waker();
         let script = "trap '' HUP; while :; do printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'; done";
         let mut pty = Pty::spawn(&command(script), 24, 80, &budget, wake).unwrap();
-        // The reader blocks once the output queue is full; nothing drains it.
+        // The reader waits once it has queued a batch; nothing drains it.
         {
             let mut state = pty.output.state.lock();
-            while state.bytes + CHUNK <= OUTPUT && state.chunks.len() < 64 {
+            while state.chunks.is_empty() {
                 pty.output.changed.wait(&mut state);
             }
         }

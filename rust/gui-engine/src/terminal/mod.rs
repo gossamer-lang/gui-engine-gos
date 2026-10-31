@@ -110,6 +110,16 @@ pub enum Event {
     LinkPointed(String),
     /// The user asked to open a link: Ctrl+click, or Command+click on macOS.
     LinkActivated(String),
+    /// The program sent a desktop notification (OSC 9 or 777): its title,
+    /// empty when it gave none, and its body.
+    Notify(String, String),
+    /// The program wrote this text to the clipboard (OSC 52).
+    Clipboard(String),
+    /// The program wrote this text to the primary selection (OSC 52).
+    PrimarySelection(String),
+    /// The user asked to open a file path the screen shows: its absolute
+    /// path and the line and column after it, 0 when it names none.
+    PathActivated(String, i64, i64),
 }
 
 /// The state of a terminal an application reads.
@@ -177,6 +187,21 @@ struct Entry {
     /// The link under the pointer when it last pressed a button, which the
     /// application hears of for its context menu.
     pointed: Option<Arc<str>>,
+    /// The program is drawing a synchronized frame, so its output is shown
+    /// once the frame ends.
+    synchronized: bool,
+    /// Whether the program last heard the view had focus.
+    focused: bool,
+    /// Stretches of the buffer the application highlights, in buffer rows.
+    highlights: Vec<Span>,
+}
+
+/// A stretch of a terminal's buffer, its end excluded, in rows counted from
+/// the oldest history row.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Span {
+    pub start: Cell,
+    pub end: Cell,
 }
 
 /// A non-UTF-8 character set the program reads and writes: its output is
@@ -302,9 +327,74 @@ pub fn create(options: &Options, budget: Budget) -> Result<i64, String> {
             links: Vec::new(),
             hovered: None,
             pointed: None,
+            synchronized: false,
+            focused: false,
+            highlights: Vec::new(),
         },
     );
     Ok(id)
+}
+
+/// The directory terminal `id`'s program works in: the one it last reported,
+/// else the foreground job's, else the program's; empty when none is known.
+pub fn cwd(id: i64) -> Result<String, String> {
+    with(id, |entry| {
+        Ok(entry
+            .engine
+            .current_dir()
+            .or_else(|| entry.transport.as_ref().and_then(Transport::cwd))
+            .unwrap_or_default())
+    })
+}
+
+/// The stretches of terminal `id`'s buffer the shell marked as prompts,
+/// inputs and outputs, oldest first.
+pub fn zones(id: i64) -> Result<Vec<engine::Zone>, String> {
+    with(id, |entry| Ok(entry.engine.zones()))
+}
+
+/// The most stretches one terminal highlights at once.
+const HIGHLIGHT_LIMIT: usize = 10_000;
+
+/// Highlights `spans` of terminal `id`'s buffer, replacing any it had.
+pub fn highlight(id: i64, spans: Vec<Span>) -> Result<(), String> {
+    if spans.len() > HIGHLIGHT_LIMIT {
+        return Err(format!(
+            "a terminal highlights at most {HIGHLIGHT_LIMIT} stretches"
+        ));
+    }
+    with(id, |entry| {
+        if entry.highlights != spans {
+            entry.highlights = spans;
+            entry.revision += 1;
+        }
+        Ok(())
+    })
+}
+
+/// Writes the replies the program asked for to it.
+fn send_replies(entry: &mut Entry) {
+    let replies = entry.engine.take_replies();
+    if !replies.is_empty()
+        && let Some(transport) = &entry.transport
+    {
+        let _ = transport.write(&replies);
+    }
+}
+
+/// Reports a pointer event to terminal `id`'s program.
+fn mouse(entry: &mut Entry, event: wezterm_term::MouseEvent) {
+    entry.engine.mouse(event);
+    send_replies(entry);
+}
+
+/// Tells terminal `id`'s program whether its view has focus, once per change.
+fn focus(entry: &mut Entry, focused: bool) {
+    if entry.focused != focused {
+        entry.focused = focused;
+        entry.engine.focus(focused);
+        send_replies(entry);
+    }
 }
 
 /// Every row of terminal `id`'s buffer, its oldest history row first; the
@@ -382,6 +472,13 @@ fn send(entry: &mut Entry, bytes: &[u8]) -> Result<(), String> {
     match &entry.charset {
         Some(charset) => transport.write(&charset.encode(bytes))?,
         None => transport.write(bytes)?,
+    }
+    // The user is answering what the screen shows, so a frame the program
+    // left open (it may have stopped) is shown as it stands.
+    if entry.synchronized {
+        entry.engine.end_synchronized();
+        entry.synchronized = false;
+        entry.revision += 1;
     }
     if entry.scrolled != 0 || entry.selection.is_some() {
         entry.scrolled = 0;
@@ -574,12 +671,25 @@ pub(crate) fn pump(budget: &Budget) -> (bool, Vec<UiMsg>) {
             };
             if processed.is_ok() {
                 entry.revision += 1;
-                changed = true;
+                // A synchronized frame shows once the program ends it.
+                let synchronized = entry.engine.synchronized();
+                changed |= !synchronized;
+                entry.synchronized = synchronized;
             }
             let replies = entry.engine.take_replies();
             if !replies.is_empty() {
                 let _ = transport.write(&replies);
             }
+        }
+        for (title, body) in entry.engine.take_toasts() {
+            events.push(UiMsg::Terminal(*id, Event::Notify(title, body)));
+        }
+        let (clipboard, primary) = entry.engine.take_clipboard();
+        if let Some(text) = clipboard {
+            events.push(UiMsg::Terminal(*id, Event::Clipboard(text)));
+        }
+        if let Some(text) = primary {
+            events.push(UiMsg::Terminal(*id, Event::PrimarySelection(text)));
         }
         let notes = entry.engine.notifications();
         if notes.title_revision != entry.title_seen {
@@ -592,6 +702,12 @@ pub(crate) fn pump(budget: &Budget) -> (bool, Vec<UiMsg>) {
         }
         if drained.exit.is_some() {
             entry.exit = drained.exit.clone();
+        }
+        // A program that ends inside a synchronized frame leaves it to show.
+        if drained.eof && entry.synchronized {
+            entry.engine.end_synchronized();
+            entry.synchronized = false;
+            changed = true;
         }
         // An exit is reported once the output before it has been parsed.
         if !entry.exit_reported

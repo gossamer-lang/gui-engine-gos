@@ -3,14 +3,16 @@
 //! exposes the screen as accessible text.
 
 use serde::{Deserialize, Serialize};
+use wezterm_term::color::{ColorPalette, SrgbaTuple};
+use wezterm_term::{KeyModifiers, MouseEvent, MouseEventKind};
 use windowing::{Key, MouseButton};
 
 use std::sync::Arc;
 
 use super::frame::{Color as CellColor, Frame};
 use super::keyboard;
-use super::links::Link;
-use super::{Cell, Event as TerminalEvent, with_entry};
+use super::links::{Link, Place, place};
+use super::{Cell, Event as TerminalEvent, Span, with_entry};
 use crate::accessibility::{AccessNode, Role};
 use crate::geometry::{Constraints, Rect, Size};
 use crate::memory::ByteCache;
@@ -41,6 +43,69 @@ pub struct View {
     /// The text size in points; zero takes [`DEFAULT_POINTS`].
     #[serde(default)]
     pub font_size: f64,
+    /// The colors the screen shows; `None` takes the theme's, with named
+    /// colors chosen for its light or dark background.
+    #[serde(default)]
+    pub scheme: Option<Scheme>,
+}
+
+/// A terminal's colors, each `#rrggbb`: the default text and background,
+/// the cursor, the selection and its text, and the sixteen named colors.
+/// A color that does not parse takes the theme's.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Scheme {
+    pub foreground: String,
+    pub background: String,
+    pub cursor: String,
+    pub selection: String,
+    pub selection_text: String,
+    pub ansi: Vec<String>,
+}
+
+/// The color `#rrggbb` names.
+fn hex(text: &str) -> Option<Color> {
+    let digits = text.strip_prefix('#')?;
+    if digits.len() != 6 || !digits.is_ascii() {
+        return None;
+    }
+    let channel = |at: usize| u8::from_str_radix(&digits[at..at + 2], 16).ok();
+    Some(Color::rgb(channel(0)?, channel(2)?, channel(4)?))
+}
+
+fn tuple(color: Color) -> SrgbaTuple {
+    SrgbaTuple::from((color.r, color.g, color.b))
+}
+
+fn shown(color: SrgbaTuple) -> Color {
+    let (r, g, b, _) = color.to_srgb_u8();
+    Color::rgb(r, g, b)
+}
+
+/// The palette a view shows in `theme`: its scheme's colors over the theme's
+/// own, the 256-color cube and gray ramp after the named colors.
+fn palette(v: &View, theme: &Theme) -> ColorPalette {
+    let scheme = v.scheme.clone().unwrap_or_default();
+    let pick = |text: &str, fallback: Color| hex(text).unwrap_or(fallback);
+    let background = pick(&scheme.background, theme.field);
+    let foreground = pick(&scheme.foreground, theme.text);
+    let dark = background.luminance() < 0.5;
+    let mut out = ColorPalette::default();
+    for (i, slot) in out.colors.0.iter_mut().enumerate() {
+        let i = i as u8;
+        let named = scheme.ansi.get(usize::from(i)).and_then(|text| hex(text));
+        *slot = tuple(named.unwrap_or_else(|| indexed(i, dark)));
+    }
+    out.foreground = tuple(foreground);
+    out.background = tuple(background);
+    // The theme names no caret color, so the cursor takes a neutral gray that
+    // shows on light and dark backgrounds alike.
+    out.cursor_bg = tuple(pick(&scheme.cursor, Color::rgb(134, 129, 129)));
+    out.cursor_border = out.cursor_bg;
+    out.cursor_fg = out.background;
+    out.selection_bg = tuple(pick(&scheme.selection, theme.selection));
+    out.selection_fg = tuple(pick(&scheme.selection_text, theme.selection_text));
+    out
 }
 
 impl View {
@@ -53,6 +118,7 @@ impl View {
             cols: 80,
             font: String::new(),
             font_size: 0.0,
+            scheme: None,
         }
     }
 }
@@ -145,16 +211,62 @@ fn cell_under(v: &View, theme: &Theme, x: i64, y: i64) -> Option<(u16, u16)> {
         .then_some((row as u16, col as u16))
 }
 
+/// A link at a point: a URI, or a file path that exists, with its place.
+#[derive(Debug, Clone, PartialEq)]
+enum Target {
+    Uri(Arc<str>),
+    Path(Arc<str>, Place),
+}
+
+impl Target {
+    /// The text the screen underlines while the pointer is over it.
+    fn shown(&self) -> Arc<str> {
+        match self {
+            Target::Uri(uri) | Target::Path(uri, _) => uri.clone(),
+        }
+    }
+
+    /// The URI the application hears of for its context menu.
+    fn uri(&self) -> String {
+        match self {
+            Target::Uri(uri) => uri.to_string(),
+            Target::Path(_, place) => format!("file://{}", place.path.replace('%', "%25")),
+        }
+    }
+}
+
+/// The file `text` names, from the directory terminal `id`'s program works
+/// in, when it exists; read only for the link under the pointer.
+fn locate(id: i64, text: &str) -> Option<Place> {
+    let mut found = place(text);
+    let path = std::path::Path::new(&found.path);
+    let full = if let Some(rest) = found.path.strip_prefix("~/") {
+        std::path::PathBuf::from(std::env::var_os("HOME")?).join(rest)
+    } else if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::path::PathBuf::from(super::cwd(id).ok().filter(|d| !d.is_empty())?).join(path)
+    };
+    std::fs::metadata(&full).ok()?;
+    found.path = full.to_str()?.to_string();
+    Some(found)
+}
+
 /// The link at a local point, as the screen last painted it.
-fn link_under(v: &View, theme: &Theme, x: i64, y: i64) -> Option<Arc<str>> {
+fn link_under(v: &View, theme: &Theme, x: i64, y: i64) -> Option<Target> {
     let (row, col) = cell_under(v, theme, x, y)?;
-    with_entry(v.terminal, |e| {
+    let (uri, path) = with_entry(v.terminal, |e| {
         e.links
             .iter()
             .find(|l| l.contains(row, col))
-            .map(|l| l.uri.clone())
+            .map(|l| (l.uri.clone(), l.path))
     })
-    .flatten()
+    .flatten()?;
+    if !path {
+        return Some(Target::Uri(uri));
+    }
+    let place = locate(v.terminal, &uri)?;
+    Some(Target::Path(uri, place))
 }
 
 /// Whether a press with `mods` opens the link under it: Command on macOS,
@@ -168,10 +280,11 @@ fn opens_link(mods: windowing::Mods) -> bool {
 }
 
 /// Underlines the link under the pointer, and tells whether that changed.
-fn hover(v: &View, link: Option<Arc<str>>, cx: &mut EventCx) {
-    if link.is_some() {
+fn hover(v: &View, target: Option<Target>, cx: &mut EventCx) {
+    if target.is_some() {
         cx.cursor = Some(windowing::SystemCursor::Pointer);
     }
+    let link = target.as_ref().map(Target::shown);
     let changed = with_entry(v.terminal, |e| {
         let changed = e.hovered != link;
         e.hovered = link;
@@ -184,14 +297,15 @@ fn hover(v: &View, link: Option<Arc<str>>, cx: &mut EventCx) {
 
 /// Records the link under a press, and tells the application when it is
 /// another than the last press found.
-fn point(v: &View, link: Option<Arc<str>>, cx: &mut EventCx) {
+fn point(v: &View, target: Option<&Target>, cx: &mut EventCx) {
+    let uri = target.map(Target::uri).unwrap_or_default();
+    let link: Option<Arc<str>> = (!uri.is_empty()).then(|| Arc::from(uri.as_str()));
     let changed = with_entry(v.terminal, |e| {
         let changed = e.pointed != link;
-        e.pointed = link.clone();
+        e.pointed = link;
         changed
     });
     if changed == Some(true) {
-        let uri = link.as_deref().unwrap_or_default().to_string();
         cx.emit(&UiMsg::Terminal(
             v.terminal,
             TerminalEvent::LinkPointed(uri),
@@ -274,10 +388,10 @@ fn indexed(i: u8, dark: bool) -> Color {
     }
 }
 
-fn resolve(color: &CellColor, default: Color, dark: bool) -> Color {
+fn resolve(color: &CellColor, default: Color, palette: &ColorPalette) -> Color {
     match color {
         CellColor::Default => default,
-        CellColor::Indexed(i) => indexed(*i, dark),
+        CellColor::Indexed(i) => shown(palette.colors.0[usize::from(*i)]),
         CellColor::Rgb(r, g, b) => Color::rgb(*r, *g, *b),
     }
 }
@@ -309,6 +423,36 @@ fn legible(fg: Color, bg: Color) -> Color {
     fg.mix(toward, high)
 }
 
+/// The columns of each screen row that highlights cover, as `start..end`
+/// ranges, for a screen whose top row is buffer row `top`.
+fn highlighted_rows(highlights: &[Span], top: i64, rows: i64, cols: i64) -> Vec<Vec<(i64, i64)>> {
+    let mut out = vec![Vec::new(); rows.max(0) as usize];
+    for span in highlights {
+        let first = span.start.row.max(top);
+        let last = span.end.row.min(top + rows - 1);
+        for row in first..=last {
+            let from = if row == span.start.row {
+                span.start.col
+            } else {
+                0
+            };
+            let to = if row == span.end.row {
+                span.end.col
+            } else {
+                cols
+            };
+            if from < to {
+                out[(row - top) as usize].push((from, to));
+            }
+        }
+    }
+    out
+}
+
+fn in_highlight(ranges: &[(i64, i64)], col: i64) -> bool {
+    ranges.iter().any(|(from, to)| (*from..*to).contains(&col))
+}
+
 fn in_selection(selection: Option<(Cell, Cell)>, row: i64, col: i64) -> bool {
     let Some((a, b)) = selection else {
         return false;
@@ -324,14 +468,19 @@ fn in_selection(selection: Option<(Cell, Cell)>, row: i64, col: i64) -> bool {
 pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
     let theme = cx.theme.clone();
     let r = Rect::from_size(node.size());
-    let background = theme.field;
-    let foreground = theme.text;
-    let dark = background.luminance() < 0.5;
-    cx.fill(r, background);
     let (rows, cols) = grid(v, &theme, node.size());
+    let wanted = palette(v, &theme);
+    let focused = cx.focus == v.id;
     let captured = with_entry(v.terminal, |entry| {
         // The screen follows the view's size; the program hears of it.
         super::follow_view(entry, rows as u16, cols as u16);
+        // A paint follows every change of focus, so the program hears of
+        // each one here.
+        super::focus(entry, focused && cx.active);
+        entry.engine.set_palette(&wanted);
+        let colors = entry.engine.palette();
+        let top = entry.engine.history() as i64 - entry.engine.scrollback() as i64;
+        let highlighted = highlighted_rows(&entry.highlights, top, rows, cols);
         let frame = entry.engine.frame()?;
         entry.links = frame.links().to_vec();
         if entry
@@ -341,11 +490,24 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
         {
             entry.hovered = None;
         }
-        Ok::<_, String>((frame, entry.selection, entry.hovered.clone()))
+        Ok::<_, String>((
+            frame,
+            entry.selection,
+            entry.hovered.clone(),
+            colors,
+            highlighted,
+        ))
     });
-    let Some(Ok((frame, selection, hovered))) = captured else {
+    let Some(Ok((frame, selection, hovered, colors, highlighted))) = captured else {
+        cx.fill(r, shown(wanted.background));
         return;
     };
+    let background = shown(colors.background);
+    let foreground = shown(colors.foreground);
+    let (selection_bg, selection_fg) = (shown(colors.selection_bg), shown(colors.selection_fg));
+    // Highlights read as a weaker selection, so the selected match stands out.
+    let highlight_bg = selection_bg.mix(background, 0.55);
+    cx.fill(r, background);
     let hovered: Vec<&Link> = frame
         .links()
         .iter()
@@ -354,7 +516,6 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
     let (cw, lh, style) = metrics(v, &theme);
     let pad = theme.px(PAD);
     let origin = cx.abs(r);
-    let focused = cx.focus == v.id;
     // Run layouts are kept per terminal, sized to its screen: output brings
     // rows that never come back, which the shared layout cache would hold to
     // its whole budget.
@@ -384,18 +545,23 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
                 continue;
             }
             let selected = in_selection(selection, row, col as i64);
+            let marks = &highlighted[row as usize];
+            let marked = in_highlight(marks, col as i64);
             let lit = hovered_at(&hovered, screen_row, col);
             let (mut fg, mut bg) = (
-                resolve(&cell.fg, foreground, dark),
-                resolve(&cell.bg, background, dark),
+                resolve(&cell.fg, foreground, &colors),
+                resolve(&cell.bg, background, &colors),
             );
             if cell.inverse {
                 std::mem::swap(&mut fg, &mut bg);
             }
+            if marked {
+                bg = highlight_bg;
+            }
             fg = legible(fg, bg);
             if selected {
-                fg = theme.selection_text;
-                bg = theme.selection;
+                fg = selection_fg;
+                bg = selection_bg;
             }
             if cell.dim {
                 fg = fg.mix(bg, 0.4);
@@ -416,6 +582,7 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
                     && cells[end].underline == cell.underline
                     && cells[end].dim == cell.dim
                     && in_selection(selection, row, end as i64) == selected
+                    && in_highlight(marks, end as i64) == marked
                     && hovered_at(&hovered, screen_row, end) == lit
                 {
                     end += 1;
@@ -487,7 +654,7 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
     with_entry(v.terminal, |entry| entry.layouts = layouts);
     // The cursor shows focus, filled while the terminal has it and hollow
     // otherwise, so the terminal draws no focus ring around its screen.
-    paint_cursor(&frame, focused, cx, (cw, lh, pad));
+    paint_cursor(&frame, focused, shown(colors.cursor_bg), cx, (cw, lh, pad));
 }
 
 // Lays out `text` in `run` under `key` unless the cache holds it.
@@ -504,7 +671,13 @@ fn lay_out(
     }
 }
 
-fn paint_cursor(frame: &Frame, focused: bool, cx: &mut PaintCx, (cw, lh, pad): (f64, f64, i64)) {
+fn paint_cursor(
+    frame: &Frame,
+    focused: bool,
+    color: Color,
+    cx: &mut PaintCx,
+    (cw, lh, pad): (f64, f64, i64),
+) {
     if frame.hide_cursor() {
         return;
     }
@@ -512,9 +685,6 @@ fn paint_cursor(frame: &Frame, focused: bool, cx: &mut PaintCx, (cw, lh, pad): (
     let x = pad + (f64::from(col) * cw) as i64;
     let y = pad + (f64::from(row) * lh) as i64;
     let cell = Rect::new(x, y, cw.ceil() as i64, lh as i64);
-    // The theme names no caret color, so the cursor takes a neutral gray that
-    // shows on light and dark backgrounds alike.
-    let color = Color::rgb(134, 129, 129);
     if !focused {
         cx.stroke_round(cell, 0, 1, color);
     } else if cx.caret_on {
@@ -609,9 +779,17 @@ fn printable(key: Key, shift: bool) -> Option<char> {
 }
 
 // A key whose Ctrl+Shift chord the terminal leaves to the application:
-// letters, digits, PageUp and PageDown.
-fn application_chord(key: Key) -> bool {
-    printable(key, false).is_some_and(|c| c != ' ') || key == Key::PageUp || key == Key::PageDown
+// letters, digits, PageUp and PageDown, and any other a window command
+// binds.
+fn application_chord(key: Key, mods: windowing::Mods, cx: &EventCx) -> bool {
+    let stroke = [(key, mods)];
+    printable(key, false).is_some_and(|c| c != ' ')
+        || key == Key::PageUp
+        || key == Key::PageDown
+        || cx
+            .registry
+            .iter()
+            .any(|c| c.enabled && c.shortcuts.iter().any(|s| s.progress(&stroke).0))
 }
 
 fn ime_area(v: &View, cx: &mut EventCx) {
@@ -626,6 +804,59 @@ fn ime_area(v: &View, cx: &mut EventCx) {
             0,
         ));
     }
+}
+
+/// Whether pointer events go to the program: it asked for the mouse, the
+/// view shows the live screen, and Shift does not keep them for selecting.
+fn reporting(v: &View, mods: windowing::Mods) -> bool {
+    !mods.shift
+        && with_entry(v.terminal, |e| e.engine.mouse_grabbed() && e.scrolled == 0).unwrap_or(false)
+}
+
+fn modifiers(mods: windowing::Mods) -> KeyModifiers {
+    let mut out = KeyModifiers::NONE;
+    if mods.shift {
+        out |= KeyModifiers::SHIFT;
+    }
+    if mods.alt {
+        out |= KeyModifiers::ALT;
+    }
+    if mods.ctrl {
+        out |= KeyModifiers::CTRL;
+    }
+    out
+}
+
+fn reported_button(button: MouseButton) -> Option<wezterm_term::MouseButton> {
+    match button {
+        MouseButton::Left => Some(wezterm_term::MouseButton::Left),
+        MouseButton::Middle => Some(wezterm_term::MouseButton::Middle),
+        MouseButton::Right => Some(wezterm_term::MouseButton::Right),
+        _ => None,
+    }
+}
+
+/// Reports a pointer event at a local point to the program, at the screen
+/// cell under it.
+fn report_pointer(
+    v: &View,
+    theme: &Theme,
+    (x, y): (i64, i64),
+    kind: MouseEventKind,
+    button: wezterm_term::MouseButton,
+    mods: windowing::Mods,
+) {
+    let (row, col) = cell_under(v, theme, x.max(0), y.max(0)).unwrap_or_default();
+    let event = MouseEvent {
+        kind,
+        x: usize::from(col),
+        y: i64::from(row),
+        x_pixel_offset: 0,
+        y_pixel_offset: 0,
+        button,
+        modifiers: modifiers(mods),
+    };
+    with_entry(v.terminal, |entry| super::mouse(entry, event));
 }
 
 fn redraw(cx: &mut EventCx) {
@@ -648,14 +879,31 @@ pub fn terminal_event(v: &View, node: &Node, ev: &Event, _st: &mut StateStore, c
         } => {
             cx.focus_on(&v.id);
             let link = link_under(v, &cx.theme, *x, *y);
-            point(v, link.clone(), cx);
-            if let (MouseButton::Left, Some(uri)) = (button, &link)
+            point(v, link.as_ref(), cx);
+            if let (MouseButton::Left, Some(target)) = (button, &link)
                 && opens_link(*mods)
             {
-                cx.emit(&UiMsg::Terminal(
-                    v.terminal,
-                    TerminalEvent::LinkActivated(uri.to_string()),
-                ));
+                let event = match target {
+                    Target::Uri(uri) => TerminalEvent::LinkActivated(uri.to_string()),
+                    Target::Path(_, place) => {
+                        TerminalEvent::PathActivated(place.path.clone(), place.line, place.col)
+                    }
+                };
+                cx.emit(&UiMsg::Terminal(v.terminal, event));
+                return cx.consume();
+            }
+            if reporting(v, *mods)
+                && let Some(reported) = reported_button(*button)
+            {
+                report_pointer(
+                    v,
+                    &cx.theme,
+                    (*x, *y),
+                    MouseEventKind::Press,
+                    reported,
+                    *mods,
+                );
+                cx.capture_pointer(&v.id);
                 return cx.consume();
             }
             // A right press goes on to the context menu around the terminal.
@@ -688,6 +936,11 @@ pub fn terminal_event(v: &View, node: &Node, ev: &Event, _st: &mut StateStore, c
             }
             redraw(cx);
         }
+        Event::PointerMove { x, y, mods, .. } if reporting(v, *mods) => {
+            let none = wezterm_term::MouseButton::None;
+            report_pointer(v, &cx.theme, (*x, *y), MouseEventKind::Move, none, *mods);
+            hover(v, link_under(v, &cx.theme, *x, *y), cx);
+        }
         Event::PointerMove {
             x,
             y,
@@ -708,6 +961,20 @@ pub fn terminal_event(v: &View, node: &Node, ev: &Event, _st: &mut StateStore, c
             ..
         } => hover(v, link_under(v, &cx.theme, *x, *y), cx),
         Event::PointerLeave => hover(v, None, cx),
+        Event::PointerUp { x, y, button, mods } if reporting(v, *mods) => {
+            cx.release_pointer();
+            if let Some(reported) = reported_button(*button) {
+                report_pointer(
+                    v,
+                    &cx.theme,
+                    (*x, *y),
+                    MouseEventKind::Release,
+                    reported,
+                    *mods,
+                );
+            }
+            cx.consume();
+        }
         Event::PointerUp { .. } => {
             cx.release_pointer();
             let collapsed = with_entry(v.terminal, |e| e.selection.is_some_and(|(a, b)| a == b));
@@ -720,9 +987,23 @@ pub fn terminal_event(v: &View, node: &Node, ev: &Event, _st: &mut StateStore, c
             }
             redraw(cx);
         }
-        Event::Scroll { dy, .. } => {
+        Event::Scroll { x, y, dy, mods, .. } => {
             let alternate = with_entry(v.terminal, |e| e.engine.alternate_screen());
-            if alternate == Some(false) && *dy != 0.0 {
+            // A program that asked for the mouse hears the wheel; one on the
+            // alternate screen that did not hears it as cursor keys.
+            let program = reporting(v, *mods)
+                || (alternate == Some(true)
+                    && !mods.shift
+                    && with_entry(v.terminal, |e| e.scrolled == 0).unwrap_or(false));
+            if program && *dy != 0.0 {
+                let wheel = if *dy > 0.0 {
+                    wezterm_term::MouseButton::WheelUp(1)
+                } else {
+                    wezterm_term::MouseButton::WheelDown(1)
+                };
+                report_pointer(v, &cx.theme, (*x, *y), MouseEventKind::Press, wheel, *mods);
+                cx.consume();
+            } else if alternate == Some(false) && *dy != 0.0 {
                 let rows = if *dy > 0.0 { WHEEL_ROWS } else { -WHEEL_ROWS };
                 let _ = super::scroll(v.terminal, rows);
                 redraw(cx);
@@ -785,6 +1066,11 @@ fn copy_selection(v: &View) -> bool {
 }
 
 fn key_down(v: &View, key: Key, mods: windowing::Mods, rows: i64, cx: &mut EventCx) {
+    // On macOS the Command layer belongs to the application, as in
+    // Terminal.app; programs read Ctrl and Option.
+    if cfg!(target_os = "macos") && mods.gui {
+        return;
+    }
     // Ctrl+Shift+C and Ctrl+Shift+V copy and paste, leaving Ctrl+C and
     // Ctrl+V to the program.
     if mods.ctrl && mods.shift && key == Key::C {
@@ -797,7 +1083,7 @@ fn key_down(v: &View, key: Key, mods: windowing::Mods, rows: i64, cx: &mut Event
     }
     // The rest of the Ctrl+Shift layer belongs to the application, as in
     // other desktop terminals, so those strokes reach the window's commands.
-    if mods.ctrl && mods.shift && application_chord(key) {
+    if mods.ctrl && mods.shift && application_chord(key, mods, cx) {
         return;
     }
     // F10 opens the window's menu bar, as in GNOME Terminal; Shift+F10 opens

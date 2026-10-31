@@ -124,6 +124,67 @@ fn links_are_found_across_wrapped_rows_and_marked_links_keep_their_target() {
     close(id);
 }
 
+/// Parses `budget`'s terminals until `done`, answering whether any pump
+/// that parsed output reported a change while `partial` held.
+#[cfg(unix)]
+fn pump_until(
+    budget: &Budget,
+    mut partial: impl FnMut() -> bool,
+    mut done: impl FnMut() -> bool,
+) -> bool {
+    let mut changed_while_partial = false;
+    while !done() {
+        let (changed, _) = pump(budget);
+        if changed && partial() {
+            changed_while_partial = true;
+        }
+        std::thread::yield_now();
+    }
+    changed_while_partial
+}
+
+#[cfg(unix)]
+#[test]
+fn a_synchronized_frame_is_shown_once_the_program_ends_it() {
+    let budget = Budget::new(64 * 1024 * 1024);
+    let id = create(&options(4, 30, 10), budget.clone()).unwrap();
+    let dir = std::env::temp_dir().join(format!("gui-sync-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let gate = dir.join("gate");
+    let path = std::ffi::CString::new(gate.to_str().unwrap()).unwrap();
+    // SAFETY: `path` is a NUL-terminated path in a directory this test owns.
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    let script = format!(
+        "printf '\\033[?2026hpartial'; read x < '{}'; printf ' whole\\033[?2026l'; read y",
+        gate.display()
+    );
+    spawn(
+        id,
+        &Command {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), script],
+            ..Command::default()
+        },
+    )
+    .unwrap();
+    let text = || snapshot(id).unwrap().text;
+    let held = pump_until(
+        &budget,
+        || !text().contains("whole"),
+        || text().contains("partial"),
+    );
+    assert!(!held, "a frame still open was reported as a change");
+    std::fs::write(&gate, "\n").unwrap();
+    let mut shown = false;
+    while !text().contains("whole") {
+        shown |= pump(&budget).0;
+        std::thread::yield_now();
+    }
+    assert!(shown, "the ended frame was not reported as a change");
+    close(id);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[cfg(unix)]
 mod session {
     use super::*;
@@ -626,6 +687,104 @@ mod session {
             );
             close(id);
             assert_eq!(budget.usage().0, before);
+            s.shutdown();
+        })
+    }
+
+    /// Runs `script` in a terminal shown in a session window, focused, once
+    /// it has printed "ready"; `events` collects what the terminal reports.
+    fn shown_program(name: &str, script: &str) -> (crate::Session, i64, Rc<RefCell<Vec<Event>>>) {
+        let mut s = crate::app::start(name, &format!("dev.gossamer.gui-terminal-{name}")).unwrap();
+        let id = create(&options(8, 40, 100), crate::app::effects::current_budget()).unwrap();
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let heard = events.clone();
+        s.set_shell(
+            move |m| {
+                if let UiMsg::Terminal(_, event) = m {
+                    heard.borrow_mut().push(event);
+                }
+            },
+            move |_| Widget::Terminal(widget::View::new("term", id, "Shell")),
+            |_| Vec::new(),
+        );
+        s.open_window("main", "Terminal", 420, 240).unwrap();
+        spawn(
+            id,
+            &Command {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), script.into()],
+                ..Command::default()
+            },
+        )
+        .unwrap();
+        assert!(s.focus("term").unwrap());
+        step_until(&mut s, || snapshot(id).unwrap().text.contains("ready"));
+        (s, id, events)
+    }
+
+    // Reads `n` bytes the program receives and prints them in hex after
+    // "got:", with the terminal in raw input so no line is waited for.
+    fn reading(setup: &str, n: usize) -> String {
+        format!(
+            "stty -icanon -echo min 1; printf '{setup}ready\\r\\n'; \
+             v=$(dd bs=1 count={n} 2>/dev/null | od -An -tx1 | tr -d ' \\n'); \
+             printf 'got:%s\\r\\n' \"$v\"; read x"
+        )
+    }
+
+    #[test]
+    fn a_program_that_asks_for_the_mouse_hears_a_click_as_an_sgr_report() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let script = reading("\\033[?1000h\\033[?1006h", 5);
+            let (mut s, id, _) = shown_program("mouse", &script);
+            s.click_at(60, 40).unwrap();
+            step_until(&mut s, || snapshot(id).unwrap().text.contains("got:"));
+            let shown = snapshot(id).unwrap().text;
+            assert!(shown.contains("got:1b5b3c303b"), "{shown}");
+            assert_eq!(snapshot(id).unwrap().selection, None);
+            s.shutdown();
+        })
+    }
+
+    #[test]
+    fn the_wheel_on_the_alternate_screen_sends_cursor_keys_to_a_program_without_the_mouse() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let script = reading("\\033[?1049h", 3);
+            let (mut s, id, _) = shown_program("wheel", &script);
+            s.scroll_at(60, 40, -1.0).unwrap();
+            step_until(&mut s, || snapshot(id).unwrap().text.contains("got:"));
+            let shown = snapshot(id).unwrap().text;
+            assert!(shown.contains("got:1b5b42"), "{shown}");
+            s.shutdown();
+        })
+    }
+
+    #[test]
+    fn clipboard_writes_and_notifications_reach_the_application_as_events() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let script = "printf 'ready\\r\\n\\033]52;c;Y29waWVk\\007\\033]52;p;cHJpbWFyeQ==\\007\\033]9;done\\007'; read x";
+            let (mut s, _, events) = shown_program("osc", script);
+            let wanted = [
+                Event::Clipboard("copied".into()),
+                Event::PrimarySelection("primary".into()),
+                Event::Notify(String::new(), "done".into()),
+            ];
+            step_until(&mut s, || {
+                let heard = events.borrow();
+                wanted.iter().all(|w| heard.contains(w))
+            });
             s.shutdown();
         })
     }

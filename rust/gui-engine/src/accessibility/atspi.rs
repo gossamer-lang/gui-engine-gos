@@ -7,7 +7,6 @@ mod linux {
     use std::collections::HashMap;
     use std::num::NonZeroU32;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
     use std::thread::JoinHandle;
     use std::time::{Duration, Instant};
@@ -45,18 +44,12 @@ mod linux {
         reader: Option<JoinHandle<()>>,
         waker: Arc<Mutex<Option<Waker>>>,
         embed: Option<NonZeroU32>,
-        /// Watches the desktop's accessibility switch while no assistive
-        /// technology is enabled, so the bus is joined once one is.
-        status_watch: Option<StatusWatch>,
+        /// Waiting for the desktop to turn assistive technology on, which
+        /// joins the bus.
+        waiting: bool,
         /// Joined the bus since the session last asked, so it describes
         /// every window.
         joined: bool,
-    }
-
-    struct StatusWatch {
-        connection: Connection,
-        thread: JoinHandle<()>,
-        enabled: Arc<AtomicBool>,
     }
 
     impl Adapter {
@@ -77,7 +70,7 @@ mod linux {
                 reader: None,
                 waker: Arc::new(Mutex::new(None)),
                 embed: None,
-                status_watch: None,
+                waiting: false,
                 joined: false,
             }
         }
@@ -100,14 +93,13 @@ mod linux {
         /// `poll`; false without a connection.
         pub fn watch(&mut self, waker: Waker) -> bool {
             *self.waker.lock() = Some(waker);
-            self.connection.is_some() || self.status_watch.is_some()
+            self.connection.is_some()
         }
 
         /// Whether bus traffic wakes the session, so it may wait for events
         /// without polling the bus.
         pub fn watched(&self) -> bool {
-            (self.connection.is_some() || self.status_watch.is_some())
-                && self.waker.lock().is_some()
+            self.connection.is_some() && self.waker.lock().is_some()
         }
 
         pub fn window_opened(&mut self, _key: &str, _title: &str, _window: &windowing::Window) {}
@@ -293,12 +285,9 @@ mod linux {
         }
 
         pub fn poll(&mut self) -> Vec<NativeAction> {
-            if self
-                .status_watch
-                .as_ref()
-                .is_some_and(|w| w.enabled.load(Ordering::Acquire))
-            {
-                self.stop_status_watch();
+            // The desktop's change wakes the session, which polls here.
+            if self.waiting && windowing::system::assistive_technology() {
+                self.waiting = false;
                 self.open();
                 self.joined = self.listening();
             }
@@ -348,16 +337,8 @@ mod linux {
             self.reset();
         }
 
-        fn stop_status_watch(&mut self) {
-            if let Some(w) = self.status_watch.take() {
-                // Closing the connection ends the signal stream and its thread.
-                let _ = w.connection.close();
-                let _ = w.thread.join();
-            }
-        }
-
         fn reset(&mut self) {
-            self.stop_status_watch();
+            self.waiting = false;
             if let Some(c) = self.connection.take() {
                 let _ = c.close();
             }
@@ -379,6 +360,14 @@ mod linux {
                 self.status = "Accessibility disabled".to_string();
                 return;
             }
+            // As other toolkits do, the tree is published only while the
+            // desktop says assistive technology is on: without a reader,
+            // publishing every frame costs work nothing receives.
+            if mode != "on" && !windowing::system::assistive_technology() {
+                self.status = "Assistive technology not enabled".to_string();
+                self.waiting = true;
+                return;
+            }
             let Ok(session) = connection::Builder::session()
                 .map(|b| b.method_timeout(ADDRESS_TIMEOUT))
                 .and_then(|b| b.build())
@@ -386,16 +375,6 @@ mod linux {
                 self.status = "No session bus".to_string();
                 return;
             };
-            // As other toolkits do, the tree is published only while the
-            // desktop says assistive technology is on: without a reader,
-            // publishing every frame costs work nothing receives.
-            if mode != "on" && !assistive_technology_enabled(&session) {
-                self.status = match self.watch_status(session) {
-                    Ok(()) => "Assistive technology not enabled".to_string(),
-                    Err(status) => status.to_string(),
-                };
-                return;
-            }
             let address = match bus_address(&session) {
                 Ok(address) => address,
                 Err(status) => {
@@ -562,94 +541,6 @@ mod linux {
         }
     }
 
-    const STATUS: &str = "org.a11y.Status";
-    // The switches screen readers and other assistive technology turn on.
-    const SWITCHES: [&str; 2] = ["IsEnabled", "ScreenReaderEnabled"];
-
-    // Whether the desktop's accessibility service says assistive technology
-    // is on. A desktop without the service answers no.
-    fn assistive_technology_enabled(session: &Connection) -> bool {
-        SWITCHES.iter().any(|switch| {
-            session
-                .call_method(
-                    Some("org.a11y.Bus"),
-                    "/org/a11y/bus",
-                    Some("org.freedesktop.DBus.Properties"),
-                    "Get",
-                    &(STATUS, *switch),
-                )
-                .ok()
-                .and_then(|reply| {
-                    reply
-                        .body()
-                        .deserialize::<zbus::zvariant::OwnedValue>()
-                        .ok()
-                })
-                .and_then(|value| bool::try_from(value).ok())
-                .unwrap_or(false)
-        })
-    }
-
-    impl Adapter {
-        // Subscribes before returning, so a switch turned on from now on is
-        // seen; a thread reads the signals and wakes the session.
-        fn watch_status(&mut self, session: Connection) -> Result<(), &'static str> {
-            let rule = zbus::MatchRule::builder()
-                .msg_type(MessageType::Signal)
-                .sender("org.a11y.Bus")
-                .and_then(|b| b.path("/org/a11y/bus"))
-                .and_then(|b| b.interface("org.freedesktop.DBus.Properties"))
-                .and_then(|b| b.member("PropertiesChanged"))
-                .and_then(|b| b.add_arg(STATUS))
-                .map(|b| b.build())
-                .map_err(|_| "Cannot watch the accessibility status")?;
-            let signals = MessageIterator::for_match_rule(rule, &session, Some(4))
-                .map_err(|_| "Cannot watch the accessibility status")?;
-            let enabled = Arc::new(AtomicBool::new(false));
-            let seen = enabled.clone();
-            let waker = self.waker.clone();
-            let thread = std::thread::Builder::new()
-                .name("gui-a11y-status".to_string())
-                .spawn(move || {
-                    for message in signals.flatten() {
-                        type Changed = (
-                            String,
-                            HashMap<String, zbus::zvariant::OwnedValue>,
-                            Vec<String>,
-                        );
-                        let Ok((_, changed, _)) = message.body().deserialize::<Changed>() else {
-                            continue;
-                        };
-                        let on = SWITCHES.iter().any(|switch| {
-                            changed
-                                .get(*switch)
-                                .and_then(|v| v.try_clone().ok())
-                                .and_then(|v| bool::try_from(v).ok())
-                                .unwrap_or(false)
-                        });
-                        if on {
-                            seen.store(true, Ordering::Release);
-                            if let Some(w) = &*waker.lock() {
-                                let _ = w.wake();
-                            }
-                            return;
-                        }
-                    }
-                })
-                .map_err(|_| "Cannot watch the accessibility status")?;
-            // A switch turned on between the first read and the subscription.
-            if assistive_technology_enabled(&session) {
-                enabled.store(true, Ordering::Release);
-            }
-            self.status_watch = Some(StatusWatch {
-                connection: session,
-                thread,
-                enabled,
-            });
-            Ok(())
-        }
-    }
-
     // The accessibility bus address the session bus's a11y service hands out.
     fn bus_address(session: &Connection) -> Result<String, &'static str> {
         let reply = session
@@ -683,100 +574,6 @@ mod linux {
             if let Some(w) = &*waker.lock() {
                 let _ = w.wake();
             }
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use std::io::{BufRead, BufReader};
-        use std::process::{Child, Command, Stdio};
-
-        use super::*;
-
-        // A message bus of the test's own, killed when it is dropped.
-        struct Bus {
-            daemon: Child,
-            address: String,
-        }
-
-        impl Bus {
-            fn start() -> Bus {
-                let mut daemon = Command::new("dbus-daemon")
-                    .args(["--session", "--nofork", "--print-address=1"])
-                    .stdout(Stdio::piped())
-                    .spawn()
-                    .expect("dbus-daemon runs");
-                let mut address = String::new();
-                BufReader::new(daemon.stdout.take().expect("piped stdout"))
-                    .read_line(&mut address)
-                    .expect("the daemon prints its address");
-                Bus {
-                    daemon,
-                    address: address.trim().to_string(),
-                }
-            }
-
-            fn connect(&self) -> Connection {
-                connection::Builder::address(self.address.as_str())
-                    .and_then(|b| b.build())
-                    .expect("a connection to the test bus")
-            }
-        }
-
-        impl Drop for Bus {
-            fn drop(&mut self) {
-                let _ = self.daemon.kill();
-                let _ = self.daemon.wait();
-            }
-        }
-
-        // Answers `Get` for the status switches, all off, as a desktop with
-        // no assistive technology does.
-        fn serve_status(service: &Connection) -> JoinHandle<()> {
-            service
-                .request_name("org.a11y.Bus")
-                .expect("the service name");
-            let calls = MessageIterator::from(service);
-            let replies = service.clone();
-            std::thread::spawn(move || {
-                for call in calls.flatten() {
-                    if call.message_type() == MessageType::MethodCall
-                        && call.header().member().is_some_and(|m| m == "Get")
-                    {
-                        let off = zbus::zvariant::Value::from(false);
-                        let _ = replies.reply(&call.header(), &off);
-                    }
-                }
-            })
-        }
-
-        #[test]
-        fn the_bus_is_joined_only_once_the_desktop_turns_assistive_technology_on() {
-            let bus = Bus::start();
-            let service = bus.connect();
-            let server = serve_status(&service);
-            let session = bus.connect();
-            assert!(!assistive_technology_enabled(&session));
-            let mut adapter = Adapter::detached("test");
-            adapter.watch_status(session).expect("the status watch");
-            let mut changed = HashMap::new();
-            changed.insert("ScreenReaderEnabled", zbus::zvariant::Value::from(true));
-            service
-                .emit_signal(
-                    None::<&str>,
-                    "/org/a11y/bus",
-                    "org.freedesktop.DBus.Properties",
-                    "PropertiesChanged",
-                    &(STATUS, changed, Vec::<String>::new()),
-                )
-                .expect("the change is sent");
-            let watch = adapter.status_watch.take().expect("a watch while off");
-            // The watcher ends once it has seen a switch turn on.
-            watch.thread.join().expect("the watcher ends");
-            assert!(watch.enabled.load(Ordering::Acquire));
-            let _ = watch.connection.close();
-            let _ = service.close();
-            server.join().expect("the service ends");
         }
     }
 }

@@ -123,6 +123,8 @@ pub struct Face {
     num_hmetrics: i64,
     cmap: i64,
     cmap_format: i64,
+    /// The glyph ids of the ASCII characters, read from `cmap` once.
+    ascii: [u16; 128],
     cff: Option<Cff>,
     /// Offsets of the color bitmap location and data tables, or -1.
     cblc: i64,
@@ -178,6 +180,7 @@ impl Default for Face {
             num_hmetrics: 0,
             cmap: 0,
             cmap_format: 0,
+            ascii: [0; 128],
             cff: None,
             cblc: -1,
             cbdt: -1,
@@ -251,6 +254,10 @@ impl Face {
         face.read_head()?;
         face.read_metrics()?;
         face.read_cmap()?;
+        // Text is mostly ASCII, so its glyphs skip the cmap search.
+        for (code, glyph) in (0u8..128).zip(0..) {
+            face.ascii[glyph] = u16::try_from(face.lookup_glyph(char::from(code))).unwrap_or(0);
+        }
         face.read_names();
         if let Some((cblc, _)) = face.tables.get("CBLC")
             && let Some((cbdt, _)) = face.tables.get("CBDT")
@@ -457,6 +464,14 @@ impl Face {
 
     /// The glyph id for `c`, or 0 (the missing glyph).
     pub fn glyph_for(&self, c: char) -> i64 {
+        match self.ascii.get(c as usize) {
+            Some(&glyph) => i64::from(glyph),
+            None => self.lookup_glyph(c),
+        }
+    }
+
+    // The glyph id `cmap` maps `c` to, or 0.
+    fn lookup_glyph(&self, c: char) -> i64 {
         let code = c as i64;
         let d = &self.data;
         let t = self.cmap;

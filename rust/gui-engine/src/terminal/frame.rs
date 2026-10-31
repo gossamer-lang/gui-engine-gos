@@ -8,9 +8,47 @@ pub enum Color {
     Indexed(u8),
     Rgb(u8, u8, u8),
 }
+/// A cell's text: nothing, one ASCII character, or a longer grapheme. Most
+/// cells are blank or ASCII, so a frame stores those without allocating.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum CellText {
+    #[default]
+    Empty,
+    Ascii(u8),
+    Other(Box<str>),
+}
+impl CellText {
+    fn new(text: &str) -> CellText {
+        match text.as_bytes() {
+            [] => CellText::Empty,
+            [byte] if byte.is_ascii() => CellText::Ascii(*byte),
+            _ => CellText::Other(text.into()),
+        }
+    }
+    pub fn as_str(&self) -> &str {
+        match self {
+            CellText::Empty => "",
+            // An ASCII byte is always a whole UTF-8 character.
+            CellText::Ascii(byte) => std::str::from_utf8(std::slice::from_ref(byte)).unwrap_or(""),
+            CellText::Other(text) => text,
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        matches!(self, CellText::Empty)
+    }
+    pub fn len(&self) -> usize {
+        self.as_str().len()
+    }
+    pub fn is_ascii(&self) -> bool {
+        match self {
+            CellText::Other(text) => text.is_ascii(),
+            _ => true,
+        }
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Cell {
-    pub text: String,
+    pub text: CellText,
     pub continuation: bool,
     pub wide: bool,
     pub fg: Color,
@@ -58,8 +96,8 @@ impl Frame {
                         Slot::Cell(cell, attrs, wide) => {
                             (cell_text(cell, attrs), false, wide, Some(attrs))
                         }
-                        Slot::Continuation => (String::new(), true, false, None),
-                        Slot::Blank => (String::new(), false, false, None),
+                        Slot::Continuation => ("", true, false, None),
+                        Slot::Blank => ("", false, false, None),
                     };
                     positions.push(if continuation { previous } else { text.len() });
                     if !continuation {
@@ -67,7 +105,7 @@ impl Frame {
                         if shown.is_empty() {
                             text.push(' ');
                         } else {
-                            text.push_str(&shown);
+                            text.push_str(shown);
                         }
                     }
                     let uri = match slot {
@@ -78,7 +116,7 @@ impl Frame {
                     let (bold, dim, italic, underline, inverse) =
                         attrs.map(styles).unwrap_or_default();
                     cells_of_row.push(Cell {
-                        text: shown,
+                        text: CellText::new(shown),
                         continuation,
                         wide,
                         fg: attrs.map_or(Color::Default, |a| color(a.foreground())),

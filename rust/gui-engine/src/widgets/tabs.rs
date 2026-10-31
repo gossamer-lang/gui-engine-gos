@@ -34,6 +34,10 @@ pub struct TabItem {
     pub dirty: bool,
     /// Work in progress: the strip shows activity.
     pub busy: bool,
+    /// Something in the tab asks for the user, such as a bell from its
+    /// program: the strip marks the tab in the accent color.
+    #[serde(default)]
+    pub attention: bool,
     /// Pinned tabs sit first, show no close button, and refuse close.
     pub pinned: bool,
     pub closable: bool,
@@ -48,9 +52,16 @@ impl TabItem {
             tooltip: String::new(),
             dirty: false,
             busy: false,
+            attention: false,
             pinned: false,
             closable: true,
         }
+    }
+
+    pub fn attention(self, attention: bool) -> TabItem {
+        let mut t = self;
+        t.attention = attention;
+        t
     }
 
     pub fn dirty(self, dirty: bool) -> TabItem {
@@ -240,7 +251,7 @@ fn natural_width(strip: &Tabs, t: &TabItem, theme: &Theme) -> i64 {
     if t.icon.is_some() {
         w += theme.px(theme.shape.small_icon + 6)
     };
-    if t.dirty || t.busy {
+    if t.dirty || t.busy || t.attention {
         w += theme.px(14)
     };
     if t.shows_close() {
@@ -492,7 +503,7 @@ pub fn paint_tabs(t: &Tabs, node: &Node, cx: &mut PaintCx) {
         } else {
             close.x - theme.px(4)
         };
-        let mark_w = if item.dirty || item.busy {
+        let mark_w = if item.dirty || item.busy || item.attention {
             theme.px(14)
         } else {
             0
@@ -514,6 +525,8 @@ pub fn paint_tabs(t: &Tabs, node: &Node, cx: &mut PaintCx) {
             if item.busy {
                 cx.canvas
                     .circle_stroke(mx, my, theme.px(4), theme.px(2), theme.accent)
+            } else if item.attention {
+                cx.canvas.circle(mx, my, theme.px(4), theme.accent)
             } else {
                 cx.canvas.circle(mx, my, theme.px(4), fg)
             }
@@ -672,7 +685,7 @@ fn popup_rows(t: &Tabs, st: &StateStore) -> Vec<(String, String)> {
         for item in &t.items {
             rows.push((
                 item.key.clone(),
-                if item.dirty {
+                if item.dirty || item.attention {
                     format!("{} •", item.title)
                 } else {
                     item.title.clone()
@@ -1106,6 +1119,13 @@ pub fn tabs_semantics(t: &Tabs) -> Option<AccessNode> {
             crate::localization::message(
                 "tabs",
                 "{title}, modified",
+                1,
+                &crate::hmap! { "title" => item.title.clone() },
+            )
+        } else if item.attention {
+            crate::localization::message(
+                "tabs",
+                "{title}, needs attention",
                 1,
                 &crate::hmap! { "title" => item.title.clone() },
             )

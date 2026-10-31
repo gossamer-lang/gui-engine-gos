@@ -2,7 +2,7 @@
 
 use serde::Serialize;
 
-use super::{Cell, Command, Options, Snapshot};
+use super::{Cell, Command, Options, Snapshot, Span};
 
 #[derive(Serialize)]
 enum Answer {
@@ -11,6 +11,7 @@ enum Answer {
     Text(String),
     Snapshot(Snapshot),
     Lines(Vec<super::engine::Row>),
+    Zones(Vec<super::engine::Zone>),
     Done,
 }
 
@@ -81,6 +82,13 @@ pub fn call(method: &str, id: i64, text: &str) -> Result<String, String> {
             Answer::Done
         }
         "rows" => Answer::Lines(super::rows(id)?),
+        "cwd" => Answer::Text(super::cwd(id)?),
+        "zones" => Answer::Zones(super::zones(id)?),
+        "highlight" => {
+            let spans: Vec<Span> = args(text)?;
+            super::highlight(id, spans)?;
+            Answer::Done
+        }
         "copy" => Answer::Text(super::copy(id)?),
         "snapshot" => Answer::Snapshot(super::snapshot(id)?),
         "close" => {

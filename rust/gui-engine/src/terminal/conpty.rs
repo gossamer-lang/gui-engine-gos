@@ -240,6 +240,11 @@ impl Pty {
         self.pid
     }
 
+    /// A console names no directory for the program that holds it.
+    pub fn cwd(&self) -> Option<String> {
+        None
+    }
+
     /// A console does not say which program holds it, so no job is reported.
     pub fn busy(&self) -> bool {
         false

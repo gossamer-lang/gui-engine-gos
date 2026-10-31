@@ -8,6 +8,8 @@ use parking_lot::{Condvar, Mutex};
 
 pub(crate) const STACK: usize = 256 * 1024;
 pub(crate) const CHUNK: usize = 8192;
+/// The most output one pass of a reader collects before queueing it.
+pub(crate) const BATCH: usize = 64 * 1024;
 pub(crate) const INPUT: usize = 64 * 1024;
 pub(crate) const OUTPUT: usize = 256 * 1024;
 const CHUNK_LIMIT: usize = 64;
@@ -66,6 +68,16 @@ impl Queue {
         state.chunks.push_back(bytes);
         self.changed.notify_all();
         Ok(wake)
+    }
+
+    /// Waits until the owner has taken every queued chunk; false once the
+    /// queue is closed.
+    pub(crate) fn wait_empty(&self) -> bool {
+        let mut state = self.state.lock();
+        while !state.closed && !state.chunks.is_empty() {
+            self.changed.wait(&mut state);
+        }
+        !state.closed
     }
 
     /// The next chunk; blocks while the queue is open and empty.

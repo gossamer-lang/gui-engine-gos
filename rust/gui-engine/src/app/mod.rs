@@ -1578,6 +1578,8 @@ impl Session {
             windowing::Event::FocusGained { window } => {
                 let w = self.find_native(*window);
                 if w >= 0 {
+                    let key = self.windows[w as usize].key.clone();
+                    self.pending.push(UiMsg::WindowFocus(key, true));
                     self.windows[w as usize].active = true;
                     self.windows[w as usize].focused_once = true;
                     self.windows[w as usize].caret_on = true;
@@ -1588,6 +1590,8 @@ impl Session {
             windowing::Event::FocusLost { window } => {
                 let w = self.find_native(*window);
                 if w >= 0 {
+                    let key = self.windows[w as usize].key.clone();
+                    self.pending.push(UiMsg::WindowFocus(key, false));
                     // Interrupted input clears press, capture, and pending chords.
                     self.windows[w as usize].active = false;
                     self.windows[w as usize].pressed = String::new();
@@ -3585,6 +3589,17 @@ impl Session {
                 Effect::SetMinSize(window, width, height) => {
                     self.set_min_size(&window, width, height)?
                 }
+                Effect::RequestAttention(window) => {
+                    let w = self.find(&window);
+                    if w >= 0
+                        && !self.windows[w as usize].native.has_focus()
+                        && let Err(e) = self.windows[w as usize]
+                            .native
+                            .request_attention(windowing::Attention::UntilFocused)
+                    {
+                        self.log_line(&format!("window attention unavailable: {}", e))
+                    }
+                }
                 Effect::SetFullscreen(window, on) => {
                     let w = self.find(&window);
                     if w >= 0
@@ -3693,6 +3708,9 @@ impl Session {
                 }
                 Effect::Emit(message) => self.pending.push(message),
                 Effect::SetClipboard(text) => crate::services::clipboard::set_text(&text),
+                Effect::SetPrimarySelection(text) => {
+                    crate::services::clipboard::set_primary_text(&text)
+                }
                 Effect::OpenUrl(url) => {
                     if let Err(err) = services::open_url(&url) {
                         self.log_line(&format!("open url failed: {}", err))

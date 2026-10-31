@@ -42,6 +42,9 @@ pub enum Effect {
     SetMinSize(String, i64, i64),
     /// Makes a window cover its display (true) or go back to its own frame.
     SetFullscreen(String, bool),
+    /// Asks the desktop to draw the user to a window that lacks focus, until
+    /// it gains it; a focused window needs no attention and is left alone.
+    RequestAttention(String),
     /// Ends the session (after asking documents, when close is deferred).
     Quit,
     /// Moves keyboard focus to the widget `id` in the main window.
@@ -78,6 +81,9 @@ pub enum Effect {
     /// Closes the toast `id` without reporting anything.
     DismissToast(String),
     SetClipboard(String),
+    /// Sets the primary selection, which a middle click pastes, where the
+    /// platform has one (X11 and Wayland).
+    SetPrimarySelection(String),
     OpenUrl(String),
     RevealFile(String),
     SetTheme(ThemeKind),

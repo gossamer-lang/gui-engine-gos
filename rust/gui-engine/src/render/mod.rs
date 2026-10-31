@@ -1011,25 +1011,24 @@ pub fn blend_rect(
     if x0 >= x1 || y0 >= y1 {
         return;
     }
-    let solid = opacity >= 255;
-    let mut row = y0;
-    while row < y1 {
-        let mut col = x0;
-        while col < x1 {
-            let o = row * stride + col * 4;
-            if solid {
-                fb[o as usize] = color.r;
-                fb[(o + 1) as usize] = color.g;
-                fb[(o + 2) as usize] = color.b
-            } else {
-                fb[o as usize] = mix(fb[o as usize], color.r, opacity);
-                fb[(o + 1) as usize] = mix(fb[(o + 1) as usize], color.g, opacity);
-                fb[(o + 2) as usize] = mix(fb[(o + 2) as usize], color.b, opacity)
+    // Whole pixels a row at a time, so a solid fill compiles to wide stores.
+    let solid = [color.r, color.g, color.b, 255];
+    for row in y0..y1 {
+        let start = (row * stride + x0 * 4) as usize;
+        let end = (row * stride + x1 * 4) as usize;
+        let pixels = fb[start..end].as_chunks_mut::<4>().0;
+        if opacity >= 255 {
+            pixels.fill(solid);
+        } else {
+            for p in pixels {
+                *p = [
+                    mix(p[0], color.r, opacity),
+                    mix(p[1], color.g, opacity),
+                    mix(p[2], color.b, opacity),
+                    255,
+                ];
             }
-            fb[(o + 3) as usize] = 255;
-            col += 1;
         }
-        row += 1;
     }
 }
 

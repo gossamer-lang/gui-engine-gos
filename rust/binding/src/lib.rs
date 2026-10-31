@@ -42,6 +42,7 @@ register_module!(
 
     fn start(name: String, app_id: String) -> Result<i64, String> {
         gui_engine::callback::set_host(host::call);
+        windowing::idle::set_thread_idle(gossamer_binding::mark_thread_idle);
         gui_engine::app::start(&name, &app_id).map(session::add).map_err(|e| e.to_string())
     }
 

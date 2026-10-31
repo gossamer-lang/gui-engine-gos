@@ -640,7 +640,7 @@ dependencies = [
 
 [[package]]
 name = "gossamer-binding"
-version = "0.75.8"
+version = "0.75.9"
 dependencies = [
  "gossamer-binding-abi",
  "gossamer-binding-macros",
@@ -652,11 +652,11 @@ dependencies = [
 
 [[package]]
 name = "gossamer-binding-abi"
-version = "0.75.8"
+version = "0.75.9"
 
 [[package]]
 name = "gossamer-binding-macros"
-version = "0.75.8"
+version = "0.75.9"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -667,6 +667,7 @@ dependencies = [
 name = "gui-engine"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "encoding_rs",
  "gif",
  "gos-windowing",
@@ -1919,7 +1920,7 @@ dependencies = [
 [[package]]
 name = "vtparse"
 version = "0.7.0"
-source = "git+https://github.com/gossamer-lang/wezterm-lite?tag=v0.1.0#0eb0184e3755714b1b1f16219dca370da1272076"
+source = "git+https://github.com/gossamer-lang/wezterm-lite?tag=v0.1.0#a26e7323ac47ec86e581869a0835ce3f1a881ed6"
 dependencies = [
  "utf8parse",
 ]
@@ -2039,7 +2040,7 @@ checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
 [[package]]
 name = "wezterm-bidi"
 version = "0.2.3"
-source = "git+https://github.com/gossamer-lang/wezterm-lite?tag=v0.1.0#0eb0184e3755714b1b1f16219dca370da1272076"
+source = "git+https://github.com/gossamer-lang/wezterm-lite?tag=v0.1.0#a26e7323ac47ec86e581869a0835ce3f1a881ed6"
 dependencies = [
  "log",
  "wezterm-dynamic",
@@ -2048,7 +2049,7 @@ dependencies = [
 [[package]]
 name = "wezterm-cell"
 version = "0.1.0"
-source = "git+https://github.com/gossamer-lang/wezterm-lite?tag=v0.1.0#0eb0184e3755714b1b1f16219dca370da1272076"
+source = "git+https://github.com/gossamer-lang/wezterm-lite?tag=v0.1.0#a26e7323ac47ec86e581869a0835ce3f1a881ed6"
 dependencies = [
  "finl_unicode",
  "serde",
@@ -2061,7 +2062,7 @@ dependencies = [
 [[package]]
 name = "wezterm-char-props"
 version = "0.1.3"
-source = "git+https://github.com/gossamer-lang/wezterm-lite?tag=v0.1.0#0eb0184e3755714b1b1f16219dca370da1272076"
+source = "git+https://github.com/gossamer-lang/wezterm-lite?tag=v0.1.0#a26e7323ac47ec86e581869a0835ce3f1a881ed6"
 dependencies = [
  "phf",
  "serde",
@@ -2071,7 +2072,7 @@ dependencies = [
 [[package]]
 name = "wezterm-color-types"
 version = "0.3.0"
-source = "git+https://github.com/gossamer-lang/wezterm-lite?tag=v0.1.0#0eb0184e3755714b1b1f16219dca370da1272076"
+source = "git+https://github.com/gossamer-lang/wezterm-lite?tag=v0.1.0#a26e7323ac47ec86e581869a0835ce3f1a881ed6"
 dependencies = [
  "csscolorparser",
  "deltae",
@@ -2083,7 +2084,7 @@ dependencies = [
 [[package]]
 name = "wezterm-dynamic"
 version = "0.2.1"
-source = "git+https://github.com/gossamer-lang/wezterm-lite?tag=v0.1.0#0eb0184e3755714b1b1f16219dca370da1272076"
+source = "git+https://github.com/gossamer-lang/wezterm-lite?tag=v0.1.0#a26e7323ac47ec86e581869a0835ce3f1a881ed6"
 dependencies = [
  "log",
  "ordered-float",
@@ -2095,7 +2096,7 @@ dependencies = [
 [[package]]
 name = "wezterm-dynamic-derive"
 version = "0.1.1"
-source = "git+https://github.com/gossamer-lang/wezterm-lite?tag=v0.1.0#0eb0184e3755714b1b1f16219dca370da1272076"
+source = "git+https://github.com/gossamer-lang/wezterm-lite?tag=v0.1.0#a26e7323ac47ec86e581869a0835ce3f1a881ed6"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2105,7 +2106,7 @@ dependencies = [
 [[package]]
 name = "wezterm-escape-parser"
 version = "0.1.0"
-source = "git+https://github.com/gossamer-lang/wezterm-lite?tag=v0.1.0#0eb0184e3755714b1b1f16219dca370da1272076"
+source = "git+https://github.com/gossamer-lang/wezterm-lite?tag=v0.1.0#a26e7323ac47ec86e581869a0835ce3f1a881ed6"
 dependencies = [
  "base64",
  "bitflags 2.13.2",
@@ -2124,7 +2125,7 @@ dependencies = [
 [[package]]
 name = "wezterm-input-types"
 version = "0.1.0"
-source = "git+https://github.com/gossamer-lang/wezterm-lite?tag=v0.1.0#0eb0184e3755714b1b1f16219dca370da1272076"
+source = "git+https://github.com/gossamer-lang/wezterm-lite?tag=v0.1.0#a26e7323ac47ec86e581869a0835ce3f1a881ed6"
 dependencies = [
  "bitflags 1.3.2",
  "euclid",
@@ -2135,7 +2136,7 @@ dependencies = [
 [[package]]
 name = "wezterm-surface"
 version = "0.1.0"
-source = "git+https://github.com/gossamer-lang/wezterm-lite?tag=v0.1.0#0eb0184e3755714b1b1f16219dca370da1272076"
+source = "git+https://github.com/gossamer-lang/wezterm-lite?tag=v0.1.0#a26e7323ac47ec86e581869a0835ce3f1a881ed6"
 dependencies = [
  "bitflags 2.13.2",
  "fancy-regex",
@@ -2156,7 +2157,7 @@ dependencies = [
 [[package]]
 name = "wezterm-term"
 version = "0.1.0"
-source = "git+https://github.com/gossamer-lang/wezterm-lite?tag=v0.1.0#0eb0184e3755714b1b1f16219dca370da1272076"
+source = "git+https://github.com/gossamer-lang/wezterm-lite?tag=v0.1.0#a26e7323ac47ec86e581869a0835ce3f1a881ed6"
 dependencies = [
  "anyhow",
  "bitflags 1.3.2",

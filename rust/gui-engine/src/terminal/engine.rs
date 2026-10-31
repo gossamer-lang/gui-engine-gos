@@ -8,8 +8,9 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use wezterm_term::color::{ColorAttribute, ColorPalette};
 use wezterm_term::{
-    Alert, AlertHandler, CellAttributes, CursorVisibility, Intensity, Line, StableRowIndex,
-    Terminal, TerminalConfiguration, TerminalSize, Underline,
+    Alert, AlertHandler, CellAttributes, Clipboard, ClipboardSelection, CursorVisibility,
+    Intensity, Line, MouseEvent, SemanticType, StableRowIndex, Terminal, TerminalConfiguration,
+    TerminalSize, Underline,
 };
 
 use crate::memory::{Budget, Lease};
@@ -17,6 +18,7 @@ use crate::memory::{Budget, Lease};
 /// One terminal's parser, screen and scrollback, charged to a session budget.
 pub struct Engine {
     term: Terminal,
+    config: Arc<Config>,
     notes: Arc<Mutex<Notifications>>,
     /// The top row shown while the view is scrolled back, as a row index that
     /// stays with its line as output scrolls; None shows the live screen.
@@ -32,10 +34,11 @@ pub struct Engine {
 }
 
 /// What the terminal core asks of its host: the scrollback to keep and the
-/// palette. Clipboard access stays off because no clipboard is attached.
+/// palette its view shows, which a program's color queries answer from.
 #[derive(Debug)]
 struct Config {
     history: usize,
+    palette: Mutex<ColorPalette>,
 }
 
 impl TerminalConfiguration for Config {
@@ -44,11 +47,16 @@ impl TerminalConfiguration for Config {
     }
 
     fn color_palette(&self) -> ColorPalette {
-        ColorPalette::default()
+        self.palette.lock().clone()
     }
 }
 
-/// Receives what the terminal reports while it parses: titles and bells.
+/// The most desktop notifications a terminal holds before the session
+/// hears of them; a program that sends more loses the oldest.
+const TOAST_LIMIT: usize = 8;
+
+/// Receives what the terminal reports while it parses: titles, bells and
+/// desktop notifications.
 struct Alerts(Arc<Mutex<Notifications>>);
 
 impl AlertHandler for Alerts {
@@ -57,10 +65,47 @@ impl AlertHandler for Alerts {
         match alert {
             Alert::WindowTitleChanged(title) => notes.set_title(&title),
             Alert::Bell => notes.bells = notes.bells.saturating_add(1),
+            Alert::ToastNotification { title, body, .. } => {
+                if notes.toasts.len() == TOAST_LIMIT {
+                    notes.toasts.pop_front();
+                }
+                let title = printable(title.as_deref().unwrap_or_default(), 256);
+                let body = printable(&body, 1024);
+                notes.toasts.push_back((title, body));
+            }
             // Colors are the view's, and the session already redraws on every
             // change.
             _ => {}
         }
+    }
+}
+
+/// `text` without control characters, at most `limit` characters long.
+fn printable(text: &str, limit: usize) -> String {
+    text.chars()
+        .filter(|c| !c.is_control())
+        .take(limit)
+        .collect()
+}
+
+/// Takes what a program writes to the clipboard (OSC 52). Nothing reads the
+/// clipboard back: the core has no path for a program to query it.
+struct Clip(Arc<Mutex<Notifications>>);
+
+impl Clipboard for Clip {
+    fn set_contents(
+        &self,
+        selection: ClipboardSelection,
+        data: Option<String>,
+    ) -> anyhow::Result<()> {
+        if let Some(text) = data {
+            let mut notes = self.0.lock();
+            match selection {
+                ClipboardSelection::Clipboard => notes.clipboard = Some(text),
+                ClipboardSelection::PrimarySelection => notes.primary = Some(text),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -98,13 +143,20 @@ enum FilterState {
     IgnoredEscape,
 }
 
-/// The title, bell count and pending replies a terminal has reported.
+/// The title, bell count, notifications, clipboard text and pending replies a
+/// terminal has reported.
 #[derive(Default, Clone)]
 pub struct Notifications {
     pub title: String,
     /// Increments whenever the program sets a title.
     pub title_revision: u64,
     pub bells: u64,
+    /// Desktop notifications (OSC 9 and 777), as title and body.
+    toasts: std::collections::VecDeque<(String, String)>,
+    /// The last text the program wrote to the clipboard and to the primary
+    /// selection.
+    clipboard: Option<String>,
+    primary: Option<String>,
     replies: std::collections::VecDeque<Vec<u8>>,
     reply_bytes: usize,
     pub dropped_replies: usize,
@@ -128,12 +180,30 @@ impl Notifications {
     }
 }
 const OSC_LIMIT: usize = 4096;
+/// The longest clipboard write (OSC 52) the filter holds: base64 of about
+/// 768 KiB of text.
+const CLIPBOARD_LIMIT: usize = 1024 * 1024;
 impl Filter {
     /// The bytes of `input` the parser may see, in order: OSC strings only
     /// when complete and bounded, and no DCS, APC, SOS or PM payloads.
     fn pass(&mut self, input: &[u8], out: &mut Vec<u8>) {
         use FilterState::*;
-        for &byte in input {
+        let mut at = 0;
+        while at < input.len() {
+            // Text between sequences passes as it is, a stretch at a time.
+            if self.state == Ground {
+                let end = input[at..]
+                    .iter()
+                    .position(|&b| b == 0x1b)
+                    .map_or(input.len(), |p| at + p);
+                out.extend_from_slice(&input[at..end]);
+                at = end;
+                if at == input.len() {
+                    break;
+                }
+            }
+            let byte = input[at];
+            at += 1;
             self.state = match self.state {
                 Ground if byte == 0x1b => Escape,
                 Ground => {
@@ -164,7 +234,12 @@ impl Filter {
                 Osc | OscEscape => {
                     let done = byte == 7 || (self.state == OscEscape && byte == b'\\');
                     if !self.overflow {
-                        if self.string.len() < OSC_LIMIT {
+                        let limit = if self.string.starts_with(b"\x1b]52;") {
+                            CLIPBOARD_LIMIT
+                        } else {
+                            OSC_LIMIT
+                        };
+                        if self.string.len() < limit {
                             self.string.push(byte);
                         } else {
                             self.string.clear();
@@ -257,11 +332,14 @@ pub(crate) fn slots(line: &Line, cols: u16) -> Vec<Slot<'_>> {
 /// One cell's text as shown: its character and any combining marks on it,
 /// bounded so a run of marks cannot grow a frame without limit; blank for a
 /// space, a tab's cell, or hidden text.
-pub(crate) fn cell_text(text: &str, attrs: &CellAttributes) -> String {
+pub(crate) fn cell_text<'a>(text: &'a str, attrs: &CellAttributes) -> &'a str {
     if attrs.invisible() || text == " " || text == "\t" {
-        return String::new();
+        return "";
     }
-    text.chars().take(17).collect()
+    match text.char_indices().nth(17) {
+        Some((end, _)) => &text[..end],
+        None => text,
+    }
 }
 
 /// A visible row as text: a wide character is one character over two cells,
@@ -275,7 +353,7 @@ fn row_text(line: &Line, cols: u16) -> String {
                 if shown.is_empty() {
                     text.push(' ');
                 } else {
-                    text.push_str(&shown);
+                    text.push_str(shown);
                 }
             }
             Slot::Continuation => {}
@@ -326,17 +404,24 @@ impl Engine {
         }
         let lease = budget.reserve(bytes)?;
         let notes = Arc::new(Mutex::new(Notifications::default()));
+        let config = Arc::new(Config {
+            history,
+            palette: Mutex::new(ColorPalette::default()),
+        });
         let mut term = Terminal::new(
             terminal_size(rows, cols),
-            Arc::new(Config { history }),
+            config.clone(),
             "xterm-256color",
             env!("CARGO_PKG_VERSION"),
             Box::new(Replies(notes.clone())),
         );
         term.set_notification_handler(Box::new(Alerts(notes.clone())));
+        let clipboard: Arc<dyn Clipboard> = Arc::new(Clip(notes.clone()));
+        term.set_clipboard(&clipboard);
         Ok(Self {
             charged: bytes,
             term,
+            config,
             notes,
             view_top: None,
             filter: Filter::default(),
@@ -574,6 +659,127 @@ impl Engine {
     pub fn dropped_controls(&self) -> usize {
         self.filter.dropped
     }
+    /// Makes `palette` the one the screen shows and a program's color queries
+    /// answer from; colors the program set itself stay over it.
+    pub fn set_palette(&mut self, palette: &ColorPalette) {
+        let mut held = self.config.palette.lock();
+        if *held != *palette {
+            *held = palette.clone();
+        }
+    }
+    /// The colors the screen shows: the view's palette with any the program
+    /// set (OSC 4, 10, 11, 12) over it.
+    pub fn palette(&self) -> ColorPalette {
+        self.term.palette()
+    }
+    /// Whether the program asked for the mouse.
+    pub fn mouse_grabbed(&self) -> bool {
+        self.term.is_mouse_grabbed()
+    }
+    /// Reports a pointer event to the program as it asked (or as cursor keys
+    /// for the wheel on the alternate screen); the bytes wait in the replies.
+    pub fn mouse(&mut self, event: MouseEvent) {
+        // An event the program asked for nothing about is not reported.
+        let _ = self.term.mouse_event(event);
+    }
+    /// Tells the program the view gained or lost focus, when it asked
+    /// (DECSET 1004).
+    pub fn focus(&mut self, focused: bool) {
+        self.term.focus_changed(focused);
+    }
+    /// Whether the program is drawing a synchronized frame (DECSET 2026).
+    pub fn synchronized(&self) -> bool {
+        self.term.synchronized_output()
+    }
+    /// Ends a synchronized frame the program left open.
+    pub fn end_synchronized(&mut self) {
+        self.term.end_synchronized_output();
+    }
+    /// The directory the program last reported (OSC 7), as a path.
+    pub fn current_dir(&self) -> Option<String> {
+        self.term.get_current_dir().and_then(directory_of)
+    }
+    /// The shell's prompts, inputs and outputs that OSC 133 marked, oldest
+    /// first, in buffer rows counted from the oldest history row.
+    pub fn zones(&mut self) -> Vec<Zone> {
+        let first = self.term.screen().phys_to_stable_row_index(0);
+        let row = |stable: StableRowIndex| (stable - first).max(0) as i64;
+        self.term
+            .get_semantic_zones()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|z| Zone {
+                kind: match z.semantic_type {
+                    SemanticType::Prompt => ZoneKind::Prompt,
+                    SemanticType::Input => ZoneKind::Input,
+                    SemanticType::Output => ZoneKind::Output,
+                },
+                start: super::Cell {
+                    row: row(z.start_y),
+                    col: z.start_x as i64,
+                },
+                end: super::Cell {
+                    row: row(z.end_y),
+                    col: z.end_x as i64,
+                },
+            })
+            .collect()
+    }
+    /// The desktop notifications the program sent since the last call.
+    pub fn take_toasts(&mut self) -> Vec<(String, String)> {
+        self.notes.lock().toasts.drain(..).collect()
+    }
+    /// The text the program last wrote to the clipboard and to the primary
+    /// selection since the last call.
+    pub fn take_clipboard(&mut self) -> (Option<String>, Option<String>) {
+        let mut notes = self.notes.lock();
+        (notes.clipboard.take(), notes.primary.take())
+    }
+}
+
+/// What a stretch of the buffer is to the shell that marked it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ZoneKind {
+    Prompt,
+    Input,
+    Output,
+}
+
+/// A stretch of the buffer the shell marked (OSC 133), its end excluded.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Zone {
+    pub kind: ZoneKind,
+    pub start: super::Cell,
+    pub end: super::Cell,
+}
+
+/// The path an OSC 7 location names: a `file://host/path` URL, its escapes
+/// decoded, or a bare absolute path.
+fn directory_of(location: &str) -> Option<String> {
+    let path = match location.strip_prefix("file://") {
+        Some(rest) => &rest[rest.find('/')?..],
+        None if location.starts_with('/') => location,
+        None => return None,
+    };
+    let bytes = path.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let hex = |b: u8| char::from(b).to_digit(16);
+        if bytes[at] == b'%'
+            && let (Some(hi), Some(lo)) = (
+                bytes.get(at + 1).and_then(|b| hex(*b)),
+                bytes.get(at + 2).and_then(|b| hex(*b)),
+            )
+        {
+            out.push((hi * 16 + lo) as u8);
+            at += 3;
+        } else {
+            out.push(bytes[at]);
+            at += 1;
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 /// The size the terminal core takes: cells only, since the view lays out
@@ -615,7 +821,7 @@ mod tests {
         assert_eq!(e.text(), "ab      cd\nlonger  x");
         let frame = e.frame().unwrap();
         assert!(frame.cells()[0][2..8].iter().all(|c| c.text.is_empty()));
-        assert_eq!(frame.cells()[0][8].text, "c");
+        assert_eq!(frame.cells()[0][8].text.as_str(), "c");
         assert_eq!(e.copy((0, 0), (0, 10)), "ab\tcd");
     }
     #[test]
@@ -670,7 +876,7 @@ mod tests {
         for _ in 0..2000 {
             e.process(&[b'A'; 8192]).unwrap();
         }
-        assert!(e.filter.string.capacity() <= OSC_LIMIT * 2);
+        assert!(e.filter.string.capacity() <= CLIPBOARD_LIMIT * 2);
         e.process(b"\x07safe").unwrap();
         assert!(e.text().contains("safe"));
         e.process(b"\x1bP").unwrap();
@@ -710,6 +916,73 @@ mod tests {
         assert!(e.notifications().dropped_replies > 0);
         assert!(e.take_replies().len() <= 4096);
     }
+    #[test]
+    fn synchronized_output_is_reported_and_followed() {
+        let mut e = Engine::new(4, 20, 10, 4 * 1024 * 1024, Budget::new(8 * 1024 * 1024)).unwrap();
+        e.process(b"\x1b[?2026$p").unwrap();
+        assert_eq!(e.take_replies(), b"\x1b[?2026;2$y");
+        e.process(b"\x1b[?2026h\x1b[?2026$p").unwrap();
+        assert!(e.synchronized());
+        assert_eq!(e.take_replies(), b"\x1b[?2026;1$y");
+        e.end_synchronized();
+        assert!(!e.synchronized());
+    }
+
+    #[test]
+    fn programs_write_the_clipboard_and_send_notifications_but_never_read_the_clipboard() {
+        let mut e = Engine::new(4, 20, 10, 4 * 1024 * 1024, Budget::new(8 * 1024 * 1024)).unwrap();
+        // "copied" in base64, to the clipboard and then to the primary selection.
+        e.process(b"\x1b]52;c;Y29waWVk\x07\x1b]52;p;cHJpbWFyeQ==\x07")
+            .unwrap();
+        assert_eq!(
+            e.take_clipboard(),
+            (Some("copied".into()), Some("primary".into()))
+        );
+        assert_eq!(e.take_clipboard(), (None, None));
+        e.process(b"\x1b]52;c;?\x07").unwrap();
+        assert!(e.take_replies().is_empty());
+        e.process(b"\x1b]9;build done\x07\x1b]777;notify;Title;Body\x07")
+            .unwrap();
+        assert_eq!(
+            e.take_toasts(),
+            [
+                (String::new(), "build done".to_string()),
+                ("Title".to_string(), "Body".to_string())
+            ]
+        );
+        for n in 0..20 {
+            e.process(format!("\x1b]9;{n}\x07").as_bytes()).unwrap();
+        }
+        assert_eq!(e.take_toasts().len(), TOAST_LIMIT);
+    }
+
+    #[test]
+    fn a_reported_directory_reads_as_a_path_and_marked_prompts_as_zones() {
+        let mut e = Engine::new(6, 30, 20, 4 * 1024 * 1024, Budget::new(8 * 1024 * 1024)).unwrap();
+        assert_eq!(e.current_dir(), None);
+        e.process(b"\x1b]7;file://host/home/me/my%20dir\x07")
+            .unwrap();
+        assert_eq!(e.current_dir().as_deref(), Some("/home/me/my dir"));
+        assert_eq!(directory_of("/plain/path").as_deref(), Some("/plain/path"));
+        assert_eq!(directory_of("relative"), None);
+        for n in 0..3 {
+            e.process(
+                format!("\x1b]133;A\x07$ \x1b]133;B\x07cmd{n}\r\n\x1b]133;C\x07out{n}\r\n")
+                    .as_bytes(),
+            )
+            .unwrap();
+        }
+        let prompts: Vec<i64> = e
+            .zones()
+            .iter()
+            .filter(|z| z.kind == ZoneKind::Prompt)
+            .map(|z| z.start.row)
+            .collect();
+        assert_eq!(prompts, [0, 2, 4]);
+        let rows = e.rows();
+        assert!(rows[2].text.starts_with("$ cmd1"), "{rows:?}");
+    }
+
     #[test]
     fn resize_admission_is_atomic_and_tracks_retained_high_water_capacity() {
         let budget = Budget::new(64 * 1024 * 1024);

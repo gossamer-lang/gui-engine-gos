@@ -17,7 +17,7 @@ use windows_sys::Win32::System::Threading::{
 
 use super::Command;
 use super::transport::{
-    CHUNK, Drain, INPUT, Notify, OUTPUT, Queue, STACK, Slot, check_command, pty_size,
+    BATCH, CHUNK, Drain, INPUT, Notify, OUTPUT, Queue, STACK, Slot, check_command, pty_size,
 };
 use crate::memory::{Budget, Lease};
 
@@ -92,7 +92,8 @@ impl Pty {
         check_command(&command.program, &command.args)?;
         let slot = Slot::acquire()?;
         let notify = Arc::new(Notify::new(wake));
-        let lease = budget.reserve(3 * INPUT + 2 * OUTPUT + 4 * STACK + 4 * CHUNK + 64 * 1024)?;
+        let lease =
+            budget.reserve(3 * INPUT + 2 * OUTPUT + 4 * STACK + 4 * CHUNK + BATCH + 64 * 1024)?;
         let pair = portable_pty::native_pty_system()
             .openpty(pty_size(rows, cols)?)
             .map_err(|e| e.to_string())?;
@@ -151,8 +152,15 @@ impl Pty {
                 .name("gui-conpty-read".into())
                 .stack_size(STACK)
                 .spawn(move || {
-                    let mut buffer = [0; CHUNK];
+                    let mut buffer = vec![0; BATCH];
                     loop {
+                        // Output is read once the owner has taken what was
+                        // queued, so one read of the pipe collects what the
+                        // program wrote meanwhile. A closing console is read
+                        // without waiting, so its close can finish.
+                        if !stop.load(Ordering::Acquire) {
+                            out.wait_empty();
+                        }
                         match reader.read(&mut buffer) {
                             Ok(0) => break,
                             // Closing flushes output synchronously; it is read

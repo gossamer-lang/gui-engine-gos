@@ -32,6 +32,7 @@ pub extern "C" fn gui_engine_startup_complete() {
 
 /// The whole pages strictly inside `begin..end`, as a start and a length.
 /// Without a link order the markers sit side by side and no page qualifies.
+#[cfg(any(target_os = "linux", test))]
 fn pages_between(begin: usize, end: usize, page: usize) -> Option<(usize, usize)> {
     let start = begin.checked_next_multiple_of(page)?;
     let stop = end - end % page;

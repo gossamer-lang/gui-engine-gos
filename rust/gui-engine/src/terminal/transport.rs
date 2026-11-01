@@ -215,6 +215,62 @@ pub(crate) fn check_command(program: &str, args: &[String]) -> Result<(), String
     Ok(())
 }
 
+// Variables by which another terminal names itself. A program started here
+// would inherit them from the terminal that started this one and take this
+// terminal for that one: `kitty @` would drive the other kitty, and an image
+// tool would speak the other terminal's protocol.
+const FOREIGN_TERMINAL: &[&str] = &[
+    "COLORFGBG",
+    "LC_TERMINAL",
+    "LC_TERMINAL_VERSION",
+    "MLTERM",
+    "TERMINAL_EMULATOR",
+    "TERMINOLOGY",
+    "TERM_PROGRAM",
+    "TERM_PROGRAM_VERSION",
+    "VTE_VERSION",
+    "WINDOWID",
+    "WT_PROFILE_ID",
+    "WT_SESSION",
+    "XTERM_LOCALE",
+    "XTERM_SHELL",
+    "XTERM_VERSION",
+];
+const FOREIGN_TERMINAL_PREFIXES: &[&str] = &[
+    "ALACRITTY_",
+    "GHOSTTY_",
+    "ITERM_",
+    "KITTY_",
+    "KONSOLE_",
+    "WEZTERM_",
+];
+
+// Whether the inherited variable `name` names another terminal. Windows
+// compares names without case.
+fn names_another_terminal(name: &str) -> bool {
+    let name = name.to_ascii_uppercase();
+    FOREIGN_TERMINAL.contains(&name.as_str())
+        || FOREIGN_TERMINAL_PREFIXES
+            .iter()
+            .any(|p| name.starts_with(p))
+}
+
+/// The environment a program in this terminal starts with: the inherited one
+/// without another terminal's names for itself, this terminal's own, then
+/// `command`'s variables.
+pub(crate) fn environment(builder: &mut portable_pty::CommandBuilder, command: &super::Command) {
+    for (key, _) in std::env::vars_os() {
+        if key.to_str().is_some_and(names_another_terminal) {
+            builder.env_remove(&key);
+        }
+    }
+    builder.env("TERM", "xterm-256color");
+    builder.env("COLORTERM", "truecolor");
+    for (key, value) in &command.env {
+        builder.env(key, value);
+    }
+}
+
 /// The size a program reads from its terminal: `rows` by `cols` cells of
 /// `cell` pixels each.
 pub(crate) fn pty_size(
@@ -231,4 +287,25 @@ pub(crate) fn pty_size(
         pixel_width: cols.saturating_mul(cell.0),
         pixel_height: rows.saturating_mul(cell.1),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::names_another_terminal;
+
+    #[test]
+    fn another_terminals_names_for_itself_are_left_behind() {
+        for name in [
+            "KITTY_PID",
+            "KITTY_WINDOW_ID",
+            "TERM_PROGRAM",
+            "VTE_VERSION",
+            "wt_session",
+        ] {
+            assert!(names_another_terminal(name), "{name}");
+        }
+        for name in ["TERM", "COLORTERM", "HOME", "PATH", "KITTYCAT"] {
+            assert!(!names_another_terminal(name), "{name}");
+        }
+    }
 }

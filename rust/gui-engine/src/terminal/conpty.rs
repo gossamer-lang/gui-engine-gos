@@ -102,11 +102,7 @@ impl Pty {
         let mut writer = pair.master.take_writer().map_err(|e| e.to_string())?;
         let mut builder = CommandBuilder::new(&command.program);
         builder.args(&command.args);
-        builder.env("TERM", "xterm-256color");
-        builder.env("COLORTERM", "truecolor");
-        for (key, value) in &command.env {
-            builder.env(key, value);
-        }
+        super::transport::environment(&mut builder, command);
         if !command.cwd.is_empty() {
             builder.cwd(&command.cwd);
         }

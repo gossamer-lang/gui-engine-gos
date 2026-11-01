@@ -551,6 +551,14 @@ pub fn menu_bar_event(b: &MenuBar, node: &Node, ev: &Event, st: &mut StateStore,
                 i += 1;
             }
         }
+        // The session closes the panel itself when focus or a click moves
+        // away; the title lets go with it, as a menu button's does.
+        Event::FocusOut if s.open >= 0 => {
+            s.open = -1;
+            s.path = vec![];
+            st.set(&b.id, WState::Menu(s));
+            cx.redraw = true
+        }
         Event::PointerMove { x, y, .. } if s.open >= 0 => {
             let lx = x - cx.origin_x;
             let ly = y - cx.origin_y;

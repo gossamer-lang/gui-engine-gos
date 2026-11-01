@@ -5691,6 +5691,49 @@ mod popup_tests {
     }
 
     #[test]
+    fn a_click_outside_an_open_menu_closes_it_and_its_title_lets_go() {
+        crate::testing::on_ui_thread(|| {
+            // A system menu bar (macOS) draws no title in the window.
+            if windowing::menu::has_native_menu_bar() {
+                return;
+            }
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::app::start("Dismissed", "dev.gossamer.gui-menu-dismiss").unwrap();
+            s.set_shell(
+                |_| {},
+                |_| {
+                    Widget::column(
+                        &[
+                            Widget::menu_bar(
+                                "menu",
+                                &[menus::Menu::new("&Edit", &[menus::item("edit.copy")])],
+                            ),
+                            view(&0),
+                        ],
+                        0,
+                    )
+                },
+                |_| vec![crate::commands::Command::new("edit.copy", "Copy")],
+            );
+            s.open_window("main", "Dismissed", 420, 320).unwrap();
+            let bar = s.rect_of("menu").unwrap();
+            s.click_at(bar.x + 12, bar.center_y()).unwrap();
+            assert_eq!(s.windows[0].states.menu("menu").open, 0);
+            assert!(!s.windows[0].popups.is_empty());
+            assert!(s.semantics(0).dump().contains("expanded"));
+            // Well below the open menu, so the press lands outside it.
+            s.click_at(380, 300).unwrap();
+            assert!(s.windows[0].popups.is_empty());
+            assert_eq!(s.windows[0].states.menu("menu").open, -1);
+            assert!(!s.semantics(0).dump().contains("expanded"));
+            s.shutdown();
+        })
+    }
+
+    #[test]
     fn an_open_context_menu_is_in_the_semantic_tree() {
         crate::testing::on_ui_thread(|| {
             let config = crate::services::private_test_config();

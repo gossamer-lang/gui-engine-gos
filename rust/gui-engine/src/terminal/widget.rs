@@ -13,6 +13,7 @@ use super::frame::{Color as CellColor, Frame};
 use super::images;
 use super::keyboard;
 use super::links::{Link, Place, place};
+use super::shapes;
 use super::{Cell, Event as TerminalEvent, Span, with_entry};
 use crate::accessibility::{AccessNode, Role};
 use crate::geometry::{Constraints, Rect, Size};
@@ -557,7 +558,10 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
     for (row, cells) in frame.cells().iter().enumerate() {
         let screen_row = row as u16;
         let row = row as i64;
+        // Cells take whole-pixel edges from the fractional grid, so each
+        // meets its neighbors with neither a gap nor an overlap.
         let y = pad + (row as f64 * lh) as i64;
+        let height = pad + ((row + 1) as f64 * lh) as i64 - y;
         let mut col = 0;
         while col < cells.len() {
             let cell = &cells[col];
@@ -580,7 +584,11 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
             if marked {
                 bg = highlight_bg;
             }
-            fg = legible(fg, bg);
+            // Blocks and box pieces build pictures, as chafa's symbols do, from
+            // colors meant to sit close together; only letters are made legible.
+            if !shapes::is_shape(cell.text.as_str()) {
+                fg = legible(fg, bg);
+            }
             if selected {
                 fg = selection_fg;
                 bg = selection_bg;
@@ -612,9 +620,9 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
             }
             let span = if cell.wide { 2 } else { end - col };
             let x = pad + (col as f64 * cw) as i64;
-            let width = (span as f64 * cw).ceil() as i64;
+            let width = pad + ((col + span) as f64 * cw) as i64 - x;
             if bg != background {
-                cx.fill(Rect::new(x, y, width, lh as i64), bg);
+                cx.fill(Rect::new(x, y, width, height), bg);
             }
             let text: String = cells[col..end]
                 .iter()
@@ -630,7 +638,9 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
             // Blank cells draw no ink, and backgrounds and underlines fill
             // their cells, so a run is laid out only up to its last glyph.
             let text = text.trim_end_matches(' ');
-            if !text.trim().is_empty() {
+            let shape = Rect::new(origin.x + x, origin.y + y, width, height);
+            let drawn = !ascii(cell) && shapes::draw(&mut cx.canvas, text, shape, fg, bg);
+            if !drawn && !text.trim().is_empty() {
                 let mut run = style.clone();
                 run.bold = cell.bold;
                 run.italic = cell.italic;
@@ -663,7 +673,7 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
             }
             if cell.underline || lit {
                 cx.fill(
-                    Rect::new(x, y + lh as i64 - theme.px(2), width, theme.px(1).max(1)),
+                    Rect::new(x, y + height - theme.px(2), width, theme.px(1).max(1)),
                     fg,
                 );
             }

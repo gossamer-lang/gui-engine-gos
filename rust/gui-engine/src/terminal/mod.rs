@@ -11,6 +11,7 @@ pub mod frame;
 mod images;
 pub mod keyboard;
 pub mod links;
+mod shapes;
 mod transport;
 pub mod widget;
 

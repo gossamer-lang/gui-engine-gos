@@ -195,6 +195,7 @@ pub struct Session {
     pending_leases: Vec<crate::memory::Lease>,
     resource_error: String,
     renderers: HashMap<String, WindowRenderer>,
+    started: bool,
     pub windows: Vec<WindowState>,
     pub app_id: String,
     pub name: String,
@@ -353,6 +354,7 @@ pub fn start(name: &str, app_id: &str) -> Result<Session, errors::Error> {
         pending_leases: Vec::new(),
         resource_error: String::new(),
         renderers: HashMap::new(),
+        started: false,
         windows: vec![],
         app_id: app_id.to_string(),
         name: name.to_string(),
@@ -4851,6 +4853,10 @@ impl Session {
         self.windows[w as usize].presented = Some(self.now());
         if !damage.is_empty() {
             self.windows[w as usize].frames += 1;
+            if !self.started {
+                self.started = true;
+                crate::startup::gui_engine_startup_complete();
+            }
         }
         if self.a11y.active() {
             let sem = self.semantics(w);

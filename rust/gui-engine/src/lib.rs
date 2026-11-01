@@ -29,6 +29,7 @@ pub mod render;
 pub mod rich;
 pub mod scene;
 pub mod services;
+pub mod startup;
 pub mod strext;
 pub mod style;
 pub mod terminal;

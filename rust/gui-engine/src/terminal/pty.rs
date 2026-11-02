@@ -74,6 +74,29 @@ fn process_cwd(_pid: i32) -> Option<String> {
     None
 }
 
+/// The name of process `pid`'s program.
+#[cfg(target_os = "linux")]
+fn process_name(pid: i32) -> Option<String> {
+    let name = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+    let name = name.trim_end();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// The name of process `pid`'s program.
+#[cfg(target_os = "macos")]
+fn process_name(pid: i32) -> Option<String> {
+    let mut name = [0u8; 256];
+    // SAFETY: `name` is writable storage of the length given.
+    let len = unsafe { libc::proc_name(pid, name.as_mut_ptr().cast(), name.len() as u32) };
+    (len > 0).then(|| String::from_utf8_lossy(&name[..len as usize]).into_owned())
+}
+
+/// Other systems name no process's program to an unprivileged reader.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_name(_pid: i32) -> Option<String> {
+    None
+}
+
 /// Waits until `fd` is ready for `events` or `cancel` is readable; answers
 /// false for cancellation. The thread hands back the memory it freed first.
 fn readiness(fd: i32, cancel: i32, events: i16) -> Result<bool, String> {
@@ -361,6 +384,17 @@ impl Pty {
         // SAFETY: `fd` is the open master descriptor.
         let foreground = unsafe { libc::tcgetpgrp(fd) };
         foreground > 0 && foreground != self.pid as i32
+    }
+
+    /// The program name of the job in the terminal's foreground, when a job
+    /// other than the program runs there.
+    pub fn job(&self) -> Option<String> {
+        let fd = self.master.as_ref().and_then(|m| m.as_raw_fd())?;
+        // SAFETY: `fd` is the open master descriptor.
+        let foreground = unsafe { libc::tcgetpgrp(fd) };
+        (foreground > 0 && foreground != self.pid as i32)
+            .then(|| process_name(foreground))
+            .flatten()
     }
 
     /// The working directory of the job in the terminal's foreground, or of

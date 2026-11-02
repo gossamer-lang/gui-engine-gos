@@ -61,6 +61,14 @@ pub struct TextStyle {
     pub tab_width: i64,
     /// Line height as a multiple of the font's natural height; 0 keeps it.
     pub line_spacing: f64,
+    /// Whether standard and contextual ligatures join letters in Latin,
+    /// Greek and Cyrillic text; scripts that need theirs keep them.
+    #[serde(default = "ligatures_on")]
+    pub ligatures: bool,
+}
+
+fn ligatures_on() -> bool {
+    true
 }
 
 impl TextStyle {
@@ -73,6 +81,7 @@ impl TextStyle {
             italic: false,
             tab_width: 4,
             line_spacing: 0.0,
+            ligatures: true,
         }
     }
 
@@ -85,6 +94,7 @@ impl TextStyle {
             italic: false,
             tab_width: 4,
             line_spacing: 0.0,
+            ligatures: true,
         }
     }
 
@@ -110,13 +120,14 @@ impl TextStyle {
             Family::Named(ref n) => n,
         };
         format!(
-            "{}|{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}|{}",
             fam,
             (self.size * 64.0) as i64,
             self.bold,
             self.italic,
             self.tab_width,
-            (self.line_spacing * 100.0) as i64
+            (self.line_spacing * 100.0) as i64,
+            self.ligatures
         )
     }
 }
@@ -1147,6 +1158,7 @@ fn itemize_and_shape(
             faces[s],
             &script_tag(scripts[s]),
             contextual_forms.as_ref().map(|forms| &forms[s..e]),
+            style.ligatures,
         );
         for glyph in &mut glyphs {
             if let Some(image) =
@@ -1184,6 +1196,7 @@ fn shape_run(
     face_id: FaceId,
     script: &str,
     contextual_forms: Option<&[String]>,
+    ligatures: bool,
 ) -> Vec<GlyphInfo> {
     let face = fonts::face(face_id);
     if indic::is_indic(script) {
@@ -1221,8 +1234,12 @@ fn shape_run(
         ];
     }
     if script == "latn" || script == "DFLT" || script == "cyrl" || script == "grek" {
-        // Discretionary ligatures stay off; standard ones are on.
-        features = vec!["ccmp", "locl", "liga", "clig", "calt"];
+        // Discretionary ligatures stay off; standard ones follow the style.
+        features = if ligatures {
+            vec!["ccmp", "locl", "liga", "clig", "calt"]
+        } else {
+            vec!["ccmp", "locl"]
+        };
     }
     opentype::substitute(&face, script, &mut glyphs, &features);
     position_run(&face, script, &mut glyphs, rtl);
@@ -2480,6 +2497,17 @@ mod tests {
         );
         let empty = layout("", &sans(), LayoutOptions::single_line());
         assert_eq!(empty.range_rects(0, 0, 4, 8).len(), 1)
+    }
+
+    #[test]
+    fn a_style_without_ligatures_keeps_each_letter_its_own_glyph() {
+        let joined = layout("ffi", &sans(), LayoutOptions::single_line());
+        let mut apart = sans();
+        apart.ligatures = false;
+        let separate = layout("ffi", &apart, LayoutOptions::single_line());
+        assert!(joined.lines[0].glyphs.len() < 3);
+        assert_eq!(separate.lines[0].glyphs.len(), 3);
+        assert_ne!(sans().key(), apart.key());
     }
 
     #[test]

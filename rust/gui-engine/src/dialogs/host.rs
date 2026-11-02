@@ -85,7 +85,16 @@ impl Instance {
     }
 
     /// Replaces the request (progress updates) keeping drafts.
+    /// Takes `req` in place of the request it shows. A field whose value
+    /// the application changed shows the new value in place of its draft,
+    /// as a change still to apply.
     pub fn update_request(&mut self, req: &DialogRequest) {
+        let before = crate::dialogs::pickers::field_values(&self.request);
+        for (key, value) in crate::dialogs::pickers::field_values(req) {
+            if before.get(&key).is_some_and(|old| *old != value) {
+                self.values.insert(format!("field:{key}"), value);
+            }
+        }
         self.request = req.clone();
     }
 
@@ -431,8 +440,14 @@ pub fn panel(inst: &Instance, body: Widget) -> Widget {
                 &crate::localization::tr("Checking\u{2026}"),
             ))
         }
+        // Restore defaults stands apart from the buttons that close.
+        let (apart, closing): (Vec<_>, Vec<_>) =
+            actions.into_iter().partition(|a| a.id == "defaults");
+        for a in apart {
+            buttons.push(button_for(inst, &a))
+        }
         buttons.push(Widget::stretch());
-        for a in actions {
+        for a in closing {
             buttons.push(button_for(inst, &a))
         }
         rows.push(Widget::row(&buttons, 8))

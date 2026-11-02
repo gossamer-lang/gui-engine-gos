@@ -820,11 +820,17 @@ fn at_weight(face: Face, bold: bool) -> Face {
     out
 }
 
+// The loaded face of family `name` that draws it regular or bold: upright
+// before italic, nearest 400 or 700 first.
 fn find_named(name: &str, bold: bool) -> Option<i64> {
     let want = name.to_lowercase();
-    FACES.lock().iter().find_map(|(&id, face)| {
-        (face.family.to_lowercase() == want && face.bold == bold).then_some(id)
-    })
+    let target = if bold { 700 } else { 400 };
+    FACES
+        .lock()
+        .iter()
+        .filter(|(_, face)| face.family.to_lowercase() == want && face.bold == bold)
+        .min_by_key(|(_, face)| (face.italic, (face.weight - target).abs()))
+        .map(|(&id, _)| id)
 }
 
 /// Family names of the bundled and installed faces, sorted, for font pickers.
@@ -847,45 +853,102 @@ pub fn available_families() -> Vec<String> {
     out
 }
 
-// Loads the installed face of family `name` closest to `bold`: an upright
-// face of that weight, then any upright face (a variable one takes the
-// weight), then italic ones.
+// The weight a record declares, or the one its bold flag implies.
+fn record_weight(r: &FontRecord) -> i64 {
+    match (r.weight, r.bold) {
+        (w, _) if w > 0 => w,
+        (_, true) => 700,
+        (_, false) => 400,
+    }
+}
+
+// Loads the installed face of family `name` closest to `bold`: upright faces
+// before italic ones, each nearest regular (400) or bold (700) weight first;
+// a variable face takes the weight.
 fn load_named(name: &str, bold: bool) -> Option<i64> {
     ensure_installed();
     let want = name.to_lowercase();
-    let candidates = INSTALLED
+    let target = if bold { 700 } else { 400 };
+    let mut ordered = INSTALLED
         .lock()
         .iter()
         .filter(|r| r.family.to_lowercase() == want)
         .cloned()
         .collect::<Vec<_>>();
-    let mut ordered = candidates
-        .iter()
-        .filter(|r| r.bold == bold && !r.italic)
-        .cloned()
-        .collect::<Vec<_>>();
-    for r in candidates
-        .iter()
-        .filter(|r| r.bold != bold && !r.italic)
-        .cloned()
-        .collect::<Vec<_>>()
-    {
-        ordered.push(r)
+    ordered.sort_by_key(|r| (r.italic, (record_weight(r) - target).abs()));
+    // Only the nearest face is asked for; the next only once it fails.
+    let usable = ordered.into_iter().find(|r| {
+        let key = (r.path.clone(), r.index, bold);
+        LOADED_SYSTEM.lock().get(&key).is_none_or(|&id| id >= 0)
+    })?;
+    load_installed(&usable, bold)
+}
+
+/// A family name that draws `name` at `weight` on the CSS scale (400 is
+/// regular), its bold `weight + 300` within 700 to 900: the family's upright
+/// faces nearest those weights, or a variable face's instances at them,
+/// registered once. `name` itself at 400, for an unknown family, and while
+/// an installed face it needs is still loading.
+pub fn weighted_family(name: &str, weight: i64) -> String {
+    if weight == 400 {
+        return name.to_string();
     }
-    for r in candidates
-        .iter()
-        .filter(|r| r.italic)
-        .cloned()
-        .collect::<Vec<_>>()
-    {
-        ordered.push(r)
+    let derived = format!("{name} (weight {weight})");
+    if INSTANCES.lock().contains(&derived) {
+        return derived;
     }
-    for r in ordered {
-        if let Some(loaded) = load_installed(&r, bold) {
-            return Some(loaded);
+    let bolder = (weight + 300).clamp(700, 900);
+    let (Some(upright), Some(bold)) = (face_at_weight(name, weight), face_at_weight(name, bolder))
+    else {
+        return name.to_string();
+    };
+    for (mut f, is_bold) in [(upright, false), (bold, true)] {
+        f.family = derived.clone();
+        // Looked up by its derived family, as that family's regular or bold.
+        f.bold = is_bold;
+        if add_face_with_lifetime(&f, true) < 0 {
+            return name.to_string();
         }
     }
-    None
+    INSTANCES.lock().insert(derived.clone());
+    faces_changed();
+    derived
+}
+
+// Family `name`'s upright face nearest `weight`, loaded or installed (once
+// it has loaded); a variable face comes at that weight.
+fn face_at_weight(name: &str, weight: i64) -> Option<Face> {
+    ensure_bundled();
+    let want = name.to_lowercase();
+    let loaded = FACES
+        .lock()
+        .values()
+        .filter(|f| f.family.to_lowercase() == want && !f.italic)
+        .min_by_key(|f| (f.weight - weight).abs())
+        .cloned();
+    let installed = if installed_known() {
+        INSTALLED
+            .lock()
+            .iter()
+            .filter(|r| r.family.to_lowercase() == want && !r.italic)
+            .min_by_key(|r| (record_weight(r) - weight).abs())
+            .cloned()
+    } else {
+        None
+    };
+    let face = match (loaded, installed) {
+        (Some(f), Some(r)) if (f.weight - weight).abs() <= (record_weight(&r) - weight).abs() => f,
+        (_, Some(r)) => face_at(load_installed(&r, weight >= 600)?),
+        (Some(f), None) => f,
+        (None, None) => return None,
+    };
+    let axes = variation::axes(&face);
+    Some(match axes.iter().find(|a| a.tag == "wght") {
+        Some(axis) => {
+            face.instance(&crate::hmap! { "wght" => (weight as f64).clamp(axis.min, axis.max) })
+        }
+        None => face,
+    })
 }
 
 /// Whether a family is bundled, registered or installed.
@@ -917,6 +980,38 @@ pub fn loaded_count() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{face, face_for, face_for_cluster, primary, shown_as_emoji};
+
+    #[test]
+    fn a_family_draws_regular_text_with_its_face_nearest_400() {
+        for weight in [300, 400, 500] {
+            let mut f = crate::text::font::Face::parse(super::MONO, 0).unwrap();
+            f.family = "Pick Test".to_string();
+            f.weight = weight;
+            super::add_face(&f);
+        }
+        let family = super::Family::Named("Pick Test".to_string());
+        assert_eq!(face(primary(&family, false)).weight, 400);
+    }
+
+    #[test]
+    fn a_weighted_family_draws_its_nearest_weights_and_a_bolder_bold() {
+        super::register_test_family("Weight Test", &crate::text::font::variable_test_face(false));
+        assert_eq!(super::weighted_family("Weight Test", 400), "Weight Test");
+        let light = super::weighted_family("Weight Test", 300);
+        assert_eq!(light, "Weight Test (weight 300)");
+        let family = super::Family::Named(light.clone());
+        assert_eq!(face(primary(&family, false)).weight, 300);
+        assert_eq!(face(primary(&family, true)).weight, 700);
+        assert_eq!(super::weighted_family("Weight Test", 300), light);
+        assert!(!super::known_families().contains(&light));
+        let sans = face(primary(&super::Family::Sans, false)).family;
+        let thin = super::weighted_family(&sans, 100);
+        assert_eq!(thin, format!("{sans} (weight 100)"));
+        let statics = super::Family::Named(thin);
+        assert_eq!(face(primary(&statics, false)).weight, 400);
+        assert!(!face(primary(&statics, false)).bold);
+        assert_eq!(face(primary(&statics, true)).weight, 700);
+    }
 
     #[test]
     fn bundled_faces_are_read_in_place_and_a_shared_file_is_charged_once() {

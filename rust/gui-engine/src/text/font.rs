@@ -109,6 +109,8 @@ pub struct Face {
     pub subfamily: String,
     pub bold: bool,
     pub italic: bool,
+    /// The weight on the CSS scale (400 regular, 700 bold), from `OS/2`.
+    pub weight: i64,
     pub monospace: bool,
     pub units_per_em: i64,
     pub ascent: i64,
@@ -167,6 +169,7 @@ impl Default for Face {
             subfamily: String::new(),
             bold: false,
             italic: false,
+            weight: 400,
             monospace: false,
             units_per_em: 0,
             ascent: 0,
@@ -291,6 +294,9 @@ impl Face {
     pub fn instance(&self, values: &HashMap<String, f64>) -> Face {
         let mut out = self.clone();
         out.coords = variation::normalize(self, values);
+        if let Some(&weight) = values.get("wght") {
+            out.weight = weight.round() as i64;
+        }
         out
     }
 
@@ -337,6 +343,7 @@ impl Face {
         let style = be_u16(&self.data, head + 44);
         self.bold = style & 1 != 0;
         self.italic = style & 2 != 0;
+        self.weight = if self.bold { 700 } else { 400 };
         if let Some((maxp, _)) = self.tables.get("maxp") {
             self.num_glyphs = be_u16(&self.data, maxp + 4);
         }
@@ -355,6 +362,9 @@ impl Face {
             && *len >= 64
         {
             let weight = be_u16(&self.data, os2 + 4);
+            if (1..=1000).contains(&weight) {
+                self.weight = weight
+            };
             if weight >= 600 {
                 self.bold = true
             };
@@ -422,6 +432,7 @@ impl Face {
         let mut family = String::new();
         let mut typographic = String::new();
         let mut subfamily = String::new();
+        let mut typographic_subfamily = String::new();
         let mut i = 0;
         while i < count {
             let rec = name + 6 + i * 12;
@@ -449,6 +460,7 @@ impl Face {
                     1 if (family.is_empty() || platform == 3) => family = text,
                     2 if (subfamily.is_empty() || platform == 3) => subfamily = text,
                     16 => typographic = text,
+                    17 => typographic_subfamily = text,
                     _ => (),
                 }
             }
@@ -459,7 +471,16 @@ impl Face {
         } else {
             typographic
         };
-        self.subfamily = subfamily;
+        self.subfamily = if typographic_subfamily.is_empty() {
+            subfamily
+        } else {
+            typographic_subfamily
+        };
+        // Some families mark their slanted faces only in the style's name.
+        let style = self.subfamily.to_lowercase();
+        if style.contains("italic") || style.contains("oblique") {
+            self.italic = true;
+        }
     }
 
     /// The glyph id for `c`, or 0 (the missing glyph).
@@ -2063,6 +2084,47 @@ pub fn color_test_face() -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::{CUBIC, Face, LINE, MOVE, QUAD, color_test_face, variable_test_face};
+
+    // A `name` table of Windows Unicode English records, (id, text) each.
+    fn names(records: &[(i64, &str)]) -> Vec<u8> {
+        let count = records.len() as i64;
+        let mut out = super::test_words(&[0, count, 6 + 12 * count]);
+        let mut strings = vec![];
+        for (id, text) in records {
+            let bytes: Vec<u8> = text.encode_utf16().flat_map(u16::to_be_bytes).collect();
+            out.extend(super::test_words(&[
+                3,
+                1,
+                0x409,
+                *id,
+                bytes.len() as i64,
+                strings.len() as i64,
+            ]));
+            strings.extend(bytes);
+        }
+        out.extend(strings);
+        out
+    }
+
+    #[test]
+    fn a_style_named_italic_marks_the_face_italic_where_its_flags_do_not() {
+        let table = names(&[
+            (1, "Lilex Light Italic"),
+            (2, "Regular"),
+            (16, "Lilex"),
+            (17, "Light Italic"),
+        ]);
+        let mut face = Face {
+            data: super::FontBytes::owned(table.clone()),
+            ..Face::default()
+        };
+        face.tables
+            .insert("name".to_string(), (0, table.len() as i64));
+        face.read_names();
+        assert_eq!(face.family, "Lilex");
+        assert_eq!(face.subfamily, "Light Italic");
+        assert!(face.italic);
+    }
 
     use std::fs;
 

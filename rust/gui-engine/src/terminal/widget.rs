@@ -49,6 +49,101 @@ pub struct View {
     /// colors chosen for its light or dark background.
     #[serde(default)]
     pub scheme: Option<Scheme>,
+    /// How the view draws and handles its terminal beyond font and colors.
+    #[serde(default)]
+    pub options: ViewOptions,
+}
+
+/// How a view draws and handles its terminal beyond its font and colors.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ViewOptions {
+    /// The cursor's shape: "block", "bar" or "underline".
+    pub cursor: String,
+    /// Whether the cursor blinks.
+    pub blink: bool,
+    /// Bold text in the eight standard colors takes their bright forms.
+    pub bold_bright: bool,
+    /// Letters too close to their background move toward a readable color.
+    pub legible: bool,
+    /// Space around the screen, in interface units.
+    pub padding: i64,
+    /// When the scrollbar shows: "always", "scrolling" (while the view is
+    /// scrolled back) or "never".
+    pub scrollbar: String,
+    /// New output brings a view scrolled back to the live screen.
+    pub scroll_on_output: bool,
+    /// Typing brings a view scrolled back to the live screen.
+    pub scroll_on_keystroke: bool,
+    /// Characters a double click selects along with letters and digits.
+    pub word_chars: String,
+    /// On macOS, Option sends Meta (Escape and the key) rather than the
+    /// character it types.
+    pub option_as_meta: bool,
+    /// A selection is copied to the clipboard as well as the primary
+    /// selection.
+    pub copy_on_select: bool,
+    /// A paste of several lines or of control characters is held for the
+    /// application to confirm (`Event::PasteHeld`).
+    pub confirm_paste: bool,
+    /// The bell flashes the screen.
+    pub flash_bell: bool,
+    /// How opaque the default background is, from 0 to 1; below 1 the
+    /// window must be see-through (`Session::set_transparent`) to show what
+    /// lies behind it.
+    pub opacity: f64,
+    /// The height of a row as a multiple of the font's line height, from 0.8
+    /// to 3; text sits in the middle of a taller row.
+    pub line_height: f64,
+    /// The font's weight on the CSS scale (400 regular); bold text is 300
+    /// heavier, from 700 to 900. The family's nearest faces draw it.
+    pub font_weight: i64,
+    /// Whether letters of one style join into the font's ligatures, such as
+    /// a coding font's arrows.
+    pub ligatures: bool,
+}
+
+impl Default for ViewOptions {
+    fn default() -> ViewOptions {
+        ViewOptions {
+            cursor: "block".to_string(),
+            blink: true,
+            bold_bright: false,
+            legible: true,
+            padding: PAD,
+            scrollbar: "never".to_string(),
+            scroll_on_output: false,
+            scroll_on_keystroke: true,
+            word_chars: WORD_CHARS.to_string(),
+            option_as_meta: true,
+            copy_on_select: false,
+            confirm_paste: false,
+            flash_bell: false,
+            opacity: 1.0,
+            line_height: 1.0,
+            font_weight: 400,
+            ligatures: true,
+        }
+    }
+}
+
+/// What a double click selects besides letters and digits, as in GNOME
+/// Terminal: enough for paths, URLs and addresses.
+pub const WORD_CHARS: &str = "-#%&+,./:=?@_~";
+
+// The space around the screen of `v`, in pixels.
+fn pad_of(v: &View, theme: &Theme) -> i64 {
+    theme.px(v.options.padding.clamp(0, 64))
+}
+
+// The width the scrollbar of `v` takes from the screen, in pixels: only an
+// always-shown one takes room; one shown while scrolling lies over it.
+fn scrollbar_room(v: &View, theme: &Theme) -> i64 {
+    if v.options.scrollbar == "always" {
+        theme.px(SCROLLBAR)
+    } else {
+        0
+    }
 }
 
 /// A terminal's colors, each `#rrggbb`: the default text and background,
@@ -121,11 +216,14 @@ impl View {
             font: String::new(),
             font_size: 0.0,
             scheme: None,
+            options: ViewOptions::default(),
         }
     }
 }
 
 pub(super) const PAD: i64 = 4;
+// The scrollbar's width in interface units.
+const SCROLLBAR: i64 = 10;
 const WHEEL_ROWS: i64 = 3;
 /// Layout bytes kept per screen cell: room for two screens of runs at about
 /// 160 bytes a cell (a glyph's layout plus each run's own), the screen the
@@ -167,6 +265,7 @@ pub(super) fn metrics(v: &View, theme: &Theme) -> (f64, f64, TextStyle) {
     };
     // A point is 96/72 interface units.
     style.size = points * 96.0 / 72.0 * theme.scale * theme.text_scale;
+    style.ligatures = v.options.ligatures;
     ensure_default_font();
     let family = if v.font.is_empty() {
         DEFAULT_FONT
@@ -174,18 +273,35 @@ pub(super) fn metrics(v: &View, theme: &Theme) -> (f64, f64, TextStyle) {
         &v.font
     };
     if crate::text::fonts::family_available(family) {
-        style.family = crate::text::fonts::Family::Named(family.to_string());
+        let weighted = crate::text::fonts::weighted_family(family, v.options.font_weight);
+        style.family = crate::text::fonts::Family::Named(weighted);
     }
     let (width, _) = layout::measure("M", &style);
     let (_, _, line) = layout::metrics(&style);
-    (width.max(1.0), line.ceil().max(1.0), style)
+    let spaced = (line * line_factor(v)).ceil().max(1.0);
+    (width.max(1.0), spaced, style)
+}
+
+fn line_factor(v: &View) -> f64 {
+    if v.options.line_height.is_finite() {
+        v.options.line_height.clamp(0.8, 3.0)
+    } else {
+        1.0
+    }
+}
+
+// How far text sits below the top of its row, centering it in a row taller
+// (or shorter) than the font's line.
+fn text_offset(style: &TextStyle, lh: f64) -> f64 {
+    let (_, _, line) = layout::metrics(style);
+    ((lh - line.ceil()) / 2.0).floor()
 }
 
 /// The rows and columns that fit a view of `size`.
 fn grid(v: &View, theme: &Theme, size: Size) -> (i64, i64) {
     let (cw, lh, _) = metrics(v, theme);
-    let pad = theme.px(PAD);
-    let cols = ((size.width - 2 * pad) as f64 / cw).floor() as i64;
+    let pad = pad_of(v, theme);
+    let cols = ((size.width - 2 * pad - scrollbar_room(v, theme)) as f64 / cw).floor() as i64;
     let rows = ((size.height - 2 * pad) as f64 / lh).floor() as i64;
     (rows.clamp(1, 256), cols.clamp(1, 512))
 }
@@ -194,7 +310,7 @@ fn grid(v: &View, theme: &Theme, size: Size) -> (i64, i64) {
 /// right half selects up to its far edge.
 fn cell_at(v: &View, theme: &Theme, x: i64, y: i64, rows: i64, cols: i64) -> Cell {
     let (cw, lh, _) = metrics(v, theme);
-    let pad = theme.px(PAD) as f64;
+    let pad = pad_of(v, theme) as f64;
     let col = ((x as f64 - pad) / cw).round() as i64;
     let row = ((y as f64 - pad) / lh).floor() as i64;
     Cell {
@@ -206,7 +322,7 @@ fn cell_at(v: &View, theme: &Theme, x: i64, y: i64, rows: i64, cols: i64) -> Cel
 /// The cell a local point falls in, or None off the screen's cells.
 fn cell_under(v: &View, theme: &Theme, x: i64, y: i64) -> Option<(u16, u16)> {
     let (cw, lh, _) = metrics(v, theme);
-    let pad = theme.px(PAD) as f64;
+    let pad = pad_of(v, theme) as f64;
     let col = ((x as f64 - pad) / cw).floor();
     let row = ((y as f64 - pad) / lh).floor();
     (col >= 0.0 && row >= 0.0 && col < f64::from(u16::MAX) && row < f64::from(u16::MAX))
@@ -322,8 +438,8 @@ fn hovered_at(hovered: &[&Link], row: u16, col: usize) -> bool {
 pub fn layout_terminal(v: &View, c: Constraints, cx: &mut LayoutCx) -> Node {
     let theme = &cx.theme;
     let (cw, lh, _) = metrics(v, theme);
-    let pad = theme.px(PAD);
-    let width = (v.cols.max(1) as f64 * cw).ceil() as i64 + 2 * pad;
+    let pad = pad_of(v, theme);
+    let width = (v.cols.max(1) as f64 * cw).ceil() as i64 + 2 * pad + scrollbar_room(v, theme);
     let height = (v.rows.max(1) as f64 * lh).ceil() as i64 + 2 * pad;
     Node::leaf(c.biggest(Size::new(width, height)))
 }
@@ -482,6 +598,16 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
         // A paint follows every change of focus, so the program hears of
         // each one here.
         super::focus(entry, focused && cx.active);
+        entry.scroll_on_output = v.options.scroll_on_output;
+        entry.scroll_on_keystroke = v.options.scroll_on_keystroke;
+        // A bell rung since the last paint flashes the screen briefly.
+        let bells = entry.engine.notifications().bells;
+        if bells != entry.bells_flashed {
+            entry.bells_flashed = bells;
+            if v.options.flash_bell {
+                entry.flash_until = cx.now + FLASH_MS;
+            }
+        }
         entry.engine.set_palette(&wanted);
         let colors = entry.engine.palette();
         let top = entry.engine.history() as i64 - entry.engine.scrollback() as i64;
@@ -501,10 +627,24 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
             entry.hovered.clone(),
             colors,
             highlighted,
+            (
+                entry.scrolled as i64,
+                entry.engine.history() as i64,
+                entry.flash_until,
+            ),
         ))
     });
-    let Some(Ok((frame, selection, hovered, colors, highlighted))) = captured else {
-        cx.fill(r, shown(wanted.background));
+    let alpha = (v.options.opacity.clamp(0.0, 1.0) * 255.0).round() as i64;
+    let Some(Ok((
+        frame,
+        selection,
+        hovered,
+        colors,
+        highlighted,
+        (scrolled, history, flash_until),
+    ))) = captured
+    else {
+        cx.fill(r, shown(wanted.background).with_alpha(alpha));
         return;
     };
     let background = shown(colors.background);
@@ -512,13 +652,14 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
     let (selection_bg, selection_fg) = (shown(colors.selection_bg), shown(colors.selection_fg));
     // Highlights read as a weaker selection, so the selected match stands out.
     let highlight_bg = selection_bg.mix(background, 0.55);
-    cx.fill(r, background);
+    cx.fill(r, background.with_alpha(alpha));
     let hovered: Vec<&Link> = frame
         .links()
         .iter()
         .filter(|l| hovered.as_ref() == Some(&l.uri))
         .collect();
-    let pad = theme.px(PAD);
+    let pad = pad_of(v, &theme);
+    let rise = text_offset(&style, lh);
     let origin = cx.abs(r);
     let mut pictures =
         with_entry(v.terminal, |entry| std::mem::take(&mut entry.pictures)).unwrap_or_default();
@@ -574,8 +715,14 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
             let marks = &highlighted[row as usize];
             let marked = in_highlight(marks, col as i64);
             let lit = hovered_at(&hovered, screen_row, col);
+            let ink = match cell.fg {
+                CellColor::Indexed(i) if v.options.bold_bright && cell.bold && i < 8 => {
+                    CellColor::Indexed(i + 8)
+                }
+                ref other => other.clone(),
+            };
             let (mut fg, mut bg) = (
-                resolve(&cell.fg, foreground, &colors),
+                resolve(&ink, foreground, &colors),
                 resolve(&cell.bg, background, &colors),
             );
             if cell.inverse {
@@ -586,7 +733,7 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
             }
             // Blocks and box pieces build pictures, as chafa's symbols do, from
             // colors meant to sit close together; only letters are made legible.
-            if !shapes::is_shape(cell.text.as_str()) {
+            if v.options.legible && !shapes::is_shape(cell.text.as_str()) {
                 fg = legible(fg, bg);
             }
             if selected {
@@ -646,7 +793,7 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
                 run.italic = cell.italic;
                 let mut key = format!("{}#{}", run.key(), text);
                 lay_out(&mut layouts, &key, text, &run);
-                let mut at = ((origin.x + x) as f64, (origin.y + y) as f64);
+                let mut at = ((origin.x + x) as f64, (origin.y + y) as f64 + rise);
                 // A glyph wider than its cells, such as an emoji a program
                 // counts as one cell, is drawn smaller and centered on its
                 // row, so it stays inside them.
@@ -703,7 +850,76 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
     });
     // The cursor shows focus, filled while the terminal has it and hollow
     // otherwise, so the terminal draws no focus ring around its screen.
-    paint_cursor(&frame, focused, shown(colors.cursor_bg), cx, (cw, lh, pad));
+    paint_cursor(
+        &frame,
+        focused,
+        &v.options,
+        shown(colors.cursor_bg),
+        cx,
+        (cw, lh, pad),
+    );
+    if let Some(bar) = scrollbar(v, &theme, r, rows, (scrolled, history)) {
+        cx.fill_round(bar.track, theme.px(3), foreground.with_alpha(28));
+        cx.fill_round(bar.thumb, theme.px(3), foreground.with_alpha(110));
+    }
+    if cx.now < flash_until {
+        cx.fill(r, foreground.with_alpha(40));
+        with_entry(v.terminal, |entry| {
+            entry.animation_due = Some(
+                entry
+                    .animation_due
+                    .map_or(flash_until, |d| d.min(flash_until)),
+            )
+        });
+    }
+}
+
+// The bell's flash, in milliseconds.
+const FLASH_MS: i64 = 150;
+
+// A scrollbar's track and thumb, local to the view.
+struct Scrollbar {
+    track: Rect,
+    thumb: Rect,
+}
+
+// Where the scrollbar of `v` in `area` lies, showing `rows` of a screen
+// `scrolled` back into `history` rows; None while it does not show.
+fn scrollbar(
+    v: &View,
+    theme: &Theme,
+    area: Rect,
+    rows: i64,
+    (scrolled, history): (i64, i64),
+) -> Option<Scrollbar> {
+    let shows = match v.options.scrollbar.as_str() {
+        "always" => history > 0,
+        "scrolling" => scrolled > 0,
+        _ => false,
+    };
+    if !shows {
+        return None;
+    }
+    let width = theme.px(SCROLLBAR);
+    let inset = theme.px(2);
+    let track = Rect::new(
+        area.width - width + inset,
+        inset,
+        width - 2 * inset,
+        area.height - 2 * inset,
+    );
+    let total = (history + rows).max(1);
+    let length = (track.height * rows / total)
+        .max(theme.px(24))
+        .min(track.height);
+    // The thumb sits at the bottom on the live screen and rises as the view
+    // goes back.
+    let travel = track.height - length;
+    let y = track.y + travel - travel * scrolled / history.max(1);
+    Some(Scrollbar {
+        track,
+        thumb: Rect::new(track.x, y, track.width, length),
+    })
 }
 
 // The whole pixels a cell `length` long spans.
@@ -728,6 +944,7 @@ fn lay_out(
 fn paint_cursor(
     frame: &Frame,
     focused: bool,
+    options: &ViewOptions,
     color: Color,
     cx: &mut PaintCx,
     (cw, lh, pad): (f64, f64, i64),
@@ -739,10 +956,20 @@ fn paint_cursor(
     let x = pad + (f64::from(col) * cw) as i64;
     let y = pad + (f64::from(row) * lh) as i64;
     let cell = Rect::new(x, y, cw.ceil() as i64, lh as i64);
+    let line = cx.theme.px(2).max(1);
+    let shape = match options.cursor.as_str() {
+        "bar" => Rect::new(x, y, line, cell.height),
+        "underline" => Rect::new(x, y + cell.height - line, cell.width, line),
+        _ => cell,
+    };
     if !focused {
-        cx.stroke_round(cell, 0, 1, color);
-    } else if cx.caret_on {
-        cx.fill(cell, color.with_alpha(160));
+        if shape == cell {
+            cx.stroke_round(cell, 0, 1, color);
+        } else {
+            cx.fill(shape, color.with_alpha(160));
+        }
+    } else if cx.caret_on || !options.blink {
+        cx.fill(shape, color.with_alpha(160));
     }
 }
 
@@ -836,21 +1063,25 @@ fn printable(key: Key, shift: bool) -> Option<char> {
 // letters, digits, PageUp and PageDown, and any other a window command
 // binds.
 fn application_chord(key: Key, mods: windowing::Mods, cx: &EventCx) -> bool {
-    let stroke = [(key, mods)];
     printable(key, false).is_some_and(|c| c != ' ')
         || key == Key::PageUp
         || key == Key::PageDown
-        || cx
-            .registry
-            .iter()
-            .any(|c| c.enabled && c.shortcuts.iter().any(|s| s.progress(&stroke).0))
+        || bound_chord(key, mods, cx)
+}
+
+// Whether an enabled command of the window is bound to this stroke.
+fn bound_chord(key: Key, mods: windowing::Mods, cx: &EventCx) -> bool {
+    let stroke = [(key, mods)];
+    cx.registry
+        .iter()
+        .any(|c| c.enabled && c.shortcuts.iter().any(|s| s.progress(&stroke).0))
 }
 
 fn ime_area(v: &View, cx: &mut EventCx) {
     let cursor = with_entry(v.terminal, |e| e.engine.cursor());
     if let Some((row, col)) = cursor {
         let (cw, lh, _) = metrics(v, &cx.theme);
-        let pad = cx.theme.px(PAD);
+        let pad = pad_of(v, &cx.theme);
         let x = pad + (f64::from(col) * cw) as i64;
         let y = pad + (f64::from(row) * lh) as i64;
         cx.ime = Some((
@@ -932,6 +1163,9 @@ pub fn terminal_event(v: &View, node: &Node, ev: &Event, _st: &mut StateStore, c
             mods,
         } => {
             cx.focus_on(&v.id);
+            if *button == MouseButton::Left && drag_scrollbar(v, node, *y, cx, Some((*x, *y))) {
+                return redraw(cx);
+            }
             let link = link_under(v, &cx.theme, *x, *y);
             point(v, link.as_ref(), cx);
             if let (MouseButton::Left, Some(target)) = (button, &link)
@@ -978,13 +1212,20 @@ pub fn terminal_event(v: &View, node: &Node, ev: &Event, _st: &mut StateStore, c
                         },
                     );
                     let _ = super::select(v.terminal, Some(line));
+                    selected(v);
+                }
+                MouseButton::Left if *clicks == 2 => {
+                    if let Some(word) = word_at(v, at) {
+                        let _ = super::select(v.terminal, Some(word));
+                        selected(v);
+                    }
                 }
                 MouseButton::Left => {
                     let _ = super::select(v.terminal, Some((at, at)));
                     cx.capture_pointer(&v.id);
                 }
                 MouseButton::Middle => {
-                    let _ = super::paste(v.terminal, &crate::services::clipboard::primary_text());
+                    paste(v, &crate::services::clipboard::primary_text(), cx);
                 }
                 _ => {}
             }
@@ -994,6 +1235,12 @@ pub fn terminal_event(v: &View, node: &Node, ev: &Event, _st: &mut StateStore, c
             let none = wezterm_term::MouseButton::None;
             report_pointer(v, &cx.theme, (*x, *y), MouseEventKind::Move, none, *mods);
             hover(v, link_under(v, &cx.theme, *x, *y), cx);
+        }
+        Event::PointerMove {
+            y, pressed: true, ..
+        } if with_entry(v.terminal, |e| e.scrollbar_drag).unwrap_or(false) => {
+            drag_scrollbar(v, node, *y, cx, None);
+            redraw(cx);
         }
         Event::PointerMove {
             x,
@@ -1031,14 +1278,29 @@ pub fn terminal_event(v: &View, node: &Node, ev: &Event, _st: &mut StateStore, c
         }
         Event::PointerUp { .. } => {
             cx.release_pointer();
+            if with_entry(v.terminal, |e| std::mem::take(&mut e.scrollbar_drag)) == Some(true) {
+                return redraw(cx);
+            }
             let collapsed = with_entry(v.terminal, |e| e.selection.is_some_and(|(a, b)| a == b));
             if collapsed == Some(true) {
                 let _ = super::select(v.terminal, None);
-            } else if let Ok(text) = super::copy(v.terminal)
-                && !text.is_empty()
-            {
-                crate::services::clipboard::set_primary_text(&text);
+            } else {
+                selected(v);
             }
+            redraw(cx);
+        }
+        Event::Drop { paths, text, .. } if !paths.is_empty() || !text.is_empty() => {
+            cx.focus_on(&v.id);
+            let dropped = if paths.is_empty() {
+                text.clone()
+            } else {
+                paths
+                    .iter()
+                    .map(|p| shell_quoted(p))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            paste(v, &dropped, cx);
             redraw(cx);
         }
         Event::Scroll { x, y, dy, mods, .. } => {
@@ -1074,9 +1336,7 @@ pub fn terminal_event(v: &View, node: &Node, ev: &Event, _st: &mut StateStore, c
         Event::Command(name) if focused => {
             let used = match name.as_str() {
                 "edit.copy" => copy_selection(v),
-                "edit.paste" => {
-                    super::paste(v.terminal, &crate::services::clipboard::text()).is_ok()
-                }
+                "edit.paste" => paste(v, &crate::services::clipboard::text(), cx),
                 "edit.select-all" => super::select(
                     v.terminal,
                     Some((
@@ -1109,6 +1369,127 @@ pub fn terminal_event(v: &View, node: &Node, ev: &Event, _st: &mut StateStore, c
     }
 }
 
+// The selection just made goes to the primary selection, and to the
+// clipboard too when the view copies on select.
+fn selected(v: &View) {
+    if let Ok(text) = super::copy(v.terminal)
+        && !text.is_empty()
+    {
+        crate::services::clipboard::set_primary_text(&text);
+        if v.options.copy_on_select {
+            crate::services::clipboard::set_text(&text);
+        }
+    }
+}
+
+// Pastes `text`, or holds it for the application to confirm when the view
+// asks that of pastes that run commands or send control characters.
+fn paste(v: &View, text: &str, cx: &mut EventCx) -> bool {
+    if text.is_empty() {
+        return false;
+    }
+    if v.options.confirm_paste && risky_paste(text) {
+        cx.emit(&UiMsg::Terminal(
+            v.terminal,
+            TerminalEvent::PasteHeld(text.to_string()),
+        ));
+        return true;
+    }
+    super::paste(v.terminal, text).is_ok()
+}
+
+/// Whether pasting `text` could run a command or send control characters:
+/// it holds a line break, other than one that ends it, or a control
+/// character other than a tab.
+pub fn risky_paste(text: &str) -> bool {
+    let body = text.strip_suffix('\n').unwrap_or(text);
+    let body = body.strip_suffix('\r').unwrap_or(body);
+    body.chars().any(|c| c.is_control() && c != '\t')
+}
+
+// `path` quoted for a POSIX shell, unless it needs no quoting.
+fn shell_quoted(path: &str) -> String {
+    let plain = !path.is_empty()
+        && path
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./:@%+=,~".contains(c));
+    if plain {
+        path.to_string()
+    } else {
+        format!("'{}'", path.replace('\'', "'\\''"))
+    }
+}
+
+// The word around cell `at` of the screen: letters, digits and the view's
+// word characters, or None on a blank.
+fn word_at(v: &View, at: Cell) -> Option<(Cell, Cell)> {
+    let frame = with_entry(v.terminal, |e| e.engine.frame()).and_then(Result::ok)?;
+    let cells = frame.cells().get(usize::try_from(at.row).ok()?)?;
+    let word = |col: usize| {
+        cells.get(col).is_some_and(|c| {
+            c.continuation
+                || c.text
+                    .as_str()
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| ch.is_alphanumeric() || v.options.word_chars.contains(ch))
+        })
+    };
+    let col = usize::try_from(at.col)
+        .ok()?
+        .min(cells.len().saturating_sub(1));
+    if !word(col) {
+        return None;
+    }
+    let mut start = col;
+    while start > 0 && word(start - 1) {
+        start -= 1;
+    }
+    let mut end = col + 1;
+    while end < cells.len() && word(end) {
+        end += 1;
+    }
+    Some((
+        Cell {
+            row: at.row,
+            col: start as i64,
+        },
+        Cell {
+            row: at.row,
+            col: end as i64,
+        },
+    ))
+}
+
+// Scrolls to where pointer row `y` falls on the scrollbar. A press (`at`)
+// starts a drag when it lands on a shown scrollbar and answers whether it
+// did; a move continues one.
+fn drag_scrollbar(v: &View, node: &Node, y: i64, cx: &mut EventCx, at: Option<(i64, i64)>) -> bool {
+    let theme = cx.theme.clone();
+    let area = Rect::from_size(node.size());
+    let (rows, _) = grid(v, &theme, node.size());
+    let Some((scrolled, history)) = with_entry(v.terminal, |e| {
+        (e.scrolled as i64, e.engine.history() as i64)
+    }) else {
+        return false;
+    };
+    let Some(bar) = scrollbar(v, &theme, area, rows, (scrolled, history)) else {
+        return false;
+    };
+    if let Some((x, _)) = at {
+        if x < bar.track.x - theme.px(2) {
+            return false;
+        }
+        with_entry(v.terminal, |e| e.scrollbar_drag = true);
+        cx.capture_pointer(&v.id);
+    }
+    let travel = (bar.track.height - bar.thumb.height).max(1);
+    let from_top = (y - bar.track.y - bar.thumb.height / 2).clamp(0, travel);
+    let target = history - history * from_top / travel;
+    let _ = super::scroll(v.terminal, target - scrolled);
+    true
+}
+
 fn copy_selection(v: &View) -> bool {
     match super::copy(v.terminal) {
         Ok(text) if !text.is_empty() => {
@@ -1132,12 +1513,22 @@ fn key_down(v: &View, key: Key, mods: windowing::Mods, rows: i64, cx: &mut Event
         return redraw(cx);
     }
     if mods.ctrl && mods.shift && key == Key::V {
-        let _ = super::paste(v.terminal, &crate::services::clipboard::text());
+        paste(v, &crate::services::clipboard::text(), cx);
         return redraw(cx);
     }
     // The rest of the Ctrl+Shift layer belongs to the application, as in
     // other desktop terminals, so those strokes reach the window's commands.
     if mods.ctrl && mods.shift && application_chord(key, mods, cx) {
+        return;
+    }
+    // A Ctrl or Alt chord the window binds to a command is the window's, as
+    // GNOME Terminal takes Ctrl+= for zoom and Alt+1 for the first tab. Ctrl
+    // and Alt with a letter stay the program's: they are its control codes
+    // and Meta keys.
+    if (mods.ctrl || mods.alt)
+        && !printable(key, false).is_some_and(|c| c.is_ascii_alphabetic())
+        && bound_chord(key, mods, cx)
+    {
         return;
     }
     // F10 opens the window's menu bar, as in GNOME Terminal; Shift+F10 opens
@@ -1158,6 +1549,11 @@ fn key_down(v: &View, key: Key, mods: windowing::Mods, rows: i64, cx: &mut Event
         let page = if key == Key::PageUp { rows } else { -rows };
         let _ = super::scroll(v.terminal, page);
         return redraw(cx);
+    }
+    // Option types characters on macOS unless it is set to send Meta; the
+    // text arrives as a Text event.
+    if cfg!(target_os = "macos") && mods.alt && !mods.ctrl && !v.options.option_as_meta {
+        return;
     }
     let Some(encoded) = encode_key(key, mods) else {
         return;
@@ -1275,6 +1671,22 @@ mod tests {
         );
         let expected = DEFAULT_POINTS * 96.0 / 72.0 * theme.scale * theme.text_scale;
         assert!((default.size - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_font_weight_draws_the_family_at_that_weight_with_bold_heavier() {
+        let theme = Theme::default();
+        let mut view = View::new("term", 1, "Shell");
+        view.options.font_weight = 300;
+        let (_, _, style) = metrics(&view, &theme);
+        let family = crate::text::fonts::Family::Named(format!("{DEFAULT_FONT} (weight 300)"));
+        assert_eq!(style.family, family);
+        let bold = crate::text::fonts::face(crate::text::fonts::primary(&family, true));
+        assert_eq!(bold.weight, 700);
+        assert!(bold.bold);
+        assert!(style.ligatures);
+        view.options.ligatures = false;
+        assert!(!metrics(&view, &theme).2.ligatures);
     }
 
     #[test]

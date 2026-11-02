@@ -26,6 +26,8 @@ pub struct FontRecord {
     pub style: String,
     pub bold: bool,
     pub italic: bool,
+    /// The weight on the CSS scale (400 regular, 700 bold); 0 when unknown.
+    pub weight: i64,
     pub monospace: bool,
     /// Whether the face draws color bitmaps (CBDT) instead of outlines.
     pub color: bool,
@@ -121,6 +123,7 @@ pub fn scan_file(file: &str) -> Result<Vec<FontRecord>, errors::Error> {
             style: face.subfamily.clone(),
             bold: face.bold,
             italic: face.italic,
+            weight: face.weight,
             monospace: face.monospace,
             color,
             coverage: face.coverage(),
@@ -311,7 +314,7 @@ pub fn load_cancellable(
 
 /// Where the toolkit caches the summaries of installed fonts.
 pub fn cache_file() -> String {
-    paths::join(&services::cache_dir("gui-gos"), "fonts-v2.json")
+    paths::join(&services::cache_dir("gui-gos"), "fonts-v3.json")
 }
 
 #[cfg(test)]

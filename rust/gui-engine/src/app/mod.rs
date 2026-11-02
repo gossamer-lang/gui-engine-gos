@@ -131,6 +131,10 @@ pub struct WindowState {
     /// The key of the window a dialog window belongs to; "" for the
     /// application's own windows.
     pub owner: String,
+    /// The window's surface can show what lies behind it.
+    pub see_through: bool,
+    /// The window shows what lies behind it where it paints nothing opaque.
+    pub transparent: bool,
     pub semantics: AccessNode,
     pub frames: i64,
     /// Mnemonic underlines show (Alt held, or a menu opened from the keyboard).
@@ -186,6 +190,8 @@ const SHORTCUT_DIALOG_SIZE: (i64, i64) = (560, 360);
 const SHORTCUT_DIALOG_MIN: (i64, i64) = (480, 340);
 const SETTINGS_DIALOG_SIZE: (i64, i64) = (720, 640);
 const SETTINGS_DIALOG_MIN: (i64, i64) = (480, 360);
+// How far a dialog window opened over another sits from it, in logical units.
+const DIALOG_CASCADE: i64 = 32;
 
 // The window a dialog opens in when it needs more room than the window that
 // asked may have: its key prefix, the size it opens at, and its minimum size.
@@ -249,6 +255,12 @@ pub struct Session {
     /// The display scale `Effect::SetDisplayScale` draws every window at,
     /// in place of each display's own.
     scale_override: Option<f64>,
+    /// Whether the application's own windows show what lies behind them, so
+    /// a view can paint a translucent background (`Session::set_transparent`).
+    transparent: bool,
+    /// Whether the application's own windows open with surfaces that can be
+    /// see-through (`Session::allow_transparency`).
+    see_through: bool,
     shell: Option<Shell>,
     disposed: Option<DisposedCallback>,
     timers: Vec<Timer>,
@@ -401,6 +413,8 @@ pub fn start(name: &str, app_id: &str) -> Result<Session, errors::Error> {
             || std::env::var("GUI_TEST_INLINE_WORK").is_ok_and(|value| value == "1"),
         held_jobs: vec![],
         scale_override: None,
+        transparent: false,
+        see_through: false,
         shell: None,
         disposed: None,
         timers: vec![],
@@ -480,6 +494,12 @@ fn with_preferences(
     };
     if let Some(points) = prefs.menu_font_size.filter(|p| (4.0..=72.0).contains(p)) {
         t.typography = t.typography.with_menu_points(points)
+    }
+    // Text and the controls holding it follow the desktop's interface font.
+    if let Some(points) = prefs.font_size.filter(|p| (4.0..=72.0).contains(p)) {
+        let factor = points * 96.0 / 72.0 / t.typography.body.size;
+        t.typography = t.typography.with_body_points(points);
+        t.shape = t.shape.scaled(factor);
     }
     t
 }
@@ -612,6 +632,8 @@ impl Session {
             } else {
                 windowing::WindowKind::Normal
             },
+            // Dialog windows stay opaque.
+            transparent: self.see_through && parent.is_none(),
             parent,
             ..windowing::WindowOptions::default()
         };
@@ -702,6 +724,8 @@ impl Session {
             active: true,
             close_policy: ClosePolicy::Close,
             owner: String::new(),
+            see_through: options.transparent,
+            transparent: options.transparent && self.transparent,
             semantics: AccessNode::new(crate::accessibility::Role::TopLevel, title),
             frames: 0,
             mnemonics: false,
@@ -761,6 +785,52 @@ impl Session {
             window_extent(t.px(width), lw, pw),
             window_extent(t.px(height), lh, ph),
         )?)
+    }
+
+    /// Makes the application's windows see-through, so a view can paint a
+    /// translucent background; dialog windows stay opaque. It reaches open
+    /// windows when they opened after `allow_transparency`, and windows
+    /// opened from now on. Where no compositor blends windows, a translucent
+    /// pixel shows dark.
+    pub fn set_transparent(&mut self, transparent: bool) {
+        if transparent {
+            self.see_through = true;
+        }
+        self.transparent = transparent;
+        for win in self.windows.iter_mut().filter(|w| w.see_through) {
+            win.transparent = transparent;
+            win.dirty = true;
+        }
+    }
+
+    /// Opens the application's windows from now on with surfaces that can
+    /// show what lies behind them, opaque until `set_transparent`, so that
+    /// call reaches them while they are open.
+    pub fn allow_transparency(&mut self) {
+        self.see_through = true;
+    }
+
+    /// Makes window `key` `width` by `height` interface units.
+    pub fn set_window_size(
+        &mut self,
+        key: &str,
+        width: i64,
+        height: i64,
+    ) -> Result<(), errors::Error> {
+        let w = self.find(key);
+        if w < 0 {
+            return Ok(());
+        };
+        let win = self.windows[w as usize].native;
+        let (lw, lh) = win.size();
+        let (pw, ph) = win.pixel_size();
+        let t = &self.windows[w as usize].theme;
+        win.set_size(
+            window_extent(t.px(width), lw, pw),
+            window_extent(t.px(height), lh, ph),
+        )?;
+        self.invalidate(w, "window resized");
+        Ok(())
     }
 
     /// Makes window `key` `height` interface units tall and lets it grow
@@ -3661,6 +3731,10 @@ impl Session {
                 Effect::SetMinSize(window, width, height) => {
                     self.set_min_size(&window, width, height)?
                 }
+                Effect::SetWindowSize(window, width, height) => {
+                    self.set_window_size(&window, width, height)?
+                }
+                Effect::SetTransparent(transparent) => self.set_transparent(transparent),
                 Effect::RequestAttention(window) => {
                     let w = self.find(&window);
                     if w >= 0
@@ -4381,17 +4455,24 @@ impl Session {
     /// file dialogs are modal to their window whatever it says.
     pub fn open_dialog_as(&mut self, w: i64, req: &DialogRequest, modality: Modality) {
         let id = req.id();
-        // A progress update replaces the open dialog of the same id.
-        let mut i = 0;
-        while i < self.windows[w as usize].dialogs.len() {
-            if self.windows[w as usize].dialogs[i].id == id {
-                let mut inst = self.windows[w as usize].dialogs[i].clone();
+        // A progress update replaces the open dialog of the same id, in the
+        // window that asked or a dialog window of its own.
+        let owner = self.windows[w as usize].key.clone();
+        for d in 0..self.windows.len() {
+            if d != w as usize && self.windows[d].owner != owner {
+                continue;
+            }
+            if let Some(i) = self.windows[d]
+                .dialogs
+                .iter()
+                .position(|inst| inst.id == id)
+            {
+                let mut inst = self.windows[d].dialogs[i].clone();
                 inst.update_request(req);
-                self.windows[w as usize].dialogs[i] = inst.clone();
-                self.relayout_dialog(w, i as i64);
+                self.windows[d].dialogs[i] = inst;
+                self.relayout_dialog(d as i64, i as i64);
                 return;
             }
-            i += 1;
         }
         match host::native_plan(req) {
             host::Plan::Native(title, location, filters, many, mode) => {
@@ -4429,6 +4510,16 @@ impl Session {
                 return;
             }
             host::Plan::Toolkit => (),
+        }
+        // A dialog asked for while the window's own dialog window is open
+        // opens over that one, as Edit Colors does over Settings.
+        let mut w = w;
+        while let Some(d) = self
+            .windows
+            .iter()
+            .rposition(|win| win.owner == self.windows[w as usize].key && !win.dialogs.is_empty())
+        {
+            w = d as i64;
         }
         // A dialog that needs more room than the window that asked may have
         // opens in a window of its own, modal to that one.
@@ -4523,6 +4614,18 @@ impl Session {
             self.windows[d as usize].theme = opener.theme.clone();
         }
         self.set_min_size(&key, min_w, min_h)?;
+        // Over another dialog window it cascades, so both stay in view.
+        if !self.windows[owner as usize].owner.is_empty() && windowing::video_driver() != "wayland"
+        {
+            let (x, y) = parent.position();
+            let step = DIALOG_CASCADE;
+            if let Err(e) = self.windows[d as usize]
+                .native
+                .set_position(x + step, y + step)
+            {
+                self.log_line(&format!("window placement unavailable: {}", e))
+            }
+        }
         self.show_window(&key)?;
         Ok(d)
     }
@@ -4922,7 +5025,13 @@ impl Session {
         let win = &self.windows[w as usize];
         let theme = &win.theme;
 
-        canvas.fill(theme.background);
+        // A see-through window starts each frame clear; its views paint what
+        // should cover what lies behind it.
+        canvas.fill(if win.transparent {
+            Color::rgba(0, 0, 0, 0)
+        } else {
+            theme.background
+        });
         let mut cx = PaintCx::new(&canvas, theme, &win.states);
         cx.focus = win.focus.clone();
         cx.hover = win.hover.last().cloned().unwrap_or_default();
@@ -6201,6 +6310,37 @@ mod dialog_scope_tests {
     }
 
     #[test]
+    fn transparency_reaches_open_windows_whose_surfaces_allow_it() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::application(
+                "Small",
+                "dev.gossamer.gui-transparency-test",
+                Log::default,
+                log_update,
+                log_view,
+            )
+            .size(300, 160)
+            .start()
+            .unwrap();
+            s.allow_transparency();
+            s.open_window("second", "Second", 300, 160).unwrap();
+            let main = s.find("main") as usize;
+            let second = s.find("second") as usize;
+            assert!(!s.windows[second].transparent);
+            s.set_transparent(true);
+            assert!(!s.windows[main].transparent);
+            assert!(s.windows[second].transparent);
+            s.set_transparent(false);
+            assert!(!s.windows[second].transparent);
+            s.shutdown();
+        });
+    }
+
+    #[test]
     fn preferences_open_in_a_window_of_their_own() {
         crate::testing::on_ui_thread(|| {
             let config = crate::services::private_test_config();
@@ -6233,7 +6373,7 @@ mod dialog_scope_tests {
             crate::perform(Effect::OpenDialog(request::preferences(
                 "settings",
                 "Settings",
-                &[page],
+                std::slice::from_ref(&page),
             )));
             s.flush().unwrap();
             assert_eq!(s.windows.len(), 2);
@@ -6268,7 +6408,30 @@ mod dialog_scope_tests {
                 ok.y + ok.node.rect.height,
                 bottom
             );
+            // Sent again, the dialog updates where it is: a field the
+            // application changed shows its new value, the user's drafts stay.
+            s.windows[1].dialogs[0]
+                .values
+                .insert("field:field0".to_string(), "typed".to_string());
+            s.windows[1].dialogs[0]
+                .values
+                .insert("field:field1".to_string(), "kept".to_string());
+            let mut changed = page.clone();
+            changed.fields[0].value = "new".to_string();
+            crate::perform(Effect::OpenDialog(request::preferences(
+                "settings",
+                "Settings",
+                &[changed],
+            )));
+            s.flush().unwrap();
+            assert_eq!(s.windows.len(), 2);
+            assert_eq!(s.windows[1].dialogs.len(), 1);
+            let values = &s.windows[1].dialogs[0].values;
+            assert_eq!(values.get("field:field0").map(String::as_str), Some("new"));
+            assert_eq!(values.get("field:field1").map(String::as_str), Some("kept"));
+            // Unapplied drafts are discarded only once confirmed.
             s.press(Key::Escape, Mods::default()).unwrap();
+            assert!(s.click("dlg:settings:discard").unwrap());
             s.flush().unwrap();
             assert_eq!(s.windows.len(), 1);
             assert!(!s.blocked(0));
@@ -6323,6 +6486,7 @@ mod dialog_scope_tests {
             accent,
             text_scale: text,
             menu_font_size: None,
+            font_size: None,
         }
     }
 
@@ -6379,6 +6543,28 @@ mod dialog_scope_tests {
             ),
             base
         )
+    }
+
+    #[test]
+    fn the_desktop_interface_font_size_scales_text_and_controls() {
+        let base = crate::style::Theme::light();
+        let mut desktop = prefs(None, None, None, None);
+        desktop.font_size = Some(10.0);
+        let t = super::with_preferences(base.clone(), desktop, None, false, false, false);
+        let body = t.font(crate::style::TextRole::Body);
+        assert!((body.size - 10.0 * 96.0 / 72.0 * t.scale * t.text_scale).abs() < 1e-9);
+        let factor = body.size / base.font(crate::style::TextRole::Body).size;
+        let heading = t.font(crate::style::TextRole::Heading).size;
+        assert!((heading - base.font(crate::style::TextRole::Heading).size * factor).abs() < 1e-9);
+        assert!(t.control_height() < base.control_height());
+        assert!(t.row_height() < base.row_height());
+        assert_eq!(
+            t.font(crate::style::TextRole::Menu),
+            base.font(crate::style::TextRole::Menu)
+        );
+        desktop.font_size = Some(0.0);
+        let kept = super::with_preferences(base.clone(), desktop, None, false, false, false);
+        assert_eq!(kept, base);
     }
 
     #[test]

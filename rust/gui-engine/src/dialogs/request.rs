@@ -152,6 +152,10 @@ pub enum PreferenceKind {
     Integer(i64, i64),
     Choice(Vec<(String, String)>),
     Color,
+    /// A button labeled with the field's label: a click reports
+    /// `UiMsg::DialogPreview(id, Outcome::Action(key))` and leaves the
+    /// dialog open, as an Open Folder button does.
+    Action,
 }
 
 /// One page of a wizard; `skip_if` names a field whose "true" value skips

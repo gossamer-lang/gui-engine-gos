@@ -505,7 +505,7 @@ const SEEN: usize = 4;
 
 /// The pixels a frame is rasterized into, such as a window's surface: rows
 /// `stride` bytes apart, each pixel four bytes holding red, green and blue at
-/// `offsets` and an opaque fourth byte.
+/// `offsets` and their coverage in the fourth byte, premultiplied.
 pub struct Target<'a> {
     pub pixels: &'a mut [u8],
     pub width: i64,
@@ -890,12 +890,12 @@ fn band_raster(
                 match (ro, go, bo) {
                     (0, 1, 2) => {
                         for (d, s) in into.iter_mut().zip(from) {
-                            *d = [s[0], s[1], s[2], 255];
+                            *d = [s[0], s[1], s[2], s[3]];
                         }
                     }
                     (2, 1, 0) => {
                         for (d, s) in into.iter_mut().zip(from) {
-                            *d = [s[2], s[1], s[0], 255];
+                            *d = [s[2], s[1], s[0], s[3]];
                         }
                     }
                     _ => {
@@ -903,7 +903,7 @@ fn band_raster(
                             d[ro] = s[0];
                             d[go] = s[1];
                             d[bo] = s[2];
-                            d[3] = 255;
+                            d[3] = s[3];
                         }
                     }
                 }

@@ -43,7 +43,7 @@ impl Conversion<'_> {
                     d[ro] = s[0];
                     d[go] = s[1];
                     d[bo] = s[2];
-                    d[3] = 255;
+                    d[3] = s[3];
                 }
             }
         }
@@ -387,7 +387,7 @@ mod tests {
                         canvas.pixels[src + 2],
                         canvas.pixels[src + 1],
                         canvas.pixels[src],
-                        255,
+                        canvas.pixels[src + 3],
                     ]
                 } else {
                     [7; 4]

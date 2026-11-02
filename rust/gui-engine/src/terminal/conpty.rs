@@ -257,6 +257,11 @@ impl Pty {
         false
     }
 
+    /// A console does not say which program holds it.
+    pub fn job(&self) -> Option<String> {
+        None
+    }
+
     /// Windows has no POSIX signals to send to a console program.
     pub fn signal(&self, signum: i32) -> Result<(), String> {
         Err(format!(

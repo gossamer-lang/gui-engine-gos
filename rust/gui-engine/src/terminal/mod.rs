@@ -122,6 +122,9 @@ pub enum Event {
     /// The user asked to open a file path the screen shows: its absolute
     /// path and the line and column after it, 0 when it names none.
     PathActivated(String, i64, i64),
+    /// A paste of several lines or of control characters waits for the
+    /// application to confirm it, which then pastes the text itself.
+    PasteHeld(String),
 }
 
 /// The state of a terminal an application reads.
@@ -149,6 +152,10 @@ pub struct Snapshot {
     /// command does; closing the terminal would end it.
     #[serde(default)]
     pub busy: bool,
+    /// The program name of the foreground job while `busy`, where the system
+    /// names it.
+    #[serde(default)]
+    pub job: String,
     /// Input bytes waiting for the program and output waiting to be parsed.
     pub queued_input: i64,
     pub queued_output: i64,
@@ -201,6 +208,15 @@ struct Entry {
     pictures: images::Pictures,
     /// When an animated image the screen shows next changes frame.
     animation_due: Option<i64>,
+    /// Whether new output, and typing, bring a view scrolled back to the
+    /// live screen; the widget sets them from its options.
+    scroll_on_output: bool,
+    scroll_on_keystroke: bool,
+    /// The bells the widget has answered, and when its flash ends.
+    bells_flashed: u64,
+    flash_until: i64,
+    /// The pointer is dragging the scrollbar's thumb.
+    scrollbar_drag: bool,
 }
 
 /// A stretch of a terminal's buffer, its end excluded, in rows counted from
@@ -339,6 +355,11 @@ pub fn create(options: &Options, budget: Budget) -> Result<i64, String> {
             highlights: Vec::new(),
             pictures: images::Pictures::default(),
             animation_due: None,
+            scroll_on_output: false,
+            scroll_on_keystroke: true,
+            bells_flashed: 0,
+            flash_until: 0,
+            scrollbar_drag: false,
         },
     );
     Ok(id)
@@ -497,9 +518,12 @@ fn send(entry: &mut Entry, bytes: &[u8]) -> Result<(), String> {
         entry.synchronized = false;
         entry.revision += 1;
     }
-    if entry.scrolled != 0 || entry.selection.is_some() {
+    if entry.scrolled != 0 && entry.scroll_on_keystroke {
         entry.scrolled = 0;
         entry.engine.scroll(0);
+        entry.revision += 1;
+    }
+    if entry.selection.is_some() {
         entry.selection = None;
         entry.revision += 1;
     }
@@ -638,6 +662,12 @@ pub fn snapshot(id: i64) -> Result<Snapshot, String> {
                 .transport
                 .as_ref()
                 .is_some_and(|t| entry.exit.is_none() && t.busy()),
+            job: entry
+                .transport
+                .as_ref()
+                .filter(|_| entry.exit.is_none())
+                .and_then(Transport::job)
+                .unwrap_or_default(),
             queued_input: queued_input as i64,
             queued_output: queued_output as i64,
         })
@@ -701,6 +731,10 @@ pub(crate) fn pump(budget: &Budget) -> (bool, Vec<UiMsg>) {
             };
             if processed.is_ok() {
                 entry.revision += 1;
+                if entry.scroll_on_output && entry.scrolled != 0 {
+                    entry.scrolled = 0;
+                    entry.engine.scroll(0);
+                }
                 // A synchronized frame shows once the program ends it.
                 let synchronized = entry.engine.synchronized();
                 changed |= !synchronized;

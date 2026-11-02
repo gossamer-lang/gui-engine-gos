@@ -40,6 +40,12 @@ pub enum Effect {
     /// Keeps a window at least this many interface units wide and tall,
     /// growing it now when its current or remembered size is smaller.
     SetMinSize(String, i64, i64),
+    /// Makes a window this many interface units wide and tall.
+    SetWindowSize(String, i64, i64),
+    /// Makes the application's windows see-through (true) or opaque,
+    /// open ones included when their surfaces allow it
+    /// (`Session::set_transparent`).
+    SetTransparent(bool),
     /// Makes a window cover its display (true) or go back to its own frame.
     SetFullscreen(String, bool),
     /// Asks the desktop to draw the user to a window that lacks focus, until

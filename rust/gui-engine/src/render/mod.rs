@@ -856,7 +856,7 @@ fn image_scaled_kernel(
                 for (d, s) in px.iter_mut().zip([r, g, b]) {
                     *d = mix(*d, s, alpha);
                 }
-                px[3] = 255;
+                px[3] = mix(px[3], 255, alpha);
             }
         }
     }
@@ -912,7 +912,7 @@ fn image_rgba(
                 dst[d as usize] = mix(dst[d as usize], rgba[src as usize], a);
                 dst[(d + 1) as usize] = mix(dst[(d + 1) as usize], rgba[(src + 1) as usize], a);
                 dst[(d + 2) as usize] = mix(dst[(d + 2) as usize], rgba[(src + 2) as usize], a);
-                dst[(d + 3) as usize] = 255
+                dst[(d + 3) as usize] = mix(dst[(d + 3) as usize], 255, a)
             }
             col += 1;
         }
@@ -943,7 +943,7 @@ pub fn blit(canvas: &Canvas, frame: &mut windowing::Frame) {
 /// Copy `width` x `height` RGBA pixels from `src` (`src_stride` bytes a
 /// row) into `dst` (`dst_stride` bytes a row), placing red, green, and
 /// blue at the byte offsets `ro`, `go`, `bo` of each destination pixel
-/// and its fourth byte opaque.
+/// and its coverage in the fourth byte.
 pub fn blit_rgba(
     dst: &mut [u8],
     dst_stride: i64,
@@ -964,7 +964,7 @@ pub fn blit_rgba(
             dst[(d + ro) as usize] = src[s as usize];
             dst[(d + go) as usize] = src[(s + 1) as usize];
             dst[(d + bo) as usize] = src[(s + 2) as usize];
-            dst[(d + 3) as usize] = 255;
+            dst[(d + 3) as usize] = src[(s + 3) as usize];
             s += 4;
             d += 4;
         }
@@ -972,16 +972,20 @@ pub fn blit_rgba(
     }
 }
 
-/// Fill every pixel of `fb` with `color`. One call per frame start.
+/// Fill every pixel of `fb` with `color`. One call per frame start. Pixels
+/// hold color premultiplied by their coverage, so a translucent clear (a
+/// see-through window's) scales its channels by its alpha.
 pub fn clear(fb: &mut [u8], color: Color) {
-    let mut i = 0;
-    let n = fb.len();
-    while i + 4 <= n {
-        fb[i] = color.r;
-        fb[i + 1] = color.g;
-        fb[i + 2] = color.b;
-        fb[i + 3] = 255;
-        i += 4;
+    let a = u16::from(color.a);
+    let channel = |c: u8| (u16::from(c) * a / 255) as u8;
+    let pixel = [
+        channel(color.r),
+        channel(color.g),
+        channel(color.b),
+        color.a,
+    ];
+    for px in fb.as_chunks_mut::<4>().0 {
+        *px = pixel;
     }
 }
 
@@ -1025,7 +1029,7 @@ pub fn blend_rect(
                     mix(p[0], color.r, opacity),
                     mix(p[1], color.g, opacity),
                     mix(p[2], color.b, opacity),
-                    255,
+                    mix(p[3], 255, opacity),
                 ];
             }
         }
@@ -1055,13 +1059,14 @@ fn blend_px(
     if a >= 255 {
         fb[o as usize] = color.r;
         fb[(o + 1) as usize] = color.g;
-        fb[(o + 2) as usize] = color.b
+        fb[(o + 2) as usize] = color.b;
+        fb[(o + 3) as usize] = 255
     } else {
         fb[o as usize] = mix(fb[o as usize], color.r, a);
         fb[(o + 1) as usize] = mix(fb[(o + 1) as usize], color.g, a);
-        fb[(o + 2) as usize] = mix(fb[(o + 2) as usize], color.b, a)
+        fb[(o + 2) as usize] = mix(fb[(o + 2) as usize], color.b, a);
+        fb[(o + 3) as usize] = mix(fb[(o + 3) as usize], 255, a)
     }
-    fb[(o + 3) as usize] = 255
 }
 
 /// `Canvas::circle` over the pixels `fb` (`stride` bytes a row), clipped to
@@ -1327,11 +1332,13 @@ pub fn blend_coverage(
             if a >= 255 {
                 fb[o as usize] = color.r;
                 fb[(o + 1) as usize] = color.g;
-                fb[(o + 2) as usize] = color.b
+                fb[(o + 2) as usize] = color.b;
+                fb[(o + 3) as usize] = 255
             } else if a > 0 {
                 fb[o as usize] = mix(fb[o as usize], color.r, a);
                 fb[(o + 1) as usize] = mix(fb[(o + 1) as usize], color.g, a);
-                fb[(o + 2) as usize] = mix(fb[(o + 2) as usize], color.b, a)
+                fb[(o + 2) as usize] = mix(fb[(o + 2) as usize], color.b, a);
+                fb[(o + 3) as usize] = mix(fb[(o + 3) as usize], 255, a)
             }
             col += 1;
             ci += 1;
@@ -1500,7 +1507,8 @@ mod tests {
         let mut faded = Canvas::new(2, 1);
         faded.opacity = 128;
         faded.image_scaled(0, 0, 2, 1, &[200, 100, 0, 255], 1, 1);
-        assert_eq!(&faded.pixels[..4], [100, 50, 0, 255]);
+        // Half covered over a transparent canvas: half the color, half alpha.
+        assert_eq!(&faded.pixels[..4], [100, 50, 0, 128]);
         let mut clear = Canvas::new(2, 1);
         clear.image_scaled(0, 0, 2, 1, &[200, 100, 0, 0], 1, 1);
         assert_eq!(&clear.pixels[..4], [0, 0, 0, 0]);
@@ -1528,6 +1536,22 @@ mod tests {
 
     fn fb() -> [u8; 16] {
         [0; 16] // 4x1 pixels, stride 16
+    }
+
+    #[test]
+    fn a_translucent_clear_and_the_fills_over_it_keep_premultiplied_coverage() {
+        let mut c = Canvas::new(2, 1);
+        c.fill(Color::rgba(0, 0, 0, 0));
+        assert_eq!(&c.pixels[..4], [0, 0, 0, 0]);
+        c.opacity = 128;
+        c.rect(0, 0, 1, 1, Color::rgb(200, 100, 0));
+        assert_eq!(&c.pixels[..4], [100, 50, 0, 128]);
+        c.opacity = 255;
+        c.rect(1, 0, 1, 1, Color::rgb(10, 20, 30));
+        assert_eq!(&c.pixels[4..8], [10, 20, 30, 255]);
+        let mut opaque = Canvas::new(1, 1);
+        opaque.fill(Color::rgba(40, 80, 120, 128));
+        assert_eq!(&opaque.pixels[..4], [20, 40, 60, 128]);
     }
 
     #[test]

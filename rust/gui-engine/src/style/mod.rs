@@ -132,6 +132,28 @@ impl Typography {
         t
     }
 
+    /// This ramp scaled so body text is `points`, the desktop's interface
+    /// font size, every role keeping its proportion to it; menus keep their
+    /// own size.
+    pub fn with_body_points(self, points: f64) -> Typography {
+        let factor = points * 96.0 / 72.0 / self.body.size;
+        let scaled = |face: Typeface| Typeface {
+            size: face.size * factor,
+            ..face
+        };
+        Typography {
+            body: scaled(self.body),
+            small: scaled(self.small),
+            caption: scaled(self.caption),
+            label: scaled(self.label),
+            heading: scaled(self.heading),
+            title: scaled(self.title),
+            hero: scaled(self.hero),
+            mono: scaled(self.mono),
+            menu: self.menu,
+        }
+    }
+
     /// The face for `role`.
     pub fn face(&self, role: TextRole) -> Typeface {
         match role {
@@ -191,6 +213,18 @@ pub struct Elevation {
 }
 
 impl Shape {
+    /// These tokens with control, row and indicator heights scaled by
+    /// `factor`, so controls keep fitting text scaled by it.
+    pub fn scaled(self, factor: f64) -> Shape {
+        let by = |n: i64| (n as f64 * factor).round() as i64;
+        Shape {
+            control_height: by(self.control_height),
+            row_height: by(self.row_height),
+            indicator: by(self.indicator),
+            ..self
+        }
+    }
+
     pub fn standard() -> Shape {
         Shape {
             radius: 7,

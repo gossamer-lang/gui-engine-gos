@@ -147,6 +147,14 @@ pub fn call(s: &mut Session, method: &str, a: &str) -> Result<String, String> {
             let (key, w, h): (String, i64, i64) = args(a)?;
             res(s.set_min_size(&key, w, h))
         }
+        "set_transparent" => {
+            s.set_transparent(args::<(bool,)>(a)?.0);
+            done()
+        }
+        "allow_transparency" => {
+            s.allow_transparency();
+            done()
+        }
         "grow_for_popups" => {
             let (key, h): (String, i64) = args(a)?;
             res(s.grow_for_popups(&key, h))

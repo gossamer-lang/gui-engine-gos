@@ -6,6 +6,7 @@ use crate::dialogs::host::Instance;
 use crate::dialogs::request::{
     ButtonRole, DateMode, DialogAction, DialogRequest, PreferenceField, PreferenceKind,
 };
+use crate::render::icons::Icon;
 use crate::services::palette::ColorPalette;
 use crate::strext::StrExt;
 use crate::style::color::Color;
@@ -13,6 +14,7 @@ use crate::style::{TextRole, Theme};
 use crate::widgets::colorpicker::ColorPicker;
 use crate::widgets::cx::UiMsg;
 use crate::widgets::state::StateStore;
+use crate::widgets::tabs::TabItem;
 use crate::widgets::temporal::{Calendar, ClockTime, Date};
 use crate::widgets::{Custom, Tone, Widget};
 use std::collections::HashMap;
@@ -23,6 +25,25 @@ fn cid(inst: &Instance, part: &str) -> String {
 fn value(inst: &Instance, key: &str) -> String {
     inst.values.get(key).map_or("", String::as_str).to_string()
 }
+/// The value each field of `req` carries, by key.
+pub fn field_values(req: &DialogRequest) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let pages = match req {
+        DialogRequest::Preferences { pages, .. } => {
+            pages.iter().flat_map(|p| p.fields.clone()).collect()
+        }
+        DialogRequest::Wizard { pages, .. } => {
+            pages.iter().flat_map(|p| p.fields.clone()).collect()
+        }
+        DialogRequest::Form { fields, .. } => fields.clone(),
+        _ => vec![],
+    };
+    for f in pages {
+        out.insert(f.key, f.value);
+    }
+    out
+}
+
 fn fields(inst: &Instance) -> Vec<PreferenceField> {
     let mut out = vec![];
     match inst.request {
@@ -327,7 +348,7 @@ fn field_view(inst: &Instance, field: &PreferenceField) -> Widget {
         PreferenceKind::Number(min, max) => Widget::column(
             &[
                 Widget::label(&field.label),
-                Widget::spin_box(&id, text.to_f64().unwrap_or(min), min, max, 1.0, 2)
+                Widget::spin_box(&id, text.to_f64().unwrap_or(min), min, max, 1.0, 1)
                     .accessible(&field.label),
             ],
             4,
@@ -347,7 +368,46 @@ fn field_view(inst: &Instance, field: &PreferenceField) -> Widget {
             ],
             4,
         ),
+        PreferenceKind::Action => Widget::button(&id, &field.label),
+        // A color reads as a swatch of what its text names.
+        PreferenceKind::Color => {
+            let shown = Color::parse_css(&text).unwrap_or(Color::rgba(0, 0, 0, 0));
+            Widget::flex(
+                crate::widgets::Axis::Horizontal,
+                &[
+                    Widget::swatch_button(
+                        &cid(inst, &format!("swatch:{}", field.key)),
+                        shown,
+                        &field.label,
+                    ),
+                    editor(inst, &format!("field:{}", field.key), &field.label, &text).grow(1),
+                ],
+                8,
+                crate::widgets::MainAlign::Start,
+                crate::widgets::CrossAlign::End,
+            )
+        }
         _ => editor(inst, &format!("field:{}", field.key), &field.label, &text),
+    };
+    // A field off its default can be put back on its own.
+    let control = if matches!(field.kind, PreferenceKind::Action) {
+        control
+    } else {
+        Widget::flex(
+            crate::widgets::Axis::Horizontal,
+            &[
+                control.grow(1),
+                Widget::tool_button(
+                    &cid(inst, &format!("reset:{}", field.key)),
+                    &Icon::Undo,
+                    &crate::localization::tr("Reset to default"),
+                )
+                .disabled(text == field.default),
+            ],
+            8,
+            crate::widgets::MainAlign::Start,
+            crate::widgets::CrossAlign::End,
+        )
     };
     if field.help.is_empty() {
         return control;
@@ -531,23 +591,9 @@ pub fn body(inst: &Instance, theme: &Theme) -> Widget {
             rows.push(Widget::Custom(preview))
         }
         DialogRequest::Preferences { ref pages, .. } => {
-            if fields(inst).len() > SEARCHABLE_FIELDS {
-                rows.push(editor(
-                    inst,
-                    "search",
-                    &crate::localization::tr("Search settings"),
-                    &value(inst, "search"),
-                ));
-            }
-            if pages.len() > 1 {
-                let mut nav = vec![];
-                for (i, p) in pages.iter().enumerate() {
-                    nav.push(Widget::flat_button(
-                        &cid(inst, &format!("page:{}", i)),
-                        &p.title,
-                    ));
-                }
-                rows.push(Widget::flow(&nav, 4));
+            // With pages the search sits above their tabs.
+            if fields(inst).len() > SEARCHABLE_FIELDS && pages.len() <= 1 {
+                rows.push(search_field(inst));
             }
             for field in shown_fields(inst) {
                 rows.push(field_view(inst, &field))
@@ -577,11 +623,57 @@ pub fn body(inst: &Instance, theme: &Theme) -> Widget {
         stacked(&rows, 8).disabled(waiting(inst)),
     );
     // A dialog in a window of its own scrolls in whatever height the window has.
-    if inst.fills_window {
+    let content = if inst.fills_window {
         content
     } else {
         content.max_height(600)
+    };
+    // Pages of preferences are tabs over their fields; a search shows its
+    // matches from every page.
+    match inst.request {
+        DialogRequest::Preferences { ref pages, .. }
+            if pages.len() > 1 && value(inst, "search").is_empty() =>
+        {
+            let items = pages
+                .iter()
+                .enumerate()
+                .map(|(i, p)| TabItem::new(&i.to_string(), &p.title).closable(false))
+                .collect::<Vec<_>>();
+            let tabs =
+                Widget::page_tabs(&cid(inst, "pages"), &items, &inst.page.to_string(), content);
+            searched_pages(inst, tabs)
+        }
+        DialogRequest::Preferences { ref pages, .. }
+            if pages.len() > 1 && fields(inst).len() > SEARCHABLE_FIELDS =>
+        {
+            searched_pages(inst, content)
+        }
+        _ => content,
     }
+}
+
+fn search_field(inst: &Instance) -> Widget {
+    editor(
+        inst,
+        "search",
+        &crate::localization::tr("Search"),
+        &value(inst, "search"),
+    )
+}
+
+// The search field over the pages of a preferences dialog, when it has
+// enough fields to search.
+fn searched_pages(inst: &Instance, pages: Widget) -> Widget {
+    if fields(inst).len() <= SEARCHABLE_FIELDS {
+        return pages;
+    }
+    Widget::flex(
+        crate::widgets::Axis::Vertical,
+        &[search_field(inst), pages.grow(1)],
+        8,
+        crate::widgets::MainAlign::Start,
+        crate::widgets::CrossAlign::Stretch,
+    )
 }
 fn validate_fields(inst: &Instance, fields: &[PreferenceField]) -> Option<String> {
     for f in fields {
@@ -843,6 +935,30 @@ pub fn message(
         UiMsg::Click(_) if part.starts_with("page:") => {
             n.page = part.substring(5, part.byte_len()).to_i64().unwrap_or(0);
             n.error = "".to_string()
+        }
+        UiMsg::Tab(_, key) if part == "pages" => {
+            n.page = key.to_i64().unwrap_or(0);
+            n.error = "".to_string()
+        }
+        UiMsg::Click(_) if part.starts_with("reset:") => {
+            let key = part.substring(6, part.byte_len());
+            if let Some(field) = fields(&n).into_iter().find(|f| f.key == key) {
+                n.values
+                    .insert(format!("field:{key}"), field.default.clone());
+                n.error = "".to_string()
+            }
+        }
+        UiMsg::Click(_)
+            if part.starts_with("field:")
+                && fields(&n).iter().any(|f| {
+                    matches!(f.kind, PreferenceKind::Action) && part == format!("field:{}", f.key)
+                }) =>
+        {
+            let key = part.substring(6, part.byte_len()).to_string();
+            fx.push(Effect::Emit(UiMsg::DialogPreview(
+                n.id.clone(),
+                Outcome::Action(key),
+            )));
         }
         UiMsg::Text(_, text) => {
             n.values.insert(part.to_string(), text.to_string());
@@ -1576,6 +1692,69 @@ mod tests {
         let (restored, _, _) = action(applied, "defaults", &[]);
         assert_eq!(super::value(&restored, "field:count"), "3");
         assert_eq!(super::value(&restored, "baseline:count"), "7")
+    }
+    #[test]
+    fn preference_pages_are_tabs_and_a_field_resets_alone_and_an_action_reports_itself() {
+        let config = crate::services::private_test_config();
+        let _defer = scopeguard::guard((), |_| {
+            crate::services::remove_test_config(&config);
+        });
+        let open = PreferenceField {
+            key: "open".to_string(),
+            label: "Open Folder".to_string(),
+            kind: PreferenceKind::Action,
+            value: String::new(),
+            default: String::new(),
+            help: String::new(),
+        };
+        let pages = vec![
+            PreferencePage {
+                key: "general".to_string(),
+                title: "General".to_string(),
+                fields: vec![field()],
+            },
+            PreferencePage {
+                key: "files".to_string(),
+                title: "Files".to_string(),
+                fields: vec![open],
+            },
+        ];
+        let inst = Instance::new(&request::preferences("p", "Preferences", &pages), "test");
+        let theme = crate::style::Theme::default();
+        let shown = format!("{:?}", super::body(&inst, &theme));
+        assert!(shown.contains("dlg:p:pages"), "{shown}");
+        let mut st = StateStore::new();
+        let (second, _, _) = message(
+            inst,
+            &UiMsg::Tab("dlg:p:pages".to_string(), "1".to_string()),
+            "pages",
+            &mut st,
+        );
+        assert_eq!(second.page, 1);
+        let (clicked, closed, fx) = message(
+            second,
+            &UiMsg::Click("dlg:p:field:open".to_string()),
+            "field:open",
+            &mut st,
+        );
+        assert_eq!(closed, None);
+        assert!(
+            fx.iter().any(|e| matches!(e, super::Effect::Emit(UiMsg::DialogPreview(id, Outcome::Action(key))) if id == "p" && key == "open")),
+            "{fx:?}"
+        );
+        let (changed, _, _) = message(
+            clicked,
+            &UiMsg::Text("dlg:p:field:count".to_string(), "7".to_string()),
+            "field:count",
+            &mut st,
+        );
+        let (reset, _, _) = message(
+            changed,
+            &UiMsg::Click("dlg:p:reset:count".to_string()),
+            "reset:count",
+            &mut st,
+        );
+        assert_eq!(super::value(&reset, "field:count"), "3");
     }
     #[test]
     fn picker_wizard_retains_drafts_skips_pages_and_checks_finish() {

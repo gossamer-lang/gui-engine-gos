@@ -1109,6 +1109,22 @@ impl Widget {
         })
     }
 
+    /// A tab strip over fixed pages, as a settings window's: no new-tab
+    /// button; the application keeps the active key.
+    pub fn page_tabs(id: &str, items: &[tabs::TabItem], active: &str, content: Widget) -> Widget {
+        Widget::Tabs(tabs::Tabs {
+            id: id.to_string(),
+            items: items.to_vec(),
+            active: active.to_string(),
+            content: Box::new(content),
+            pages: HashMap::new(),
+            workspace: "".to_string(),
+            add_button: false,
+            detachable: false,
+            joined: false,
+        })
+    }
+
     /// A tab strip joined to the content below it, as a terminal's tabs are:
     /// the field color, the desktop's menu text size, no dividing line, and
     /// no new-tab button.

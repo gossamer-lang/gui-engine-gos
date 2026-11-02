@@ -694,6 +694,14 @@ mod session {
     /// Runs `script` in a terminal shown in a session window, focused, once
     /// it has printed "ready"; `events` collects what the terminal reports.
     fn shown_program(name: &str, script: &str) -> (crate::Session, i64, Rc<RefCell<Vec<Event>>>) {
+        shown_with(name, script, widget::ViewOptions::default())
+    }
+
+    fn shown_with(
+        name: &str,
+        script: &str,
+        view_options: widget::ViewOptions,
+    ) -> (crate::Session, i64, Rc<RefCell<Vec<Event>>>) {
         let mut s = crate::app::start(name, &format!("dev.gossamer.gui-terminal-{name}")).unwrap();
         let id = create(&options(8, 40, 100), crate::app::effects::current_budget()).unwrap();
         let events = Rc::new(RefCell::new(Vec::new()));
@@ -704,7 +712,11 @@ mod session {
                     heard.borrow_mut().push(event);
                 }
             },
-            move |_| Widget::Terminal(widget::View::new("term", id, "Shell")),
+            move |_| {
+                let mut view = widget::View::new("term", id, "Shell");
+                view.options = view_options.clone();
+                Widget::Terminal(view)
+            },
             |_| Vec::new(),
         );
         s.open_window("main", "Terminal", 420, 240).unwrap();
@@ -730,6 +742,160 @@ mod session {
              v=$(dd bs=1 count={n} 2>/dev/null | od -An -tx1 | tr -d ' \\n'); \
              printf 'got:%s\\r\\n' \"$v\"; read x"
         )
+    }
+
+    // The window point at the middle of cell (`row`, `col`) of the view.
+    fn cell_point(row: i64, col: i64) -> (f64, f64) {
+        let view = widget::View::new("term", 0, "Shell");
+        let theme = crate::style::Theme::default();
+        let (cw, lh, _) = widget::metrics(&view, &theme);
+        let pad = theme.px(widget::PAD) as f64;
+        (pad + (col as f64 + 0.5) * cw, pad + (row as f64 + 0.5) * lh)
+    }
+
+    fn button(s: &mut crate::Session, (x, y): (f64, f64), clicks: i64) {
+        let window = s.windows[0].native.id();
+        let source = windowing::PointerSource::Mouse;
+        let button = windowing::MouseButton::Left;
+        s.inject(&windowing::Event::ButtonDown {
+            window,
+            button,
+            x,
+            y,
+            clicks,
+            source,
+        })
+        .unwrap();
+        s.inject(&windowing::Event::ButtonUp {
+            window,
+            button,
+            x,
+            y,
+            clicks,
+            source,
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a_double_click_selects_a_word_and_copy_on_select_copies_it() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            crate::services::clipboard::use_memory(true);
+            let script = "printf 'ready\\r\\nsee /usr/local/bin now\\r\\n'; read x";
+            let options = widget::ViewOptions {
+                copy_on_select: true,
+                ..widget::ViewOptions::default()
+            };
+            let (mut s, id, _) = shown_with("word", script, options);
+            step_until(&mut s, || snapshot(id).unwrap().text.contains("now"));
+            button(&mut s, cell_point(1, 9), 2);
+            assert_eq!(copy(id).unwrap(), "/usr/local/bin");
+            assert_eq!(crate::services::clipboard::text(), "/usr/local/bin");
+            // A double click on a blank selects nothing new.
+            button(&mut s, cell_point(1, 3), 2);
+            assert_eq!(crate::services::clipboard::text(), "/usr/local/bin");
+            s.shutdown();
+        })
+    }
+
+    #[test]
+    fn a_paste_of_several_lines_waits_for_the_application_and_a_dropped_file_is_quoted() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            crate::services::clipboard::use_memory(true);
+            let options = widget::ViewOptions {
+                confirm_paste: true,
+                ..widget::ViewOptions::default()
+            };
+            let (mut s, id, events) = shown_with("held", &reading("", 10), options);
+            crate::services::clipboard::set_text("rm -rf a\nb");
+            let chord = windowing::Mods {
+                ctrl: true,
+                shift: true,
+                ..windowing::Mods::default()
+            };
+            s.press(windowing::Key::V, chord).unwrap();
+            assert!(
+                events
+                    .borrow()
+                    .contains(&Event::PasteHeld("rm -rf a\nb".to_string())),
+                "{:?}",
+                events.borrow()
+            );
+            let window = s.windows[0].native.id();
+            let (x, y) = cell_point(2, 2);
+            s.inject(&windowing::Event::DroppedFile {
+                window,
+                path: "/tmp/a b".to_string(),
+                x,
+                y,
+            })
+            .unwrap();
+            step_until(&mut s, || snapshot(id).unwrap().text.contains("got:"));
+            // The path arrives quoted for the shell.
+            let shown = snapshot(id).unwrap().text;
+            assert!(shown.contains("got:272f746d702f61206227"), "{shown}");
+            s.shutdown();
+        })
+    }
+
+    #[test]
+    fn a_bound_ctrl_chord_reaches_the_window_and_ctrl_letters_reach_the_program() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::app::start("chords", "dev.gossamer.gui-terminal-chords").unwrap();
+            let id = create(&options(8, 40, 100), crate::app::effects::current_budget()).unwrap();
+            let commands = Rc::new(RefCell::new(Vec::new()));
+            let heard = commands.clone();
+            s.set_shell(
+                move |m| {
+                    if let UiMsg::Command(c) = m {
+                        heard.borrow_mut().push(c);
+                    }
+                },
+                move |_| Widget::Terminal(widget::View::new("term", id, "Shell")),
+                |_| {
+                    vec![
+                        crate::commands::Command::new("view.zoom-in", "Zoom In").key("Ctrl+="),
+                        crate::commands::Command::new("edit.copy", "Copy").key("Ctrl+B"),
+                    ]
+                },
+            );
+            s.open_window("main", "Terminal", 420, 240).unwrap();
+            spawn(
+                id,
+                &Command {
+                    program: "/bin/sh".into(),
+                    args: vec!["-c".into(), reading("", 1)],
+                    ..Command::default()
+                },
+            )
+            .unwrap();
+            assert!(s.focus("term").unwrap());
+            step_until(&mut s, || snapshot(id).unwrap().text.contains("ready"));
+            let ctrl = windowing::Mods {
+                ctrl: true,
+                ..windowing::Mods::default()
+            };
+            s.press(windowing::Key::Char('='), ctrl).unwrap();
+            assert_eq!(*commands.borrow(), vec!["view.zoom-in".to_string()]);
+            s.press(windowing::Key::B, ctrl).unwrap();
+            step_until(&mut s, || snapshot(id).unwrap().text.contains("got:"));
+            let shown = snapshot(id).unwrap().text;
+            assert!(shown.contains("got:02"), "{shown}");
+            assert_eq!(commands.borrow().len(), 1);
+            s.shutdown();
+        })
     }
 
     #[test]

@@ -222,6 +222,10 @@ pub struct ThemeOverride {
     /// Overrides the keyboard focus outline within this subtree.
     #[serde(default)]
     pub focus: Option<Color>,
+    /// Replaces the desktop accent, and the selection derived from it,
+    /// within this subtree.
+    #[serde(default)]
+    pub accent: Option<Color>,
 }
 
 impl ThemeOverride {
@@ -242,6 +246,9 @@ impl ThemeOverride {
         if let Some(ref tokens) = self.tokens {
             t = t.with_tokens(tokens)
         };
+        if let Some(color) = self.accent {
+            t = t.with_accent(color);
+        }
         if let Some(color) = self.focus {
             t.focus = color;
         }
@@ -1492,6 +1499,7 @@ impl Widget {
             text_scale: 0.0,
             tokens: None,
             focus: None,
+            accent: None,
         })
     }
 
@@ -2551,11 +2559,32 @@ mod tests {
             text_scale: 0.0,
             tokens: Some(tokens),
             focus: None,
+            accent: None,
         };
         let t = change.apply(crate::style::Theme::light());
         assert!(t.is_dark());
         assert_eq!(t.radius(), 3);
         assert_eq!(t.icons, "brand")
+    }
+
+    #[test]
+    fn a_subtree_accent_replaces_the_desktop_accent_and_selection() {
+        let bronze = crate::style::color::Color::rgb(176, 104, 44);
+        let change = super::ThemeOverride {
+            kind: None,
+            density: None,
+            rtl: None,
+            text_scale: 0.0,
+            tokens: None,
+            focus: None,
+            accent: Some(bronze),
+        };
+        let base =
+            crate::style::Theme::light().with_accent(crate::style::color::Color::rgb(30, 100, 220));
+        let t = change.apply(base.clone());
+        assert_eq!(t, base.with_accent(bronze));
+        assert_eq!(t.selection, t.accent);
+        assert!(t.selection_text.contrast(t.selection) >= 4.5);
     }
 
     #[test]

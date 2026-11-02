@@ -78,8 +78,10 @@ fn window(s: &Session, w: i64) -> Result<&gui_engine::app::WindowState, String> 
 
 // Activation is explicit: ordinary applications should keep using focus(),
 // while a launcher must take keyboard focus after its user asks to open it.
-fn activate_window(native: windowing::Window) -> Result<(), String> {
-    native.focus().map_err(|e| e.to_string())?;
+fn activate_window(native: windowing::Window, token: &str) -> Result<(), String> {
+    native
+        .focus_with_activation(token)
+        .map_err(|e| e.to_string())?;
     native.sync().map_err(|e| e.to_string())?;
     #[cfg(target_os = "linux")]
     if windowing::video_driver() == "x11" && native.is_visible() {
@@ -297,7 +299,8 @@ pub fn call(s: &mut Session, method: &str, a: &str) -> Result<String, String> {
             done()
         }
         "activate_window" => {
-            activate_window(window(s, args::<(i64,)>(a)?.0)?.native)?;
+            let (w, token): (i64, String) = args(a)?;
+            activate_window(window(s, w)?.native, &token)?;
             done()
         }
         "window_visible" => out(window(s, args::<(i64,)>(a)?.0)?.native.is_visible()),

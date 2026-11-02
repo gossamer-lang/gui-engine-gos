@@ -1769,16 +1769,18 @@ fn request(
     }
     let show = !cs.items.is_empty() || cs.loading || explicit;
     cs.open = show;
-    st.set(&cs_id, WState::Choice(cs.clone()));
     if show {
-        open_list(t, &cs, cx, field)
+        open_list(t, &mut cs, cx, field)
     } else {
         cx.close_popup(&t.id, 0)
     }
+    st.set(&cs_id, WState::Choice(cs.clone()));
 }
 
-fn open_list(t: &TextInput, cs: &ChoiceState, cx: &mut EventCx, field: Rect) {
+// Opens the completion list below `field`, recording the rows that fit there.
+fn open_list(t: &TextInput, cs: &mut ChoiceState, cx: &mut EventCx, field: Rect) {
     let size = completion::list_size(cs, &cx.theme, field.width);
+    cs.rows = completion::fitted_rows(field, size, cx.window, 0, &cx.theme);
     cx.open_popup(&PopupRequest::new(
         &t.id,
         0,
@@ -1879,8 +1881,8 @@ fn request_all(
         }
     }
     cs.open = true;
+    open_list(t, &mut cs, cx, field);
     st.set(&cs_id, WState::Choice(cs.clone()));
-    open_list(t, &cs, cx, field)
 }
 
 // Replaces the completion range with the accepted item: one undo step.
@@ -1943,10 +1945,8 @@ pub fn popup_event(t: &TextInput, rect: Rect, ev: &Event, st: &mut StateStore, c
             }
         }
         Event::Scroll { dy, .. } => {
-            let max_first = cs.items.len() - (completion::VISIBLE_ROWS) as usize;
-            cs.first = (cs.first - dy.round() as i64 * 3)
-                .max(0)
-                .min(max_first as i64);
+            let max_first = (cs.items.len() as i64 - cs.visible_rows()).max(0);
+            cs.first = (cs.first - dy.round() as i64 * 3).max(0).min(max_first);
             cx.redraw = true;
         }
         _ => (),

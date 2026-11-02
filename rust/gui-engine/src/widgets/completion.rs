@@ -31,7 +31,7 @@ use crate::style::{TextRole, Theme};
 use crate::text::folding::{FoldedText, folded_chars};
 use crate::text::layout;
 use crate::text::layout::LayoutOptions;
-use crate::widgets::cx::{EventCx, PaintCx};
+use crate::widgets::cx::{EventCx, PaintCx, Placement};
 
 /// Detail text kept per item.
 pub const DOC_LIMIT: i64 = 2000;
@@ -263,6 +263,9 @@ pub struct ChoiceState {
     /// Separate filter text for searchable pickers.
     pub filter: String,
     pub filter_caret: i64,
+    /// Rows the open list shows: as many as fit where it opened, at most
+    /// `VISIBLE_ROWS`; 0 before it is placed.
+    pub rows: i64,
 }
 
 /// Case-folded comparison key.
@@ -508,6 +511,15 @@ impl ChoiceState {
         self.first = self.first.min(self.items.len() as i64 - 1).max(0);
     }
 
+    /// The rows the open list shows.
+    pub fn visible_rows(&self) -> i64 {
+        if self.rows > 0 {
+            self.rows
+        } else {
+            VISIBLE_ROWS
+        }
+    }
+
     /// Moves the highlight `step` enabled items (wrapping at the ends
     /// unless `clamp`), keeping it visible within `rows` rows.
     pub fn move_highlight(&mut self, step: i64, rows: i64, clamp: bool) {
@@ -671,6 +683,14 @@ pub fn widest(items: &[CompletionItem], theme: &Theme, details: bool) -> f64 {
 /// Rows a popup list shows before scrolling.
 pub const VISIBLE_ROWS: i64 = 8;
 
+/// Rows a popup list of `size` shows when it opens below `anchor` in
+/// `window`, `extra` pixels of it taken by other parts: a list the window
+/// cannot hold shrinks to the rows that fit, and scrolls through the rest.
+pub fn fitted_rows(anchor: Rect, size: Size, window: Rect, extra: i64, theme: &Theme) -> i64 {
+    let placed = crate::widgets::popup::place(anchor, size, window, Placement::Below, theme.rtl);
+    ((placed.height - extra - theme.px(8)) / theme.row_height()).clamp(1, VISIBLE_ROWS)
+}
+
 /// The pixel size of a popup list for `state` at least `min_width` wide.
 pub fn list_size(state: &ChoiceState, theme: &Theme, min_width: i64) -> Size {
     let row = theme.row_height();
@@ -737,7 +757,7 @@ pub fn paint_list(
         )
     }
     let mut i = state.first.max(0);
-    let end = (state.first + VISIBLE_ROWS).min(state.items.len() as i64);
+    let end = (state.first + state.visible_rows()).min(state.items.len() as i64);
     while i < end {
         let it = &state.items[i as usize];
         let lit = it.key == state.highlight;
@@ -847,13 +867,12 @@ pub fn paint_list(
             tone,
         )
     }
-    if state.items.len() > VISIBLE_ROWS as usize {
+    let rows = state.visible_rows();
+    if state.items.len() as i64 > rows {
         let track = rect.height - pad * 2;
-        let thumb = (track * VISIBLE_ROWS / state.items.len() as i64).max(theme.px(20));
-        let ty = rect.y
-            + pad
-            + (track - thumb) * state.first
-                / ((state.items.len() - VISIBLE_ROWS as usize).max(1)) as i64;
+        let thumb = (track * rows / state.items.len() as i64).max(theme.px(20));
+        let ty =
+            rect.y + pad + (track - thumb) * state.first / (state.items.len() as i64 - rows).max(1);
         cx.canvas.round_rect(
             rect.right() - theme.px(6),
             ty,
@@ -877,7 +896,7 @@ pub fn list_hit(state: &ChoiceState, rect: Rect, theme: &Theme, x: i64, y: i64) 
     if y - rect.y - pad < 0
         || i < 0
         || i >= state.items.len() as i64
-        || i >= state.first + VISIBLE_ROWS
+        || i >= state.first + state.visible_rows()
     {
         return "".to_string();
     }
@@ -899,7 +918,7 @@ pub fn list_semantics(
     lb.id = list_id.to_string();
     lb.set_size = state.items.len() as i64;
     let mut i = state.first.max(0);
-    let end = (state.first + VISIBLE_ROWS).min(state.items.len() as i64);
+    let end = (state.first + state.visible_rows()).min(state.items.len() as i64);
     while i < end {
         let it = &state.items[i as usize];
         let mut item = AccessNode::new(Role::ListItem, &it.label);
@@ -924,22 +943,24 @@ pub fn list_semantics(
 pub fn list_key(state: &mut ChoiceState, key: Key, cx: &mut EventCx) -> bool {
     match key {
         Key::Down => {
-            state.move_highlight(1, VISIBLE_ROWS, false);
+            state.move_highlight(1, state.visible_rows(), false);
             cx.redraw = true;
             true
         }
         Key::Up => {
-            state.move_highlight(-1, VISIBLE_ROWS, false);
+            state.move_highlight(-1, state.visible_rows(), false);
             cx.redraw = true;
             true
         }
         Key::PageDown => {
-            state.move_highlight(VISIBLE_ROWS - 1, VISIBLE_ROWS, true);
+            let rows = state.visible_rows();
+            state.move_highlight(rows - 1, rows, true);
             cx.redraw = true;
             true
         }
         Key::PageUp => {
-            state.move_highlight(1 - VISIBLE_ROWS, VISIBLE_ROWS, true);
+            let rows = state.visible_rows();
+            state.move_highlight(1 - rows, rows, true);
             cx.redraw = true;
             true
         }

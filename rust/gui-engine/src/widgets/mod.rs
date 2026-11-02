@@ -463,6 +463,15 @@ impl Widget {
         Widget::Text(l)
     }
 
+    /// Muted small text that wraps to the width it is given, such as the
+    /// help beneath a field.
+    pub fn note(text: &str) -> Widget {
+        let mut l = display::Label::new(text, TextRole::Small);
+        l.tone = Tone::Muted;
+        l.wrap = true;
+        Widget::Text(l)
+    }
+
     /// Body text that wraps to the width it is given.
     pub fn paragraph(text: &str) -> Widget {
         let mut l = display::Label::new(text, TextRole::Body);

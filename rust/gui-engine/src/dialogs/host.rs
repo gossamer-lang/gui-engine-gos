@@ -415,7 +415,13 @@ pub fn panel(inst: &Instance, body: Widget) -> Widget {
             | DialogRequest::Shortcut { .. }
     );
     let browser = matches!(inst.request, DialogRequest::File { .. });
-    let mut rows = vec![header, if bounded { body.grow(1) } else { body }];
+    // A dialog in a window of its own has the window's title and close box.
+    let mut rows = if inst.fills_window {
+        vec![]
+    } else {
+        vec![header]
+    };
+    rows.push(if bounded { body.grow(1) } else { body });
     let actions = ordered(&actions_of(inst));
     if !actions.is_empty() {
         let mut buttons = vec![];

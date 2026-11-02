@@ -172,15 +172,48 @@ pub struct Shell {
     pub commands: WindowCommands,
 }
 
-// The key prefix of the window a file dialog opens in, followed by the key
-// of the window it belongs to.
+// The key prefix of the window a dialog of its own opens in, followed by
+// the key of the window it belongs to.
 const FILE_DIALOG_WINDOW: &str = "gui:file-dialog:";
 const SHORTCUT_DIALOG_WINDOW: &str = "gui:shortcut-dialog:";
+const SETTINGS_DIALOG_WINDOW: &str = "gui:settings-dialog:";
 
-// The size a file dialog's window opens at, in interface units, until the
-// user resizes one, and the smallest it can be.
+// The size each dialog window opens at, in interface units, until the user
+// resizes one, and the smallest it can be.
 const FILE_DIALOG_SIZE: (i64, i64) = (900, 620);
 const FILE_DIALOG_MIN: (i64, i64) = (560, 420);
+const SHORTCUT_DIALOG_SIZE: (i64, i64) = (560, 360);
+const SHORTCUT_DIALOG_MIN: (i64, i64) = (480, 340);
+const SETTINGS_DIALOG_SIZE: (i64, i64) = (720, 640);
+const SETTINGS_DIALOG_MIN: (i64, i64) = (480, 360);
+
+// The window a dialog opens in when it needs more room than the window that
+// asked may have: its key prefix, the size it opens at, and its minimum size.
+struct DialogWindow {
+    prefix: &'static str,
+    size: (i64, i64),
+    min: (i64, i64),
+}
+
+// A file browser, a shortcut capture, and the many fields of preferences or
+// a wizard open in a window of their own.
+fn own_window(req: &DialogRequest) -> Option<DialogWindow> {
+    let (prefix, size, min) = match req {
+        DialogRequest::File { .. } => (FILE_DIALOG_WINDOW, FILE_DIALOG_SIZE, FILE_DIALOG_MIN),
+        DialogRequest::Shortcut { .. } => (
+            SHORTCUT_DIALOG_WINDOW,
+            SHORTCUT_DIALOG_SIZE,
+            SHORTCUT_DIALOG_MIN,
+        ),
+        DialogRequest::Preferences { .. } | DialogRequest::Wizard { .. } => (
+            SETTINGS_DIALOG_WINDOW,
+            SETTINGS_DIALOG_SIZE,
+            SETTINGS_DIALOG_MIN,
+        ),
+        _ => return None,
+    };
+    Some(DialogWindow { prefix, size, min })
+}
 
 /// A running toolkit session.
 type DisposedCallback = Box<dyn FnMut(&str)>;
@@ -586,6 +619,13 @@ impl Session {
             options.x = Some(d.usable.x + (d.usable.width - options.width) / 2);
             options.y = Some(d.usable.y);
         }
+        // A window of a window, such as a dialog's, first opens centered over it.
+        if let (None, Some(owner)) = (&placement, parent) {
+            let (x, y) = owner.position();
+            let (w, h) = owner.size();
+            options.x = Some(x + (w - options.width) / 2);
+            options.y = Some(y + (h - options.height) / 2);
+        }
         if let Some(p) = placement {
             options.x = Some(p.x);
             options.y = Some(p.y);
@@ -774,7 +814,14 @@ impl Session {
     }
 
     fn build_view(&self, key: &str) -> Widget {
-        if key.starts_with(FILE_DIALOG_WINDOW) || key.starts_with(SHORTCUT_DIALOG_WINDOW) {
+        if [
+            FILE_DIALOG_WINDOW,
+            SHORTCUT_DIALOG_WINDOW,
+            SETTINGS_DIALOG_WINDOW,
+        ]
+        .iter()
+        .any(|prefix| key.starts_with(prefix))
+        {
             return Widget::Empty;
         }
         match self.shell {
@@ -4368,14 +4415,10 @@ impl Session {
             }
             host::Plan::Toolkit => (),
         }
-        // A file browser needs room the window that asked may not have, so it
+        // A dialog that needs more room than the window that asked may have
         // opens in a window of its own, modal to that one.
-        let (w, own_window) = if matches!(
-            req,
-            DialogRequest::File { .. } | DialogRequest::Shortcut { .. }
-        ) {
-            let shortcut = matches!(req, DialogRequest::Shortcut { .. });
-            match self.dialog_window(w, &req.title(), shortcut) {
+        let (w, own_window) = if let Some(window) = own_window(req) {
+            match self.dialog_window(w, &req.title(), window) {
                 Ok(d) => (d, true),
                 Err(e) => {
                     self.pending
@@ -4429,31 +4472,27 @@ impl Session {
         }
     }
 
-    // The window file dialogs of window `owner` open in, made and shown the
-    // first time. It is modal to `owner` and keeps the size the user gave it.
+    // The window dialogs of window `owner` open in, as `own_window` describes
+    // it, made and shown the first time. It is modal to `owner` and keeps the
+    // size the user gave it.
     fn dialog_window(
         &mut self,
         owner: i64,
         title: &str,
-        shortcut: bool,
+        window: DialogWindow,
     ) -> Result<i64, errors::Error> {
+        let DialogWindow {
+            prefix,
+            size: (width, height),
+            min: (min_w, min_h),
+        } = window;
         let owner_key = self.windows[owner as usize].key.clone();
-        let prefix = if shortcut {
-            SHORTCUT_DIALOG_WINDOW
-        } else {
-            FILE_DIALOG_WINDOW
-        };
         let key = format!("{prefix}{owner_key}");
         let found = self.find(&key);
         if found >= 0 {
             return Ok(found);
         }
         let parent = self.windows[owner as usize].native;
-        let (width, height) = if shortcut {
-            (560, 360)
-        } else {
-            FILE_DIALOG_SIZE
-        };
         self.prepare_window_as(
             &key,
             title,
@@ -4468,11 +4507,6 @@ impl Session {
         if let Some(opener) = self.path_in_layers(owner, &focus).last() {
             self.windows[d as usize].theme = opener.theme.clone();
         }
-        let (min_w, min_h) = if shortcut {
-            (480, 340)
-        } else {
-            FILE_DIALOG_MIN
-        };
         self.set_min_size(&key, min_w, min_h)?;
         self.show_window(&key)?;
         Ok(d)
@@ -6152,6 +6186,82 @@ mod dialog_scope_tests {
     }
 
     #[test]
+    fn preferences_open_in_a_window_of_their_own() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::application(
+                "Small",
+                "dev.gossamer.gui-settings-window-test",
+                Log::default,
+                log_update,
+                log_view,
+            )
+            .size(300, 160)
+            .start()
+            .unwrap();
+            let field = |key: &str| request::PreferenceField {
+                key: key.to_string(),
+                label: key.to_string(),
+                kind: request::PreferenceKind::Text,
+                value: String::new(),
+                default: String::new(),
+                help: String::new(),
+            };
+            let page = request::PreferencePage {
+                key: "general".to_string(),
+                title: "General".to_string(),
+                fields: (0..40).map(|i| field(&format!("field{i}"))).collect(),
+            };
+            crate::perform(Effect::OpenDialog(request::preferences(
+                "settings",
+                "Settings",
+                &[page],
+            )));
+            s.flush().unwrap();
+            assert_eq!(s.windows.len(), 2);
+            let d = &s.windows[1];
+            assert_eq!(d.owner, "main");
+            assert_eq!(d.title, "Settings");
+            let (width, height) = super::SETTINGS_DIALOG_SIZE;
+            assert!(
+                d.node.rect.width >= d.theme.px(width) - 1,
+                "{:?}",
+                d.node.rect
+            );
+            assert!(
+                d.node.rect.height >= d.theme.px(height) - 1,
+                "{:?}",
+                d.node.rect
+            );
+            assert_eq!(d.dialogs[0].node.rect.size(), d.node.rect.size());
+            assert!(s.blocked(0));
+            // A taller window gives its fields its whole height, buttons at the
+            // bottom.
+            s.windows[1].native.set_size(720, 1100).unwrap();
+            s.windows[1].native.sync().unwrap();
+            s.invalidate(1, "test a tall settings window");
+            s.flush().unwrap();
+            let path = s.path_in_layers(1, "dlg:settings:action:ok");
+            let ok = path.last().unwrap();
+            let bottom = s.windows[1].node.rect.height;
+            assert!(
+                ok.y + ok.node.rect.height >= bottom - ok.theme.px(40),
+                "{} of {}",
+                ok.y + ok.node.rect.height,
+                bottom
+            );
+            s.press(Key::Escape, Mods::default()).unwrap();
+            s.flush().unwrap();
+            assert_eq!(s.windows.len(), 1);
+            assert!(!s.blocked(0));
+            s.shutdown()
+        })
+    }
+
+    #[test]
     fn theme_tokens_reach_every_window_and_outlast_a_theme_change() {
         crate::testing::on_ui_thread(|| {
             let config = crate::services::private_test_config();
@@ -6421,9 +6531,11 @@ mod dialog_scope_tests {
             .unwrap();
             crate::perform(Effect::OpenDialog(wizard()));
             s.flush().unwrap();
+            // A wizard opens in a window of its own.
+            assert_eq!(s.windows.len(), 2);
             assert!(s.click("dlg:setup:action:next").unwrap());
             assert!(events(&s).ends_with("check setup#1 next"), "{}", events(&s));
-            let dump = s.semantics(0).dump();
+            let dump = s.semantics(1).dump();
             assert!(
                 dump.contains("Checking")
                     && dump.contains("button \"Stop\"")
@@ -6439,9 +6551,9 @@ mod dialog_scope_tests {
             ));
             s.flush().unwrap();
             assert!(
-                s.semantics(0).dump().contains("That name is taken"),
+                s.semantics(1).dump().contains("That name is taken"),
                 "{}",
-                s.semantics(0).dump()
+                s.semantics(1).dump()
             );
             assert!(s.click("dlg:setup:action:next").unwrap());
             assert!(s.click("dlg:setup:action:stop").unwrap());
@@ -6458,9 +6570,9 @@ mod dialog_scope_tests {
             ));
             s.flush().unwrap();
             assert!(
-                s.semantics(0).dump().contains("button \"Next\""),
+                s.semantics(1).dump().contains("button \"Next\""),
                 "{}",
-                s.semantics(0).dump()
+                s.semantics(1).dump()
             );
             assert!(s.click("dlg:setup:action:next").unwrap());
             crate::perform(Effect::DialogChecked(
@@ -6470,9 +6582,9 @@ mod dialog_scope_tests {
             ));
             s.flush().unwrap();
             assert!(
-                s.semantics(0).dump().contains("button \"Finish\""),
+                s.semantics(1).dump().contains("button \"Finish\""),
                 "{}",
-                s.semantics(0).dump()
+                s.semantics(1).dump()
             );
             assert!(s.click("dlg:setup:action:finish").unwrap());
             assert!(

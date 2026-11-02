@@ -352,7 +352,7 @@ fn field_view(inst: &Instance, field: &PreferenceField) -> Widget {
     if field.help.is_empty() {
         return control;
     }
-    stacked(&[control, Widget::muted(&field.help)], 2)
+    stacked(&[control, Widget::note(&field.help)], 2)
 }
 pub fn body(inst: &Instance, theme: &Theme) -> Widget {
     let mut rows = vec![];
@@ -572,11 +572,16 @@ pub fn body(inst: &Instance, theme: &Theme) -> Widget {
         rows.push(Widget::text(&inst.error, TextRole::Small, Tone::Danger))
     };
     // The drafts being checked stay as they were sent.
-    Widget::scroll_to_fit(
+    let content = Widget::scroll_to_fit(
         &cid(inst, "content"),
         stacked(&rows, 8).disabled(waiting(inst)),
-    )
-    .max_height(600)
+    );
+    // A dialog in a window of its own scrolls in whatever height the window has.
+    if inst.fills_window {
+        content
+    } else {
+        content.max_height(600)
+    }
 }
 fn validate_fields(inst: &Instance, fields: &[PreferenceField]) -> Option<String> {
     for f in fields {

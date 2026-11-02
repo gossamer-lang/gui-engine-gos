@@ -118,13 +118,14 @@ pub fn sync_model(ch: &Choice, st: &mut StateStore) {
     cs.loading = loading;
     cs.error = error;
     let at = cs.highlight_index();
-    cs.first = cs.first.min((cs.items.len() as i64 - VISIBLE_ROWS).max(0));
+    let rows = cs.visible_rows();
+    cs.first = cs.first.min((cs.items.len() as i64 - rows).max(0));
     if at >= 0 {
         if at < cs.first {
             cs.first = at
         };
-        if at >= cs.first + VISIBLE_ROWS {
-            cs.first = at - VISIBLE_ROWS + 1
+        if at >= cs.first + rows {
+            cs.first = at - rows + 1
         }
     }
     st.set(&id, WState::Choice(cs))
@@ -516,16 +517,20 @@ fn open_list(
     if present(items, highlight) {
         s.highlight = highlight.to_string()
     };
-    let idx = s.highlight_index().max(0);
-    s.first = (idx - VISIBLE_ROWS / 2)
-        .max(0)
-        .min((items.len() as i64 - VISIBLE_ROWS).max(0));
-    st.set(id, WState::Choice(s.clone()));
     let anchor = cx.to_window(Rect::new(0, 0, node.rect.width, node.rect.height));
     let mut size = completion::list_size(&s, &cx.theme, node.rect.width);
-    if filterable {
-        size.height += cx.theme.control_height()
+    let filter = if filterable {
+        cx.theme.control_height()
+    } else {
+        0
     };
+    size.height += filter;
+    s.rows = completion::fitted_rows(anchor, size, cx.window, filter, &cx.theme);
+    let idx = s.highlight_index().max(0);
+    s.first = (idx - s.rows / 2)
+        .max(0)
+        .min((items.len() as i64 - s.rows).max(0));
+    st.set(id, WState::Choice(s.clone()));
     let request = PopupRequest::new(id, 0, anchor, size, Placement::Below, false, true);
     let request = if filterable {
         request
@@ -588,7 +593,8 @@ fn select_event(s: &Select, node: &Node, ev: &Event, st: &mut StateStore, cx: &m
                     }
                     Key::Tab => close_list(&s.id, st, cx),
                     Key::Home | Key::End => {
-                        cs.highlight_edge(*key == Key::End, VISIBLE_ROWS);
+                        let rows = cs.visible_rows();
+                        cs.highlight_edge(*key == Key::End, rows);
                         st.set(&s.id, WState::Choice(cs));
                         cx.redraw = true;
                         cx.consume()
@@ -1061,7 +1067,7 @@ pub fn choice_popup_paint(ch: &Choice, rect: Rect, cx: &mut PaintCx) {
             if p.multiple {
                 let row = theme.row_height();
                 let mut i = marked.first;
-                while i < marked.items.len() as i64 && i < marked.first + VISIBLE_ROWS {
+                while i < marked.items.len() as i64 && i < marked.first + marked.visible_rows() {
                     if p.selected.contains(&marked.items[i as usize].key) {
                         let y = list.y + theme.px(4) + (i - marked.first) * row;
                         cx.icon(
@@ -1132,10 +1138,8 @@ pub fn choice_popup_event(
             }
         }
         Event::Scroll { dy, .. } => {
-            let max_first = cs.items.len() - VISIBLE_ROWS as usize;
-            cs.first = (cs.first - dy.round() as i64 * 3)
-                .max(0)
-                .min(max_first as i64);
+            let max_first = (cs.items.len() as i64 - cs.visible_rows()).max(0);
+            cs.first = (cs.first - dy.round() as i64 * 3).max(0).min(max_first);
             st.set(&id, WState::Choice(cs));
             cx.redraw = true;
         }
@@ -1793,7 +1797,7 @@ mod session_tests {
                 update,
                 view,
             )
-            .size(420, 360)
+            .size(420, 480)
             .start()
             .unwrap();
             assert!(s.focus("fruit").unwrap());
@@ -1823,6 +1827,46 @@ mod session_tests {
                 "{}",
                 bottom
             );
+            s.shutdown()
+        })
+    }
+
+    #[test]
+    fn a_list_the_window_cannot_hold_scrolls_to_every_item() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let eight = numbered(8);
+            let view = move |m: &Picks| {
+                Widget::column(&[Widget::select("fruit", &eight, &m.fruit, "Item")], 8).padding(8)
+            };
+            let mut s = crate::application(
+                "Short",
+                "dev.gossamer.gui-short-list-test",
+                Picks::default,
+                update,
+                view,
+            )
+            .size(420, 200)
+            .start()
+            .unwrap();
+            assert!(s.focus("fruit").unwrap());
+            press(&mut s, Key::Return);
+            let top = s.semantics(0).dump();
+            assert!(top.contains("1/8") && !top.contains("8/8"), "{}", top);
+            s.scroll_at(100, 150, -3.0).unwrap();
+            let scrolled = s.semantics(0).dump();
+            assert!(
+                scrolled.contains("\"Item 7\"") && scrolled.contains("8/8"),
+                "{}",
+                scrolled
+            );
+            s.scroll_at(100, 150, 3.0).unwrap();
+            press(&mut s, Key::End);
+            let end = s.semantics(0).dump();
+            assert!(end.contains("8/8") && !end.contains("1/8"), "{}", end);
             s.shutdown()
         })
     }

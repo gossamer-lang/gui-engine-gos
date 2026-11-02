@@ -183,7 +183,9 @@ mod linux {
         if interface == PREFIX.to_owned() + "Application" && p.object == ROOT {
             return Some(match name {
                 "ToolkitName" => ("s", Wire::Text("gui-gos".to_string())),
-                "Version" | "ToolkitVersion" => ("s", Wire::Text("0.1.0".to_string())),
+                "Version" | "ToolkitVersion" => {
+                    ("s", Wire::Text(env!("CARGO_PKG_VERSION").to_string()))
+                }
                 "AtspiVersion" => ("s", Wire::Text("2.1".to_string())),
                 "Id" => ("i", Wire::Signed(a.application_id)),
                 _ => return None,

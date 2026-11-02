@@ -60,6 +60,11 @@ pub fn app_icon_drawn(icon: String, size: i64, background: String, foreground: S
     gui_engine_host::app_icon_drawn(icon, size, background, foreground)
 }
 
+/// The JSON icon the SVG document `svg` draws, `size` pixels square.
+pub fn app_icon_svg(svg: String, size: i64) -> Result<String, String> {
+    gui_engine_host::app_icon_svg(svg, size)
+}
+
 /// The JSON icon `icon` encoded as a PNG file.
 pub fn app_icon_png(icon: String) -> Result<Vec<u8>, String> {
     gui_engine_host::app_icon_png(icon)

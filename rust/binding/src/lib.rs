@@ -178,6 +178,12 @@ register_module!(
             .map_err(|e| e.to_string())
     }
 
+    fn app_icon_svg(svg: String, size: i64) -> Result<String, String> {
+        let icon = gui_engine::services::apps::AppIcon::from_svg(&svg, size)
+            .map_err(|e| e.to_string())?;
+        serde_json::to_string(&icon).map_err(|e| e.to_string())
+    }
+
     fn app_icon_png(icon: String) -> Result<Bytes, String> {
         let icon: gui_engine::services::apps::AppIcon =
             serde_json::from_str(&icon).map_err(|e| format!("icon: {e}"))?;

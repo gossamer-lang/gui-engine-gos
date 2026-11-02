@@ -49,6 +49,16 @@ pub struct AppIcon {
 }
 
 impl AppIcon {
+    /// The SVG document `text` drawn `size` pixels square.
+    pub fn from_svg(text: &str, size: i64) -> Result<AppIcon, errors::Error> {
+        let picture = svg::rasterize(text, size)?;
+        Ok(AppIcon {
+            rgba: picture.rgba,
+            width: picture.width,
+            height: picture.height,
+        })
+    }
+
     /// The icon encoded as a PNG file's bytes, transparency kept.
     pub fn to_png(&self) -> Vec<u8> {
         crate::render::to_png(&crate::render::Canvas {
@@ -1084,16 +1094,8 @@ pub fn load_icon(name: &str, size: i64) -> Option<AppIcon> {
 /// The PNG in `file` fit to `size` pixels, or the SVG in it drawn at `size`.
 pub fn load_icon_file(file: &str, size: i64) -> Option<AppIcon> {
     if file.to_lowercase().ends_with(".svg") {
-        let picture = svg::rasterize(
-            &super::bounded_io::read_text(file, ENTRY_BYTE_LIMIT).ok()?,
-            size,
-        )
-        .ok()?;
-        return Some(AppIcon {
-            rgba: picture.rgba,
-            width: picture.width,
-            height: picture.height,
-        });
+        let text = super::bounded_io::read_text(file, ENTRY_BYTE_LIMIT).ok()?;
+        return AppIcon::from_svg(&text, size).ok();
     }
     let bytes =
         super::bounded_io::read(std::path::Path::new(file), 32 * 1024 * 1024, &|| true).ok()?;
@@ -1428,6 +1430,15 @@ mod tests {
         let loaded = super::with_icons(&[entry.clone(), entry], 32);
         assert_eq!(loaded[0].image, loaded[1].image);
         assert_eq!(loaded[0].image.as_ref().unwrap().width, 32);
+    }
+
+    #[test]
+    fn an_svg_document_becomes_an_icon_of_the_size_asked() {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><rect width="10" height="10" fill="#b05e24"/></svg>"##;
+        let icon = super::AppIcon::from_svg(svg, 32).unwrap();
+        assert_eq!((icon.width, icon.height), (32, 32));
+        assert_eq!(&icon.rgba[0..4], &[0xb0, 0x5e, 0x24, 0xff]);
+        assert!(super::AppIcon::from_svg("not svg", 32).is_err());
     }
 
     #[test]

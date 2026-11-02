@@ -1,10 +1,11 @@
 # Changelog
 
-## 0.1.4 - F11, accent overrides and activation tokens
+## 0.1.4 - F11, accent overrides, activation tokens and SVG icons
 
 - In a terminal, F11 reaches the program unless a window command binds it, so programs receive it on macOS.
 - A subtree theme override can set the accent color, which also colors selected rows.
 - Activating a window can pass the Wayland activation token that came with the user's request.
+- An application icon can be drawn from an SVG document's text.
 
 ## 0.1.3 - Terminal options and settings windows
 

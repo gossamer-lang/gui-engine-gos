@@ -519,17 +519,13 @@ fn open_list(
     };
     let anchor = cx.to_window(Rect::new(0, 0, node.rect.width, node.rect.height));
     let mut size = completion::list_size(&s, &cx.theme, node.rect.width);
-    let filter = if filterable {
-        cx.theme.control_height()
-    } else {
-        0
+    if filterable {
+        size.height += cx.theme.control_height()
     };
-    size.height += filter;
-    s.rows = completion::fitted_rows(anchor, size, cx.window, filter, &cx.theme);
     let idx = s.highlight_index().max(0);
-    s.first = (idx - s.rows / 2)
+    s.first = (idx - VISIBLE_ROWS / 2)
         .max(0)
-        .min((items.len() as i64 - s.rows).max(0));
+        .min((items.len() as i64 - VISIBLE_ROWS).max(0));
     st.set(id, WState::Choice(s.clone()));
     let request = PopupRequest::new(id, 0, anchor, size, Placement::Below, false, true);
     let request = if filterable {
@@ -684,6 +680,18 @@ fn select_event(s: &Select, node: &Node, ev: &Event, st: &mut StateStore, cx: &m
 }
 
 // Picker popup: a filter line above the list.
+/// Records the rows the open list of `ch` shows where the session placed it.
+pub fn list_placed(ch: &Choice, rect: Rect, st: &mut StateStore, theme: &Theme) {
+    let id = ch.id();
+    let mut cs = st.choice(&id);
+    let list = match ch {
+        Choice::Pick(_) => picker_list_rect(rect, theme),
+        _ => rect,
+    };
+    cs.placed(list.height, theme);
+    st.set(&id, WState::Choice(cs))
+}
+
 fn picker_list_rect(rect: Rect, theme: &Theme) -> Rect {
     let h = theme.control_height();
     Rect::new(rect.x, rect.y + h, rect.width, rect.height - h)

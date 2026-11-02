@@ -1884,6 +1884,16 @@ impl Widget {
         }
     }
 
+    /// Records where the session placed this widget's popup, for popups that
+    /// show as many rows as fit.
+    pub fn popup_placed(&self, rect: Rect, st: &mut StateStore, theme: &Theme) {
+        match self {
+            Widget::Choice(ch) => choices::list_placed(ch, rect, st, theme),
+            Widget::TextInput(t) => textinput::list_placed(t, rect, st, theme),
+            _ => (),
+        }
+    }
+
     /// Handles an event aimed at a popup this widget opened.
     pub fn popup_event(
         &self,

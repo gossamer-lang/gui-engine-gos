@@ -1769,18 +1769,16 @@ fn request(
     }
     let show = !cs.items.is_empty() || cs.loading || explicit;
     cs.open = show;
+    st.set(&cs_id, WState::Choice(cs.clone()));
     if show {
-        open_list(t, &mut cs, cx, field)
+        open_list(t, &cs, cx, field)
     } else {
         cx.close_popup(&t.id, 0)
     }
-    st.set(&cs_id, WState::Choice(cs.clone()));
 }
 
-// Opens the completion list below `field`, recording the rows that fit there.
-fn open_list(t: &TextInput, cs: &mut ChoiceState, cx: &mut EventCx, field: Rect) {
+fn open_list(t: &TextInput, cs: &ChoiceState, cx: &mut EventCx, field: Rect) {
     let size = completion::list_size(cs, &cx.theme, field.width);
-    cs.rows = completion::fitted_rows(field, size, cx.window, 0, &cx.theme);
     cx.open_popup(&PopupRequest::new(
         &t.id,
         0,
@@ -1790,6 +1788,15 @@ fn open_list(t: &TextInput, cs: &mut ChoiceState, cx: &mut EventCx, field: Rect)
         false,
         true,
     ))
+}
+
+/// Records the rows the completion list of `t` shows where the session
+/// placed it.
+pub fn list_placed(t: &TextInput, rect: Rect, st: &mut StateStore, theme: &Theme) {
+    let cs_id = format!("{}#completion", t.id);
+    let mut cs = st.choice(&cs_id);
+    cs.placed(rect.height, theme);
+    st.set(&cs_id, WState::Choice(cs))
 }
 
 /// Delivers asynchronous completion results; answers false when they are
@@ -1881,8 +1888,8 @@ fn request_all(
         }
     }
     cs.open = true;
-    open_list(t, &mut cs, cx, field);
     st.set(&cs_id, WState::Choice(cs.clone()));
+    open_list(t, &cs, cx, field)
 }
 
 // Replaces the completion range with the accepted item: one undo step.

@@ -2853,7 +2853,21 @@ impl Session {
             request: req.clone(),
             rect,
         });
+        self.popup_placed(w, self.windows[w as usize].popups.len() - 1);
         self.windows[w as usize].dirty = true;
+    }
+
+    // Tells the owner of popup `i` of window `w` where it now is.
+    fn popup_placed(&mut self, w: i64, i: usize) {
+        let open = &self.windows[w as usize].popups[i];
+        let rect = open.rect;
+        let path = self.path_in_layers(w, &open.request.owner.clone());
+        let Some(owner) = path.last() else {
+            return;
+        };
+        let mut st = self.take_states(w);
+        owner.widget.popup_placed(rect, &mut st, &owner.theme);
+        self.windows[w as usize].states = st;
     }
 
     fn close_popup(&mut self, w: i64, owner: &str, level: i64) {
@@ -2954,6 +2968,7 @@ impl Session {
             let rect = popup::place(r.anchor, r.size, area, r.placement, rtl);
             if rect != self.windows[w as usize].popups[i].rect {
                 self.windows[w as usize].popups[i].rect = rect;
+                self.popup_placed(w, i);
                 self.windows[w as usize].dirty = true;
             }
             i += 1;
@@ -6908,6 +6923,9 @@ mod growth_tests {
             ));
             s.flush().unwrap();
             let expanded = height(&s);
+            // The grown window shows every proposal.
+            let shown = s.semantics(0).dump();
+            assert!(shown.contains("4/4"), "{}", shown);
             let popup_height = s.windows[0].popups[0].request.size.height;
             s.type_text("b").unwrap();
             s.advance(1).unwrap();

@@ -31,7 +31,7 @@ use crate::style::{TextRole, Theme};
 use crate::text::folding::{FoldedText, folded_chars};
 use crate::text::layout;
 use crate::text::layout::LayoutOptions;
-use crate::widgets::cx::{EventCx, PaintCx, Placement};
+use crate::widgets::cx::{EventCx, PaintCx};
 
 /// Detail text kept per item.
 pub const DOC_LIMIT: i64 = 2000;
@@ -511,6 +511,17 @@ impl ChoiceState {
         self.first = self.first.min(self.items.len() as i64 - 1).max(0);
     }
 
+    /// Takes the rows a list placed `height` pixels tall shows, keeping the
+    /// highlight among them.
+    pub fn placed(&mut self, height: i64, theme: &Theme) {
+        self.rows = rows_in(height, theme);
+        self.first = self.first.min(self.items.len() as i64 - self.rows).max(0);
+        let at = self.highlight_index();
+        if at >= 0 && at >= self.first + self.rows {
+            self.first = at - self.rows + 1
+        }
+    }
+
     /// The rows the open list shows.
     pub fn visible_rows(&self) -> i64 {
         if self.rows > 0 {
@@ -683,12 +694,10 @@ pub fn widest(items: &[CompletionItem], theme: &Theme, details: bool) -> f64 {
 /// Rows a popup list shows before scrolling.
 pub const VISIBLE_ROWS: i64 = 8;
 
-/// Rows a popup list of `size` shows when it opens below `anchor` in
-/// `window`, `extra` pixels of it taken by other parts: a list the window
-/// cannot hold shrinks to the rows that fit, and scrolls through the rest.
-pub fn fitted_rows(anchor: Rect, size: Size, window: Rect, extra: i64, theme: &Theme) -> i64 {
-    let placed = crate::widgets::popup::place(anchor, size, window, Placement::Below, theme.rtl);
-    ((placed.height - extra - theme.px(8)) / theme.row_height()).clamp(1, VISIBLE_ROWS)
+/// Rows a popup list `height` pixels tall shows: as many as fit, at most
+/// `VISIBLE_ROWS`, at least one.
+pub fn rows_in(height: i64, theme: &Theme) -> i64 {
+    ((height - theme.px(8)) / theme.row_height()).clamp(1, VISIBLE_ROWS)
 }
 
 /// The pixel size of a popup list for `state` at least `min_width` wide.

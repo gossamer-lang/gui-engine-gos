@@ -934,6 +934,26 @@ mod session {
     }
 
     #[test]
+    fn f11_reaches_the_program_when_no_window_command_binds_it() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let (mut s, id, _) = shown_program("f11", &reading("", 5));
+            s.press(windowing::Key::F11, windowing::Mods::default())
+                .unwrap();
+            // The program reads five bytes: F11's sequence, or this text in
+            // its place were F11 withheld.
+            s.type_text("xxxxx").unwrap();
+            step_until(&mut s, || snapshot(id).unwrap().text.contains("got:"));
+            let shown = snapshot(id).unwrap().text;
+            assert!(shown.contains("got:1b5b32337e"), "{shown}");
+            s.shutdown();
+        })
+    }
+
+    #[test]
     fn clipboard_writes_and_notifications_reach_the_application_as_events() {
         crate::testing::on_ui_thread(|| {
             let config = crate::services::private_test_config();

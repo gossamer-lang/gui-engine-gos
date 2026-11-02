@@ -1541,8 +1541,9 @@ fn key_down(v: &View, key: Key, mods: windowing::Mods, rows: i64, cx: &mut Event
     {
         return;
     }
-    // F11 makes the window fullscreen, as in GNOME Terminal and xfce4-terminal.
-    if key == Key::F11 && !mods.ctrl && !mods.alt && !mods.shift {
+    // F11 is the window's where a command binds it, as fullscreen is in GNOME
+    // Terminal and xfce4-terminal; elsewhere, as on macOS, it is the program's.
+    if key == Key::F11 && !mods.ctrl && !mods.alt && !mods.shift && bound_chord(key, mods, cx) {
         return;
     }
     if mods.shift && !mods.ctrl && (key == Key::PageUp || key == Key::PageDown) {

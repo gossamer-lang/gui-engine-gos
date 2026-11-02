@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.4 - F11 fix
+
+- In a terminal, F11 reaches the program unless a window command binds it, so programs receive it on macOS.
+
 ## 0.1.3 - Terminal options and settings windows
 
 - Text and controls scale with the desktop's interface font.

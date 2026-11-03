@@ -688,7 +688,7 @@ dependencies = [
 
 [[package]]
 name = "gos-windowing"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "block2",
  "getrandom 0.4.3",
@@ -718,7 +718,8 @@ dependencies = [
 
 [[package]]
 name = "gossamer-binding"
-version = "0.75.9"
+version = "0.75.16"
+source = "git+https://github.com/gossamer-lang/gossamer?tag=v0.75.16#082e6c3903be6947e0103eec4deaa0fd97e4796e"
 dependencies = [
  "gossamer-binding-abi",
  "gossamer-binding-macros",
@@ -730,11 +731,13 @@ dependencies = [
 
 [[package]]
 name = "gossamer-binding-abi"
-version = "0.75.9"
+version = "0.75.16"
+source = "git+https://github.com/gossamer-lang/gossamer?tag=v0.75.16#082e6c3903be6947e0103eec4deaa0fd97e4796e"
 
 [[package]]
 name = "gossamer-binding-macros"
-version = "0.75.9"
+version = "0.75.16"
+source = "git+https://github.com/gossamer-lang/gossamer?tag=v0.75.16#082e6c3903be6947e0103eec4deaa0fd97e4796e"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -743,7 +746,7 @@ dependencies = [
 
 [[package]]
 name = "gui-engine"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "encoding_rs",
@@ -777,7 +780,7 @@ dependencies = [
 
 [[package]]
 name = "gui-engine-binding"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "gos-windowing",
  "gossamer-binding",
@@ -1888,7 +1891,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys",

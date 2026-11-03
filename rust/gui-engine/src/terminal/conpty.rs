@@ -150,14 +150,9 @@ impl Pty {
                 .stack_size(STACK)
                 .spawn(move || {
                     let mut buffer = vec![0; BATCH];
+                    // Output is read while the owner parses what is queued; the
+                    // queue's bound holds the program back once it is full.
                     loop {
-                        // Output is read once the owner has taken what was
-                        // queued, so one read of the pipe collects what the
-                        // program wrote meanwhile. A closing console is read
-                        // without waiting, so its close can finish.
-                        if !stop.load(Ordering::Acquire) {
-                            out.wait_empty();
-                        }
                         match reader.read(&mut buffer) {
                             Ok(0) => break,
                             // Closing flushes output synchronously; it is read

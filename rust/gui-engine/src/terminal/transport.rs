@@ -70,16 +70,6 @@ impl Queue {
         Ok(wake)
     }
 
-    /// Waits until the owner has taken every queued chunk; false once the
-    /// queue is closed.
-    pub(crate) fn wait_empty(&self) -> bool {
-        let mut state = self.state.lock();
-        while !state.closed && !state.chunks.is_empty() {
-            self.changed.wait(&mut state);
-        }
-        !state.closed
-    }
-
     /// The next chunk; blocks while the queue is open and empty.
     pub(crate) fn pop(&self) -> Option<Vec<u8>> {
         let mut state = self.state.lock();

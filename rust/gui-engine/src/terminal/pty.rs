@@ -137,10 +137,6 @@ fn readiness(fd: i32, cancel: i32, events: i16) -> Result<bool, String> {
     }
 }
 
-/// How long a reader lets a streaming program's output gather between
-/// passes: short against a frame, long against the program's writes.
-const STREAM_GATHER: std::time::Duration = std::time::Duration::from_micros(250);
-
 fn would_block(error: &std::io::Error) -> bool {
     matches!(
         error.kind(),
@@ -226,10 +222,9 @@ impl Pty {
                 .stack_size(STACK)
                 .spawn(move || {
                     let mut buffer = [0; CHUNK];
-                    // Output is read once the owner has taken what was queued:
-                    // meanwhile the kernel holds what the program writes, and
-                    // one pass collects it whole rather than a write at a time.
-                    'reading: while !stop.load(Ordering::Acquire) && out.wait_empty() {
+                    // Output is read while the owner parses what is queued; the
+                    // queue's bound holds the program back once it is full.
+                    'reading: while !stop.load(Ordering::Acquire) {
                         if readiness(fd, signal.as_raw_fd(), libc::POLLIN) != Ok(true) {
                             break;
                         }
@@ -247,8 +242,7 @@ impl Pty {
                                 Err(_) => break true,
                             }
                         };
-                        let streaming = !batch.is_empty();
-                        if streaming {
+                        if !batch.is_empty() {
                             match out.push(batch, true) {
                                 Ok(true) => wake.fire(),
                                 Ok(false) => (),
@@ -257,13 +251,6 @@ impl Pty {
                         }
                         if ended {
                             break;
-                        }
-                        // The kernel hands a terminal's output over a write at
-                        // a time, at a fixed cost a read. While a program
-                        // streams, a moment's pause lets it gather, so a pass
-                        // reads it in fewer, fuller reads.
-                        if streaming {
-                            thread::sleep(STREAM_GATHER);
                         }
                     }
                     out.finish(true, None);
@@ -550,6 +537,34 @@ mod tests {
         pty.close().unwrap();
         drop(pty);
         assert_eq!(budget.usage().0, 0);
+    }
+
+    #[test]
+    fn the_reader_keeps_reading_while_queued_output_waits_and_stops_at_the_bound() {
+        let budget = Budget::new(8 * 1024 * 1024);
+        let (wake, wakes) = waker();
+        let mut pty = Pty::spawn(
+            &command("yes | head -c 300000"),
+            24,
+            80,
+            (0, 0),
+            &budget,
+            wake,
+        )
+        .unwrap();
+        // Nothing is drained: the reader goes on past its first pass, which
+        // ends within a read of `BATCH`.
+        {
+            let mut state = pty.output.state.lock();
+            while state.bytes < BATCH + CHUNK {
+                pty.output.changed.wait(&mut state);
+            }
+            assert!(state.bytes <= OUTPUT);
+        }
+        let text = collect(&pty, &wakes, |_, got| got.eof && !got.more);
+        // The tty writes each newline as a carriage return and newline.
+        assert_eq!(text.len(), 300_000 + 300_000 / 2);
+        pty.close().unwrap();
     }
 
     #[test]

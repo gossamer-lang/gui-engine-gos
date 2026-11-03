@@ -122,8 +122,9 @@ pub struct WindowState {
     /// Terminal output arrived that the window has not painted yet; the event
     /// loop paints it at most once per `OUTPUT_FRAME_MS`.
     pub output_dirty: bool,
-    /// Session time of the window's last paint, in milliseconds.
-    pub presented: Option<i64>,
+    /// Session time of the window's last paint that showed new terminal
+    /// output, in milliseconds.
+    pub output_presented: Option<i64>,
     pub layout_dirty: bool,
     pub caret_on: bool,
     pub active: bool,
@@ -339,8 +340,9 @@ pub struct ResourceUsage {
 const LOG_LIMIT: i64 = 400;
 
 const FRAME_MS: i64 = 33;
-/// The shortest time between two paints driven by terminal output alone, so
-/// a program writing fast is parsed in large runs rather than painted per read.
+/// The shortest time between two paints that show terminal output, so a
+/// program writing fast is parsed in large runs rather than painted per read.
+/// Output after a quiet spell paints at once, whatever else painted lately.
 const OUTPUT_FRAME_MS: i64 = 16;
 // How long a held toast waits before its timeout is looked at again.
 const TOAST_RECHECK_MS: i64 = 1000;
@@ -718,7 +720,7 @@ impl Session {
             commands: CommandTable::new(&[]),
             dirty: true,
             output_dirty: false,
-            presented: None,
+            output_presented: None,
             layout_dirty: true,
             caret_on: true,
             active: true,
@@ -1205,10 +1207,11 @@ impl Session {
             if window.output_dirty
                 && (!paced
                     || window
-                        .presented
+                        .output_presented
                         .is_none_or(|at| now - at >= OUTPUT_FRAME_MS))
             {
                 window.output_dirty = false;
+                window.output_presented = Some(now);
                 window.dirty = true;
             }
             if self.windows[w].dirty || self.windows[w].layout_dirty {
@@ -1325,7 +1328,10 @@ impl Session {
         self.windows
             .iter()
             .filter(|w| w.output_dirty)
-            .map(|w| w.presented.map_or(self.now(), |at| at + OUTPUT_FRAME_MS))
+            .map(|w| {
+                w.output_presented
+                    .map_or(self.now(), |at| at + OUTPUT_FRAME_MS)
+            })
             .min()
     }
 
@@ -5000,9 +5006,13 @@ impl Session {
             .entry(key)
             .or_default()
             .present(native, pw, ph, painted)?;
-        self.windows[w as usize].dirty = false;
-        self.windows[w as usize].output_dirty = false;
-        self.windows[w as usize].presented = Some(self.now());
+        let now = self.now();
+        let window = &mut self.windows[w as usize];
+        if window.output_dirty {
+            window.output_presented = Some(now);
+        }
+        window.dirty = false;
+        window.output_dirty = false;
         if !damage.is_empty() {
             self.windows[w as usize].frames += 1;
             if !self.started {
@@ -7416,7 +7426,7 @@ mod advance_tests {
 
     #[cfg(unix)]
     #[test]
-    fn terminal_output_waits_for_the_output_frame_after_the_last_paint() {
+    fn terminal_output_paints_at_once_after_a_quiet_spell_and_then_at_the_output_frame() {
         use crate::terminal::{self, Command, Options};
         crate::testing::on_ui_thread(|| {
             let config = crate::services::private_test_config();
@@ -7445,20 +7455,32 @@ mod advance_tests {
             let painted = s.windows[0].frames;
             let command = Command {
                 program: "/bin/sh".into(),
-                args: vec!["-c".into(), "echo first; read line".into()],
+                args: vec![
+                    "-c".into(),
+                    "echo first; read line; echo second; read line".into(),
+                ],
                 ..Command::default()
             };
             terminal::spawn(id, &command).unwrap();
             while !terminal::snapshot(id).unwrap().text.contains("first") {
                 assert!(s.step().unwrap(), "the session ended");
             }
-            // The clock has not moved since the window painted.
-            assert!(s.windows[0].output_dirty);
-            assert_eq!(s.windows[0].frames, painted);
-            s.advance(OUTPUT_FRAME_MS - 1).unwrap();
-            assert_eq!(s.windows[0].frames, painted);
-            s.advance(1).unwrap();
+            // The clock has not moved since the window painted, but that paint
+            // showed no output.
+            s.step_held_clock(0).unwrap();
             assert_eq!(s.windows[0].frames, painted + 1);
+            assert!(!s.windows[0].output_dirty);
+            terminal::input(id, b"\n").unwrap();
+            while !terminal::snapshot(id).unwrap().text.contains("second") {
+                assert!(s.step().unwrap(), "the session ended");
+            }
+            s.step_held_clock(0).unwrap();
+            assert!(s.windows[0].output_dirty);
+            assert_eq!(s.windows[0].frames, painted + 1);
+            s.step_held_clock(OUTPUT_FRAME_MS - 1).unwrap();
+            assert_eq!(s.windows[0].frames, painted + 1);
+            s.step_held_clock(1).unwrap();
+            assert_eq!(s.windows[0].frames, painted + 2);
             assert!(!s.windows[0].output_dirty);
             terminal::close(id);
             s.shutdown()

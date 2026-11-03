@@ -593,6 +593,23 @@ fn commit_spin(s: &SpinBox, e: &mut EditState, st: &mut StateStore, cx: &mut Eve
     cx.redraw = true;
 }
 
+// A held stepper button repeats as GTK's spin buttons do: once on the press,
+// again after the delay, then at the repeat interval until it is released or
+// the value reaches its bound.
+const HOLD_TIMER: &str = "hold";
+const HOLD_DELAY_MS: i64 = 500;
+const HOLD_REPEAT_MS: i64 = 50;
+
+// The value one step from the spin box's own in `direction` (-1 or 1).
+fn stepped(s: &SpinBox, direction: i64) -> f64 {
+    snap(
+        s.value + direction as f64 * s.step.max(0.0),
+        s.min,
+        s.max,
+        s.step,
+    )
+}
+
 // Reports `next` unless it is the value the control already shows.
 fn report(id: &str, current: f64, next: f64, cx: &mut EventCx) {
     if next != current {
@@ -617,20 +634,20 @@ pub fn numeric_event(n: &Numeric, node: &Node, ev: &Event, st: &mut StateStore, 
                     cx.focus_on(&s.id);
                     let lx = x - cx.origin_x;
                     let ly = y - cx.origin_y;
-                    if node.parts.len() >= 3 && node.parts[1].contains(lx, ly) {
-                        report(
-                            &s.id,
-                            s.value,
-                            snap(s.value - s.step.max(0.0), s.min, s.max, s.step),
-                            cx,
-                        )
-                    } else if node.parts.len() >= 3 && node.parts[2].contains(lx, ly) {
-                        report(
-                            &s.id,
-                            s.value,
-                            snap(s.value + s.step.max(0.0), s.min, s.max, s.step),
-                            cx,
-                        )
+                    let held = if node.parts.len() < 3 {
+                        0
+                    } else if node.parts[1].contains(lx, ly) {
+                        -1
+                    } else if node.parts[2].contains(lx, ly) {
+                        1
+                    } else {
+                        0
+                    };
+                    if held != 0 {
+                        report(&s.id, s.value, stepped(s, held), cx);
+                        st.set_field(&s.id, "held", &held.to_string());
+                        cx.capture_pointer(&s.id);
+                        cx.start_timer(&s.id, HOLD_TIMER, HOLD_DELAY_MS)
                     } else if !node.parts.is_empty() {
                         let tl = layout::layout(
                             &e.text,
@@ -704,6 +721,21 @@ pub fn numeric_event(n: &Numeric, node: &Node, ev: &Event, st: &mut StateStore, 
                         }
                     }
                     cx.redraw = true;
+                }
+                Event::Timer(tag) if tag == HOLD_TIMER => {
+                    let held: i64 = st.field(&s.id, "held", "0").parse().unwrap_or(0);
+                    let next = stepped(s, held);
+                    if held != 0 && next != s.value {
+                        report(&s.id, s.value, next, cx);
+                        cx.start_timer(&s.id, HOLD_TIMER, HOLD_REPEAT_MS)
+                    }
+                }
+                Event::PointerUp { .. } | Event::CaptureLost
+                    if st.field(&s.id, "held", "0") != "0" =>
+                {
+                    st.set_field(&s.id, "held", "0");
+                    cx.cancel_timer(&s.id, HOLD_TIMER);
+                    cx.release_pointer()
                 }
                 Event::FocusIn => {
                     e.select_all();
@@ -1166,6 +1198,48 @@ mod session_tests {
             press(&mut s, Key::Right);
             press(&mut s, Key::Right);
             assert_eq!(log(&s), "count=10; span=10..80; span=0..80; angle=90");
+            s.shutdown()
+        })
+    }
+
+    #[test]
+    fn a_held_stepper_repeats_until_released_or_at_its_bound() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::application(
+                "Numbers",
+                "dev.gossamer.gui-numeric-test",
+                || Model {
+                    count: 2.0,
+                    ..Model::default()
+                },
+                update,
+                view,
+            )
+            .size(420, 420)
+            .start()
+            .unwrap();
+            let r = s.rect_of("count").unwrap();
+            let plus = (r.x + r.width - r.height / 2, r.center_y());
+            s.press_pointer(plus.0, plus.1).unwrap();
+            assert_eq!(log(&s), "count=3");
+            s.advance(400).unwrap();
+            assert_eq!(log(&s), "count=3");
+            s.advance(100).unwrap();
+            assert_eq!(log(&s), "count=3; count=4");
+            s.advance(150).unwrap();
+            assert_eq!(log(&s), "count=3; count=4; count=5; count=6; count=7");
+            s.release_pointer(plus.0, plus.1).unwrap();
+            s.advance(1000).unwrap();
+            assert_eq!(log(&s), "count=3; count=4; count=5; count=6; count=7");
+
+            s.press_pointer(plus.0, plus.1).unwrap();
+            s.advance(2000).unwrap();
+            assert!(log(&s).ends_with("count=9; count=10"), "{}", log(&s));
+            s.release_pointer(plus.0, plus.1).unwrap();
             s.shutdown()
         })
     }

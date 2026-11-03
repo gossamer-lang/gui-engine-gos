@@ -552,14 +552,19 @@ mod tests {
             wake,
         )
         .unwrap();
-        // Nothing is drained: the reader goes on past its first pass, which
-        // ends within a read of `BATCH`.
+        // Nothing is drained: the reader goes on past its first pass until
+        // the queue holds it at its byte or chunk bound. A platform's reads
+        // may be small (about 1 KiB on macOS), so either bound may come first.
         {
             let mut state = pty.output.state.lock();
-            while state.bytes < BATCH + CHUNK {
+            while state.bytes < BATCH + CHUNK
+                && state.chunks.len() < super::super::transport::CHUNK_LIMIT
+            {
                 pty.output.changed.wait(&mut state);
             }
+            assert!(state.chunks.len() > 1, "{} chunks", state.chunks.len());
             assert!(state.bytes <= OUTPUT);
+            assert!(state.chunks.len() <= super::super::transport::CHUNK_LIMIT);
         }
         let text = collect(&pty, &wakes, |_, got| got.eof && !got.more);
         // The tty writes each newline as a carriage return and newline.

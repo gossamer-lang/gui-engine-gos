@@ -10,7 +10,7 @@ publish = false
 crate-type = ["rlib"]
 
 [dependencies]
-gossamer-binding = "0.75.16"
+gossamer-binding = "0.75.17"
 gui-engine = { path = "../gui-engine" }
 # The program's build links windowing-gos's copy, which its own binding
 # carries; `gos` patches it in. Standalone Cargo runs patch it the same way.

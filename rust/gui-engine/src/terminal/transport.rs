@@ -12,7 +12,7 @@ pub(crate) const CHUNK: usize = 8192;
 pub(crate) const BATCH: usize = 64 * 1024;
 pub(crate) const INPUT: usize = 64 * 1024;
 pub(crate) const OUTPUT: usize = 256 * 1024;
-const CHUNK_LIMIT: usize = 64;
+pub(crate) const CHUNK_LIMIT: usize = 64;
 const TRANSPORT_LIMIT: usize = 16;
 
 pub(crate) struct State {

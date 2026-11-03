@@ -688,7 +688,7 @@ dependencies = [
 
 [[package]]
 name = "gos-windowing"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "block2",
  "getrandom 0.4.3",
@@ -718,8 +718,8 @@ dependencies = [
 
 [[package]]
 name = "gossamer-binding"
-version = "0.75.16"
-source = "git+https://github.com/gossamer-lang/gossamer?tag=v0.75.16#082e6c3903be6947e0103eec4deaa0fd97e4796e"
+version = "0.75.17"
+source = "git+https://github.com/gossamer-lang/gossamer?tag=v0.75.17#a17712795107cf0b9dcdb788d50fa5a32f3711a1"
 dependencies = [
  "gossamer-binding-abi",
  "gossamer-binding-macros",
@@ -731,13 +731,13 @@ dependencies = [
 
 [[package]]
 name = "gossamer-binding-abi"
-version = "0.75.16"
-source = "git+https://github.com/gossamer-lang/gossamer?tag=v0.75.16#082e6c3903be6947e0103eec4deaa0fd97e4796e"
+version = "0.75.17"
+source = "git+https://github.com/gossamer-lang/gossamer?tag=v0.75.17#a17712795107cf0b9dcdb788d50fa5a32f3711a1"
 
 [[package]]
 name = "gossamer-binding-macros"
-version = "0.75.16"
-source = "git+https://github.com/gossamer-lang/gossamer?tag=v0.75.16#082e6c3903be6947e0103eec4deaa0fd97e4796e"
+version = "0.75.17"
+source = "git+https://github.com/gossamer-lang/gossamer?tag=v0.75.17#a17712795107cf0b9dcdb788d50fa5a32f3711a1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1891,7 +1891,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys",

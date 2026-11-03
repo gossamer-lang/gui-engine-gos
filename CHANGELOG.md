@@ -2,7 +2,7 @@
 
 ## 0.1.5 - Held spin box buttons and faster terminals
 
-- Requires Gossamer 0.75.16 or later and builds on windowing-gos 0.1.2.
+- Requires Gossamer 0.75.17 or later and builds on windowing-gos 0.1.3.
 - A terminal shows a typed character as soon as the program echoes it, instead of up to a frame later.
 - A terminal reads a program's output while it parses what came before, so plain text floods show about twice as fast.
 - Holding a spin box's - or + button keeps stepping, as in GTK: after half a second, then 20 steps a second until the button is released or the value reaches its bound.

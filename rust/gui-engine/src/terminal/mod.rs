@@ -11,6 +11,7 @@ pub mod frame;
 mod images;
 pub mod keyboard;
 pub mod links;
+mod modes;
 mod shapes;
 mod transport;
 pub mod widget;
@@ -20,7 +21,7 @@ mod conpty;
 #[cfg(unix)]
 mod pty;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, LazyLock};
 
@@ -40,7 +41,6 @@ use pty::Pty as Transport;
 
 const HANDLE_LIMIT: usize = 256;
 const ENTRY_BYTES: usize = 16 * 1024;
-const PUMP_BYTES: usize = 256 * 1024;
 const FEED_LIMIT: usize = 1024 * 1024;
 
 static NEXT: AtomicI64 = AtomicI64::new(1);
@@ -156,7 +156,8 @@ pub struct Snapshot {
     /// names it.
     #[serde(default)]
     pub job: String,
-    /// Input bytes waiting for the program and output waiting to be parsed.
+    /// Input bytes waiting for the program, and output waiting to be parsed:
+    /// none, since output is parsed as it is read.
     pub queued_input: i64,
     pub queued_output: i64,
 }
@@ -181,6 +182,17 @@ struct Entry {
     /// once, and the report waiting for the next pump.
     refused: Option<(u16, u16)>,
     refusal: Option<String>,
+    /// A paste the program has not read all of yet.
+    paste: Option<Paste>,
+    /// Output parsed since the last pump that the screen shows, which the
+    /// session repaints for.
+    output_shown: bool,
+    /// The revision the last pump saw, and the one last given to the
+    /// compactor.
+    pumped: u64,
+    compacted: u64,
+    /// Copy mode or link hints, which take the view's keys while on.
+    mode: Option<modes::Mode>,
     /// The program's character set, or `None` for UTF-8, which passes
     /// through unchanged.
     charset: Option<Charset>,
@@ -344,6 +356,11 @@ pub fn create(options: &Options, budget: Budget) -> Result<i64, String> {
             suppress_text: false,
             refused: None,
             refusal: None,
+            paste: None,
+            output_shown: false,
+            pumped: 0,
+            compacted: 0,
+            mode: None,
             charset: None,
             layouts: ByteCache::new(0),
             layouts_generation: 0,
@@ -455,6 +472,27 @@ pub fn set_encoding(id: i64, label: &str) -> Result<(), String> {
     })
 }
 
+/// Parses output terminal `id`'s program wrote, answering what the program
+/// asked of the terminal.
+fn take_output(entry: &mut Entry, bytes: &[u8]) {
+    let processed = match &mut entry.charset {
+        Some(charset) => entry.engine.process(charset.decode(bytes).as_bytes()),
+        None => entry.engine.process(bytes),
+    };
+    if processed.is_ok() {
+        entry.revision += 1;
+        if entry.scroll_on_output && entry.scrolled != 0 {
+            entry.scrolled = 0;
+            entry.engine.scroll(0);
+        }
+        // A synchronized frame shows once the program ends it.
+        let synchronized = entry.engine.synchronized();
+        entry.output_shown |= !synchronized;
+        entry.synchronized = synchronized;
+    }
+    send_replies(entry);
+}
+
 /// Runs `command` on terminal `id`, which must not already run a program.
 pub fn spawn(id: i64, command: &Command) -> Result<(), String> {
     let waker = crate::app::effects::current_waker();
@@ -470,6 +508,13 @@ pub fn spawn(id: i64, command: &Command) -> Result<(), String> {
         }
         let (rows, cols) = entry.engine.size();
         let cell = entry.engine.cell();
+        // The reader parses the output it reads on its own thread, under the
+        // registry lock, while the session's thread paints what came before.
+        let sink: transport::Sink = Box::new(move |bytes: &[u8]| {
+            if let Some(entry) = TERMINALS.lock().get_mut(&id) {
+                take_output(entry, bytes);
+            }
+        });
         entry.transport = Some(Transport::spawn(
             command,
             rows,
@@ -477,6 +522,7 @@ pub fn spawn(id: i64, command: &Command) -> Result<(), String> {
             cell,
             &entry.budget,
             wake,
+            sink,
         )?);
         entry.exit = None;
         entry.exit_reported = false;
@@ -502,15 +548,225 @@ pub fn input(id: i64, bytes: &[u8]) -> Result<(), String> {
     with(id, |entry| send(entry, bytes))
 }
 
+/// Sends typed `bytes` as `input` does, answering whether the view changed:
+/// typing scrolls it back to the live screen and drops the selection.
+pub(crate) fn typed(id: i64, bytes: &[u8]) -> Result<bool, String> {
+    with(id, |entry| {
+        let before = entry.revision;
+        send(entry, bytes)?;
+        Ok(entry.revision != before)
+    })
+}
+
 fn send(entry: &mut Entry, bytes: &[u8]) -> Result<(), String> {
     let transport = entry
         .transport
         .as_ref()
         .ok_or("the terminal runs no program")?;
-    match &entry.charset {
-        Some(charset) => transport.write(&charset.encode(bytes))?,
-        None => transport.write(bytes)?,
+    let bytes = match &entry.charset {
+        Some(charset) => charset.encode(bytes),
+        None => bytes.to_vec(),
+    };
+    if let Some(paste) = &mut entry.paste {
+        // Escape or Ctrl+C stops a paste still going out; other input waits
+        // for it to finish.
+        if bytes == b"\x1b" || bytes == b"\x03" {
+            paste.sent = paste.body.len();
+        }
+        if paste.after.len() + bytes.len() > transport::INPUT {
+            return Err("terminal input waiting for a paste exceeds 64 KiB".into());
+        }
+        paste.after.extend_from_slice(&bytes);
+        feed_paste(entry);
+    } else {
+        transport.write(&bytes)?;
     }
+    settle_input(entry);
+    Ok(())
+}
+
+/// Pastes `text`, bracketed when the program asked for bracketed paste.
+pub fn paste(id: i64, text: &str) -> Result<(), String> {
+    with(id, |entry| {
+        if entry.paste.is_some() {
+            return Err("an earlier paste is still being sent".into());
+        }
+        entry
+            .transport
+            .as_ref()
+            .ok_or("the terminal runs no program")?;
+        let (body, end) = entry.engine.paste(text)?;
+        let (body, end) = match &entry.charset {
+            Some(charset) => (charset.encode(&body), charset.encode(&end)),
+            None => (body, end),
+        };
+        let lease = entry.budget.reserve(body.len() + end.len())?;
+        entry.paste = Some(Paste {
+            body,
+            sent: 0,
+            end,
+            after: Vec::new(),
+            _lease: lease,
+        });
+        feed_paste(entry);
+        settle_input(entry);
+        Ok(())
+    })
+}
+
+/// A paste on its way to the program, which reads it as fast as it can: the
+/// input queue takes it a part at a time, so keys typed meanwhile follow it.
+struct Paste {
+    body: Vec<u8>,
+    sent: usize,
+    /// Bracketed paste's closing mark, sent even when the paste is cancelled.
+    end: Vec<u8>,
+    /// Input typed while the paste was going out, which follows it.
+    after: Vec<u8>,
+    _lease: Lease,
+}
+
+/// Queues as much of the pending paste as the input queue has room for.
+fn feed_paste(entry: &mut Entry) {
+    let (Some(paste), Some(transport)) = (&mut entry.paste, &entry.transport) else {
+        return;
+    };
+    loop {
+        let room = transport.input_room().min(transport::CHUNK * 8);
+        let left = paste.body.len() - paste.sent;
+        if left == 0 {
+            let tail = [
+                std::mem::take(&mut paste.end),
+                std::mem::take(&mut paste.after),
+            ]
+            .concat();
+            if tail.len() > room {
+                paste.end = tail;
+                transport.want_input_room();
+                return;
+            }
+            if transport.write(&tail).is_err() {
+                transport.want_input_room();
+                paste.end = tail;
+                return;
+            }
+            entry.paste = None;
+            return;
+        }
+        if room == 0 {
+            transport.want_input_room();
+            return;
+        }
+        let take = left.min(room);
+        if transport
+            .write(&paste.body[paste.sent..paste.sent + take])
+            .is_err()
+        {
+            transport.want_input_room();
+            return;
+        }
+        paste.sent += take;
+    }
+}
+
+/// Stops the pending paste where the program has got to: its closing mark and
+/// the input typed meanwhile still go out.
+pub fn cancel_paste(id: i64) -> Result<(), String> {
+    with(id, |entry| {
+        if let Some(paste) = &mut entry.paste {
+            paste.sent = paste.body.len();
+        }
+        feed_paste(entry);
+        Ok(())
+    })
+}
+
+/// Pastes `text` from the terminal's own view: a paste that fails is reported
+/// from the next pump as a refusal, since the view has no caller to answer.
+pub(crate) fn paste_from_view(id: i64, text: &str) -> bool {
+    match paste(id, text) {
+        Ok(()) => true,
+        Err(why) => {
+            with_entry(id, |entry| {
+                entry.refusal = Some(format!("Couldn't paste: {why}"))
+            });
+            false
+        }
+    }
+}
+
+/// Starts copy mode on terminal `id`, its cursor where the program's is:
+/// keys move it over the screen and the history, select, and copy.
+pub fn copy_mode(id: i64) -> Result<(), String> {
+    with(id, |entry| {
+        let (row, col) = entry.engine.cursor();
+        let cursor = (entry.engine.stable_top() + row as isize, col);
+        entry.mode = Some(modes::Mode::Copy(modes::Copy {
+            cursor,
+            anchor: None,
+        }));
+        entry.selection = None;
+        entry.revision += 1;
+        Ok(())
+    })
+}
+
+/// Labels the links on terminal `id`'s screen for keys to open them, or to
+/// copy them when `copy` is set. Answers how many there are; with none, no
+/// mode starts.
+pub fn hints(id: i64, copy: bool) -> Result<i64, String> {
+    with(id, |entry| {
+        let links = entry.links.clone();
+        if links.is_empty() {
+            return Ok(0);
+        }
+        let labels = modes::hint_labels(links.len())
+            .into_iter()
+            .zip(links)
+            .collect();
+        entry.mode = Some(modes::Mode::Hints(modes::Hints {
+            copy,
+            labels,
+            typed: String::new(),
+        }));
+        entry.revision += 1;
+        Ok(entry.links.len() as i64)
+    })
+}
+
+/// Ends copy mode or the hints on terminal `id`.
+pub fn leave_mode(id: i64) -> Result<(), String> {
+    with(id, |entry| {
+        leave(entry);
+        Ok(())
+    })
+}
+
+fn leave(entry: &mut Entry) {
+    if entry.mode.take().is_some() {
+        entry.selection = None;
+        entry.revision += 1;
+    }
+}
+
+/// The keyboard mode terminal `id` is in: "copy", "hints", or empty.
+pub fn mode(id: i64) -> String {
+    with_entry(id, |entry| match entry.mode {
+        Some(modes::Mode::Copy(_)) => "copy",
+        Some(modes::Mode::Hints(_)) => "hints",
+        None => "",
+    })
+    .unwrap_or("")
+    .to_string()
+}
+
+/// Whether a paste to terminal `id`'s program is still going out.
+pub fn pasting(id: i64) -> bool {
+    with_entry(id, |entry| entry.paste.is_some()).unwrap_or(false)
+}
+
+/// What sending input does to the view besides the bytes.
+fn settle_input(entry: &mut Entry) {
     // The user is answering what the screen shows, so a frame the program
     // left open (it may have stopped) is shown as it stands.
     if entry.synchronized {
@@ -527,15 +783,6 @@ fn send(entry: &mut Entry, bytes: &[u8]) -> Result<(), String> {
         entry.selection = None;
         entry.revision += 1;
     }
-    Ok(())
-}
-
-/// Pastes `text`, bracketed when the program asked for bracketed paste.
-pub fn paste(id: i64, text: &str) -> Result<(), String> {
-    with(id, |entry| {
-        let bytes = entry.engine.paste(text)?;
-        send(entry, &bytes)
-    })
 }
 
 /// Resizes the screen and tells the program.
@@ -612,6 +859,35 @@ pub fn copy(id: i64) -> Result<String, String> {
     with(id, |entry| Ok(selected_text(entry)))
 }
 
+/// Writes terminal `id`'s text to the file at `path` as UTF-8: the selection
+/// when `selection` is set, otherwise every row it keeps, oldest first. A
+/// row that wraps runs on into the next one, so the program's lines come back
+/// whole; trailing blank rows are left out. Answers the bytes written.
+pub fn save_text(id: i64, path: &str, selection: bool) -> Result<i64, String> {
+    use std::io::Write;
+    let text = with(id, |entry| {
+        Ok(if selection {
+            selected_text(entry)
+        } else {
+            let mut out = String::new();
+            for row in entry.engine.rows() {
+                out.push_str(&row.text);
+                if !row.wrapped {
+                    out.push('\n');
+                }
+            }
+            out.truncate(out.trim_end_matches(['\n', ' ']).len());
+            out.push('\n');
+            out
+        })
+    })?;
+    let mut file = std::fs::File::create(path).map_err(|e| format!("{path}: {e}"))?;
+    file.write_all(text.as_bytes())
+        .and_then(|()| file.flush())
+        .map_err(|e| format!("{path}: {e}"))?;
+    Ok(text.len() as i64)
+}
+
 fn selected_text(entry: &Entry) -> String {
     let Some((a, b)) = entry.selection else {
         return String::new();
@@ -636,7 +912,7 @@ pub fn snapshot(id: i64) -> Result<Snapshot, String> {
         let (pid, (queued_input, queued_output)) = entry
             .transport
             .as_ref()
-            .map_or((0, (0, 0)), |t| (t.pid(), t.queued_bytes()));
+            .map_or((0, (0, 0)), |t| (t.pid(), (t.queued_input(), 0)));
         Ok(Snapshot {
             rows: rows.into(),
             cols: cols.into(),
@@ -706,7 +982,11 @@ pub(crate) fn animation_due() -> Option<i64> {
         .min()
 }
 
-pub(crate) fn pump(budget: &Budget) -> (bool, Vec<UiMsg>) {
+/// Takes what the terminals of `budget` did since the last pump. When `held`,
+/// a window already waits to paint output: the transports' wakes stay taken,
+/// so more output does not wake the session before that frame, which takes
+/// the programs' ends and events.
+pub(crate) fn pump(budget: &Budget, held: bool) -> (bool, Vec<UiMsg>) {
     let mut changed = false;
     let mut events = Vec::new();
     let mut terminals = TERMINALS.lock();
@@ -715,36 +995,20 @@ pub(crate) fn pump(budget: &Budget) -> (bool, Vec<UiMsg>) {
             changed = true;
             events.push(UiMsg::Terminal(*id, Event::Refused(why)));
         }
+        if entry.paste.is_some() {
+            feed_paste(entry);
+        }
+        changed |= std::mem::take(&mut entry.output_shown);
+        entry.pumped = entry.revision;
         let Some(transport) = &entry.transport else {
             continue;
         };
-        if !transport.has_pending_output() {
+        if held || !transport.has_pending_output() {
             continue;
         }
-        let drained = transport.drain(PUMP_BYTES);
-        if !drained.bytes.is_empty() {
-            let processed = match &mut entry.charset {
-                Some(charset) => entry
-                    .engine
-                    .process(charset.decode(&drained.bytes).as_bytes()),
-                None => entry.engine.process(&drained.bytes),
-            };
-            if processed.is_ok() {
-                entry.revision += 1;
-                if entry.scroll_on_output && entry.scrolled != 0 {
-                    entry.scrolled = 0;
-                    entry.engine.scroll(0);
-                }
-                // A synchronized frame shows once the program ends it.
-                let synchronized = entry.engine.synchronized();
-                changed |= !synchronized;
-                entry.synchronized = synchronized;
-            }
-            let replies = entry.engine.take_replies();
-            if !replies.is_empty() {
-                let _ = transport.write(&replies);
-            }
-        }
+        // The reader parsed the output; what is left is its end and the
+        // program's exit.
+        let drained = transport.drain();
         for (title, body) in entry.engine.take_toasts() {
             events.push(UiMsg::Terminal(*id, Event::Notify(title, body)));
         }
@@ -776,7 +1040,6 @@ pub(crate) fn pump(budget: &Budget) -> (bool, Vec<UiMsg>) {
         // An exit is reported once the output before it has been parsed.
         if !entry.exit_reported
             && drained.eof
-            && !drained.more
             && let Some(exit) = &entry.exit
         {
             entry.exit_reported = true;
@@ -791,6 +1054,92 @@ pub(crate) fn pump(budget: &Budget) -> (bool, Vec<UiMsg>) {
         }
     }
     (changed, events)
+}
+
+/// Readies the terminals for the session's thread to wait: their history
+/// rows its reads inflated, drawing or searching, are compressed again. Once
+/// the windows show all the output there is (`presented`), each terminal
+/// that took none since the last pump has its history compacted off this
+/// thread; output that keeps arriving holds this off, so a flood's rows are
+/// not compressed only to be dropped.
+pub fn before_wait(presented: bool) {
+    let compactor = compactor();
+    for (id, entry) in TERMINALS.lock().iter_mut() {
+        entry.engine.recompress_read_history();
+        if presented && entry.revision == entry.pumped && entry.compacted != entry.revision {
+            entry.compacted = entry.revision;
+            match compactor {
+                Some(compactor) => compactor.request(*id, entry.revision),
+                None => entry.engine.compact_history(),
+            }
+        }
+    }
+}
+
+// Compacts the histories `before_wait` hands it on a thread of its own, a
+// block at a time, stopping at the first output since the request.
+struct Compactor {
+    queue: Mutex<VecDeque<(i64, u64)>>,
+    ready: parking_lot::Condvar,
+}
+
+impl Compactor {
+    fn request(&self, id: i64, revision: u64) {
+        self.queue.lock().push_back((id, revision));
+        self.ready.notify_one();
+    }
+
+    fn run(&self) {
+        loop {
+            let (id, revision) = {
+                let mut queue = self.queue.lock();
+                loop {
+                    if let Some(request) = queue.pop_front() {
+                        break request;
+                    }
+                    match windowing::idle::thread_idle() {
+                        Some(due) => {
+                            self.ready.wait_for(&mut queue, due);
+                        }
+                        None => self.ready.wait(&mut queue),
+                    }
+                }
+            };
+            loop {
+                let mut terminals = TERMINALS.lock();
+                let Some(entry) = terminals.get_mut(&id) else {
+                    break;
+                };
+                if entry.revision != revision || !entry.engine.compact_history_step() {
+                    // The rows compacted away belong to the reader, which
+                    // made them, to hand back.
+                    if let Some(transport) = &entry.transport {
+                        transport.release_memory();
+                    }
+                    break;
+                }
+            }
+        }
+    }
+}
+
+static COMPACTOR: Compactor = Compactor {
+    queue: Mutex::new(VecDeque::new()),
+    ready: parking_lot::Condvar::new(),
+};
+
+// The compactor, its thread started on first use; `None` when the thread
+// could not start, and the session's thread compacts instead.
+fn compactor() -> Option<&'static Compactor> {
+    static STARTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let started = STARTED.get_or_init(|| {
+        std::thread::Builder::new()
+            .name("gui-term-compact".into())
+            .stack_size(256 * 1024)
+            .spawn(|| COMPACTOR.run())
+            .is_ok()
+    });
+    started.then_some(&COMPACTOR)
 }
 
 /// Runs `f` on a terminal's entry for the widget, which draws and drives it.

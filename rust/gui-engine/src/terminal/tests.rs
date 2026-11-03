@@ -87,14 +87,14 @@ fn a_screen_that_cannot_take_its_view_reports_why_once() {
         })
         .unwrap();
     }
-    let (_, events) = pump(&budget);
+    let (_, events) = pump(&budget, false);
     let failures: Vec<_> = events
         .iter()
         .filter(|m| matches!(m, UiMsg::Terminal(t, Event::Refused(_)) if *t == id))
         .collect();
     assert_eq!(failures.len(), 1, "{events:?}");
     assert_eq!(snapshot(id).unwrap().rows, 4);
-    assert!(pump(&budget).1.is_empty());
+    assert!(pump(&budget, false).1.is_empty());
     close_budget(&budget);
 }
 
@@ -134,13 +134,46 @@ fn pump_until(
 ) -> bool {
     let mut changed_while_partial = false;
     while !done() {
-        let (changed, _) = pump(budget);
+        let (changed, _) = pump(budget, false);
         if changed && partial() {
             changed_while_partial = true;
         }
         std::thread::yield_now();
     }
     changed_while_partial
+}
+
+#[cfg(unix)]
+#[test]
+fn a_held_pump_leaves_the_output_wake_for_the_frame_that_takes_it() {
+    let budget = Budget::new(64 * 1024 * 1024);
+    let id = create(&options(4, 30, 10), budget.clone()).unwrap();
+    spawn(
+        id,
+        &Command {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "printf shown; read x".into()],
+            ..Command::default()
+        },
+    )
+    .unwrap();
+    let pending = || {
+        with(id, |e| {
+            Ok(e.transport.as_ref().is_some_and(|t| t.has_pending_output()))
+        })
+        .unwrap()
+    };
+    while !pending() {
+        std::thread::yield_now();
+    }
+    // A frame waits: the wake stays taken, so output does not wake the loop.
+    pump(&budget, true);
+    assert!(pending());
+    // The frame takes it, and later output wakes the loop again.
+    pump(&budget, false);
+    assert!(!pending());
+    assert!(snapshot(id).unwrap().text.contains("shown"));
+    close(id);
 }
 
 #[cfg(unix)]
@@ -175,12 +208,14 @@ fn a_synchronized_frame_is_shown_once_the_program_ends_it() {
     );
     assert!(!held, "a frame still open was reported as a change");
     std::fs::write(&gate, "\n").unwrap();
-    let mut shown = false;
+    // The reader parses the frame's end; the next pump reports it.
     while !text().contains("whole") {
-        shown |= pump(&budget).0;
         std::thread::yield_now();
     }
-    assert!(shown, "the ended frame was not reported as a change");
+    assert!(
+        pump(&budget, false).0,
+        "the ended frame was not reported as a change"
+    );
     close(id);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -674,7 +709,8 @@ mod session {
                 peak = peak.max(shown.queued_output);
                 *exited.borrow()
             });
-            assert!(peak <= transport::OUTPUT as i64);
+            // Output is parsed as the reader takes it; none waits in a queue.
+            assert_eq!(peak, 0);
             let shown = snapshot(id).unwrap();
             assert!(shown.text.contains("row-19999"));
             // Twenty thousand rows that never come back are laid out in the
@@ -732,6 +768,211 @@ mod session {
         assert!(s.focus("term").unwrap());
         step_until(&mut s, || snapshot(id).unwrap().text.contains("ready"));
         (s, id, events)
+    }
+
+    #[test]
+    fn a_large_paste_reaches_the_program_whole_and_typing_follows_it() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| crate::services::remove_test_config(&config));
+            let script = "stty raw -echo; printf 'ready\\r\\n'; \
+                          v=$(head -c 300000 | tail -c 5); printf 'got:%s\\r\\n' \"$v\"; read x";
+            let (mut s, id, _) = shown_program("large-paste", script);
+            paste(id, &"a".repeat(299_995)).unwrap();
+            assert!(pasting(id));
+            input(id, b"XYZ12").unwrap();
+            step_until(&mut s, || snapshot(id).unwrap().text.contains("got:XYZ12"));
+            assert!(!pasting(id));
+            close(id);
+            s.shutdown();
+        })
+    }
+
+    #[test]
+    fn escape_stops_a_paste_and_still_ends_it() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| crate::services::remove_test_config(&config));
+            let dir = std::env::temp_dir().join(format!("gui-paste-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let reader = dir.join("reader.py");
+            // Counts what arrives before the paste's closing mark.
+            std::fs::write(
+                &reader,
+                "import os, sys, time, tty\n\
+                 tty.setraw(0)\n\
+                 sys.stdout.write('\\x1b[?2004hready\\r\\n'); sys.stdout.flush()\n\
+                 data = b''\n\
+                 while b'\\x1b[201~' not in data:\n    data += os.read(0, 65536)\n\
+                 sys.stdout.write('got:%d\\r\\n' % data.index(b'\\x1b[201~')); sys.stdout.flush()\n\
+                 time.sleep(30)\n",
+            )
+            .unwrap();
+            let (mut s, id, _) = shown_program(
+                "paste-cancel",
+                &format!("exec python3 {}", reader.display()),
+            );
+            let total = 8 * 1024 * 1024;
+            paste(id, &"b".repeat(total)).unwrap();
+            input(id, b"\x1b").unwrap();
+            step_until(&mut s, || snapshot(id).unwrap().text.contains("got:"));
+            let text = snapshot(id).unwrap().text;
+            let got: usize = text
+                .split("got:")
+                .nth(1)
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|n| n.parse().ok())
+                .unwrap();
+            assert!(got < total, "{got}");
+            assert!(!pasting(id));
+            close(id);
+            s.shutdown();
+            let _ = std::fs::remove_dir_all(&dir);
+        })
+    }
+
+    #[test]
+    fn shift_enter_is_its_own_key_once_a_program_asks_for_kittys_protocol() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| crate::services::remove_test_config(&config));
+            let shift = windowing::Mods {
+                shift: true,
+                ..windowing::Mods::default()
+            };
+            // Classic encoding sends Shift+Enter as Enter, a carriage return
+            // the tty reads as a newline.
+            let (mut s, id, _) = shown_program("classic-keys", &reading("", 1));
+            s.press(windowing::Key::Return, shift).unwrap();
+            step_until(&mut s, || snapshot(id).unwrap().text.contains("got:"));
+            let text = snapshot(id).unwrap().text;
+            assert!(text.contains("got:0a"), "{text}");
+            close(id);
+            s.shutdown();
+            let (mut s, id, _) = shown_program("kitty-keys", &reading("\\033[>1u", 7));
+            s.press(windowing::Key::Return, shift).unwrap();
+            step_until(&mut s, || snapshot(id).unwrap().text.contains("got:"));
+            let text = snapshot(id).unwrap().text;
+            assert!(text.contains("got:1b5b31333b3275"), "{text}");
+            close(id);
+            s.shutdown();
+        })
+    }
+
+    fn keys(s: &mut crate::Session, typed: &str) {
+        for c in typed.chars() {
+            let (key, shift) = match c {
+                '$' => (windowing::Key::Num4, true),
+                '0'..='9' => (
+                    [
+                        windowing::Key::Num0,
+                        windowing::Key::Num1,
+                        windowing::Key::Num2,
+                        windowing::Key::Num3,
+                        windowing::Key::Num4,
+                        windowing::Key::Num5,
+                        windowing::Key::Num6,
+                        windowing::Key::Num7,
+                        windowing::Key::Num8,
+                        windowing::Key::Num9,
+                    ][c as usize - '0' as usize],
+                    false,
+                ),
+                'A'..='Z' => (windowing::Key::Char(c.to_ascii_lowercase()), true),
+                _ => (windowing::Key::Char(c), false),
+            };
+            let key = match key {
+                windowing::Key::Char(l) if l.is_ascii_lowercase() => [
+                    windowing::Key::A,
+                    windowing::Key::B,
+                    windowing::Key::C,
+                    windowing::Key::D,
+                    windowing::Key::E,
+                    windowing::Key::F,
+                    windowing::Key::G,
+                    windowing::Key::H,
+                    windowing::Key::I,
+                    windowing::Key::J,
+                    windowing::Key::K,
+                    windowing::Key::L,
+                    windowing::Key::M,
+                    windowing::Key::N,
+                    windowing::Key::O,
+                    windowing::Key::P,
+                    windowing::Key::Q,
+                    windowing::Key::R,
+                    windowing::Key::S,
+                    windowing::Key::T,
+                    windowing::Key::U,
+                    windowing::Key::V,
+                    windowing::Key::W,
+                    windowing::Key::X,
+                    windowing::Key::Y,
+                    windowing::Key::Z,
+                ][(l as u8 - b'a') as usize],
+                other => other,
+            };
+            let mods = windowing::Mods {
+                shift,
+                ..windowing::Mods::default()
+            };
+            s.press(key, mods).unwrap();
+        }
+    }
+
+    #[test]
+    fn copy_mode_moves_selects_and_copies_across_the_history() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| crate::services::remove_test_config(&config));
+            let script = "i=0; while [ $i -lt 20 ]; do echo line $i; i=$((i+1)); done; \
+                          printf 'alpha beta\\r\\ngamma delta\\r\\nready\\r\\n'; read x";
+            let (mut s, id, _) = shown_program("copy-mode", script);
+            copy_mode(id).unwrap();
+            assert_eq!(mode(id), "copy");
+            // Up to "gamma delta", from its second word to its end.
+            keys(&mut s, "kk0wv$y");
+            assert_eq!(crate::services::clipboard::text(), "delta");
+            assert_eq!(mode(id), "");
+            // From the oldest row of the history down past a screen.
+            copy_mode(id).unwrap();
+            keys(&mut s, "gvjjjjjjjjj$y");
+            let copied = crate::services::clipboard::text();
+            let lines: Vec<&str> = copied.lines().collect();
+            assert_eq!(lines.first(), Some(&"line 0"), "{copied}");
+            assert_eq!(lines.len(), 10, "{copied}");
+            assert_eq!(lines.last(), Some(&"line 9"), "{copied}");
+            close(id);
+            s.shutdown();
+        })
+    }
+
+    #[test]
+    fn hints_open_or_copy_the_link_whose_label_is_typed() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| crate::services::remove_test_config(&config));
+            let script =
+                "printf 'https://e.test/a x\\r\\nhttp://b.test/y\\r\\nready\\r\\n'; read x";
+            let (mut s, id, events) = shown_program("hints", script);
+            s.flush().unwrap();
+            assert_eq!(hints(id, true).unwrap(), 2);
+            assert_eq!(mode(id), "hints");
+            keys(&mut s, "s");
+            assert_eq!(crate::services::clipboard::text(), "http://b.test/y");
+            assert_eq!(mode(id), "");
+            assert_eq!(hints(id, false).unwrap(), 2);
+            keys(&mut s, "a");
+            assert!(
+                events
+                    .borrow()
+                    .contains(&Event::LinkActivated("https://e.test/a".to_string())),
+                "{:?}",
+                events.borrow()
+            );
+            close(id);
+            s.shutdown();
+        })
     }
 
     // Reads `n` bytes the program receives and prints them in hex after
@@ -1049,5 +1290,109 @@ fn image_strings_reach_the_screen_and_other_strings_do_not() {
     feed(id, b"\x1bXhidden\x1b\\\x1b^hidden\x1b\\shown").unwrap();
     let text = snapshot(id).unwrap().text;
     assert!(text.contains("shown") && !text.contains("hidden"));
+    close(id);
+}
+
+#[test]
+fn a_terminal_that_settles_has_its_history_compacted_off_the_session_thread() {
+    let budget = Budget::new(512 * 1024 * 1024);
+    let id = create(
+        &Options {
+            rows: 24,
+            cols: 80,
+            scrollback: 10_000,
+            byte_limit: 64 * 1024 * 1024,
+        },
+        budget.clone(),
+    )
+    .unwrap();
+    let mut out = Vec::new();
+    for n in 0..5_000 {
+        out.extend(format!("\x1b[3{}mrow {n} of the history\x1b[0m\r\n", n % 8).bytes());
+    }
+    for chunk in out.chunks(512 * 1024) {
+        feed(id, chunk).unwrap();
+    }
+    let bytes = || with(id, |entry| Ok(entry.engine.history_bytes())).unwrap();
+    let asked = || with(id, |entry| Ok(entry.compacted)).unwrap();
+    let before = bytes();
+    // Output the session has not pumped, or not shown, holds the compactor
+    // back.
+    before_wait(true);
+    assert_eq!(asked(), 0);
+    pump(&budget, false);
+    before_wait(false);
+    assert_eq!(asked(), 0);
+    before_wait(true);
+    assert_ne!(asked(), 0);
+    while bytes() >= before * 3 / 4 {
+        std::thread::yield_now();
+    }
+    assert!(snapshot(id).unwrap().text.contains("row 4999"));
+    close(id);
+}
+
+#[test]
+fn a_long_history_opens_within_its_byte_limit_and_keeps_the_newest_rows() {
+    let budget = Budget::new(512 * 1024 * 1024);
+    let limit = 64 * 1024 * 1024;
+    let id = create(
+        &Options {
+            rows: 36,
+            cols: 82,
+            scrollback: 100_000,
+            byte_limit: limit,
+        },
+        budget.clone(),
+    )
+    .unwrap();
+    assert!(snapshot(id).unwrap().reserved_bytes <= limit);
+    let mut out = Vec::new();
+    for n in 0..30_000 {
+        out.extend(format!("\x1b[3{}mrow {n}\x1b[0m\r\n", n % 8).bytes());
+    }
+    for chunk in out.chunks(512 * 1024) {
+        feed(id, chunk).unwrap();
+    }
+    with(id, |entry| {
+        entry.engine.compact_history();
+        Ok(())
+    })
+    .unwrap();
+    let shown = snapshot(id).unwrap();
+    assert_eq!(shown.history, 30_000 - 35);
+    assert!(shown.text.contains("row 29999"), "{}", shown.text);
+    close(id);
+    // A screen larger than the limit is still refused.
+    let small = Options {
+        rows: 256,
+        cols: 512,
+        scrollback: 0,
+        byte_limit: 1024 * 1024,
+    };
+    assert_eq!(
+        create(&small, budget).unwrap_err(),
+        "terminal screen exceeds its byte budget"
+    );
+}
+
+#[test]
+fn saved_text_joins_wrapped_rows_back_into_their_lines() {
+    let budget = Budget::new(64 * 1024 * 1024);
+    let id = create(&options(4, 20, 50), budget).unwrap();
+    let long = "x".repeat(45);
+    feed(id, format!("first line\r\n{long}\r\nlast").as_bytes()).unwrap();
+    let path = std::env::temp_dir().join(format!("gui-save-{}.txt", std::process::id()));
+    let path = path.to_str().unwrap();
+    let written = save_text(id, path, false).unwrap();
+    let saved = std::fs::read_to_string(path).unwrap();
+    assert_eq!(saved, format!("first line\n{long}\nlast\n"));
+    assert_eq!(written, saved.len() as i64);
+    // The first line is in the history now; the selection is on the screen.
+    select(id, Some((Cell { row: 3, col: 0 }, Cell { row: 3, col: 4 }))).unwrap();
+    save_text(id, path, true).unwrap();
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "last");
+    assert!(save_text(id, "/nonexistent/dir/file.txt", false).is_err());
+    let _ = std::fs::remove_file(path);
     close(id);
 }

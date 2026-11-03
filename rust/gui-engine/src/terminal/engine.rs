@@ -41,6 +41,9 @@ pub struct Engine {
 /// The most memory one terminal's images may take, while the session's
 /// budget has room for them.
 pub(crate) const IMAGE_LIMIT: usize = 32 * 1024 * 1024;
+/// The largest paste a terminal takes; it reaches the program as fast as the
+/// program reads it.
+pub(crate) const PASTE_LIMIT: usize = 16 * 1024 * 1024;
 
 /// What the terminal core asks of its host: the scrollback to keep, the
 /// palette its view shows, which a program's color queries answer from, and
@@ -48,6 +51,8 @@ pub(crate) const IMAGE_LIMIT: usize = 32 * 1024 * 1024;
 #[derive(Debug)]
 struct Config {
     history: usize,
+    /// The memory the history may hold; past it the oldest rows go first.
+    history_bytes: AtomicUsize,
     palette: Mutex<ColorPalette>,
     image_limit: AtomicUsize,
 }
@@ -57,11 +62,19 @@ impl TerminalConfiguration for Config {
         self.history
     }
 
+    fn scrollback_bytes(&self) -> usize {
+        self.history_bytes.load(Ordering::Relaxed)
+    }
+
     fn color_palette(&self) -> ColorPalette {
         self.palette.lock().clone()
     }
 
     fn enable_kitty_graphics(&self) -> bool {
+        true
+    }
+
+    fn enable_kitty_keyboard(&self) -> bool {
         true
     }
 
@@ -201,6 +214,26 @@ impl Notifications {
         self.title_revision = self.title_revision.wrapping_add(1);
     }
 }
+// Where the first ESC at or after `from` is, found a word at a time. A word's
+// lowest flagged byte is an ESC; a borrow can only flag bytes above one.
+fn next_escape(input: &[u8], from: usize) -> Option<usize> {
+    const ONES: u64 = u64::from_le_bytes([1; 8]);
+    const HIGHS: u64 = u64::from_le_bytes([0x80; 8]);
+    let rest = &input[from..];
+    let (words, tail) = rest.as_chunks::<8>();
+    for (n, word) in words.iter().enumerate() {
+        let x = u64::from_le_bytes(*word) ^ (ONES * 0x1b);
+        let escapes = x.wrapping_sub(ONES) & !x & HIGHS;
+        if escapes != 0 {
+            return Some(from + n * 8 + escapes.trailing_zeros() as usize / 8);
+        }
+    }
+    let done = words.len() * 8;
+    tail.iter()
+        .position(|&b| b == 0x1b)
+        .map(|n| from + done + n)
+}
+
 const OSC_LIMIT: usize = 4096;
 /// The longest image a program may send in one string: a sixel (DCS), a
 /// kitty graphics command (APC) or an iTerm2 file (OSC 1337).
@@ -232,6 +265,22 @@ impl Filter {
         }
     }
 
+    /// Whether `pass` hands `input` on as it is: from the ground state, each
+    /// ESC in it comes before a byte that begins no string and no new escape.
+    fn passes_whole(&self, input: &[u8]) -> bool {
+        if self.state != FilterState::Ground {
+            return false;
+        }
+        let mut from = 0;
+        while let Some(at) = next_escape(input, from) {
+            match input.get(at + 1) {
+                Some(b']' | b'P' | b'_' | b'X' | b'^' | 0x1b) | None => return false,
+                Some(_) => from = at + 2,
+            }
+        }
+        true
+    }
+
     /// The bytes of `input` the parser may see, in order: OSC, DCS and APC
     /// strings only when complete and bounded, and no SOS or PM payloads.
     fn pass(&mut self, input: &[u8], out: &mut Vec<u8>) {
@@ -240,10 +289,7 @@ impl Filter {
         while at < input.len() {
             // Text between sequences passes as it is, a stretch at a time.
             if self.state == Ground {
-                let end = input[at..]
-                    .iter()
-                    .position(|&b| b == 0x1b)
-                    .map_or(input.len(), |p| at + p);
+                let end = next_escape(input, at).unwrap_or(input.len());
                 out.extend_from_slice(&input[at..end]);
                 at = end;
                 if at == input.len() {
@@ -319,24 +365,43 @@ impl Filter {
     }
 }
 
-fn charge(rows: u16, cols: u16, history: usize) -> Result<usize, String> {
+/// What a terminal is charged, and the part of it its history may hold.
+struct Charge {
+    bytes: usize,
+    history: usize,
+}
+
+fn charge(rows: u16, cols: u16, history: usize, byte_limit: usize) -> Result<Charge, String> {
     if rows == 0 || cols == 0 || rows > 256 || cols > 512 || history > 100_000 {
         return Err("terminal dimensions/history exceed limits".into());
     }
-    // Charges what the terminal can hold: the main and alternate screens, the
-    // copy a resize makes while it reflows, and every history row at full
-    // width as cells, which bounds a packed history row too, plus a line
-    // header for every row the history ring reserves. Storage keeps its
-    // high-water dimensions, so a shrink returns nothing.
+    // The main and alternate screens and the copy a resize makes while it
+    // reflows, at full width as cells, plus their line headers. Storage keeps
+    // its high-water dimensions, so a shrink returns nothing.
     let cell = std::mem::size_of::<wezterm_term::Cell>();
     let line = std::mem::size_of::<Line>();
-    let cells = (usize::from(rows) * 3 + history)
-        .checked_mul(usize::from(cols))
-        .and_then(|n| n.checked_mul(cell));
-    cells
-        .and_then(|n| n.checked_add((history + usize::from(rows) * 2) * line))
+    let rows = usize::from(rows);
+    let cols = usize::from(cols);
+    let screens = (rows * 3)
+        .checked_mul(cols)
+        .and_then(|n| n.checked_mul(cell))
+        .and_then(|n| n.checked_add(rows * 2 * line))
         .and_then(|n| n.checked_add(64 * 1024))
-        .ok_or_else(|| "terminal storage overflow".into())
+        .ok_or("terminal storage overflow")?;
+    if screens > byte_limit {
+        return Err("terminal screen exceeds its byte budget".into());
+    }
+    // The history holds what its rows take at full width as cells, or what
+    // the limit leaves, whichever is less: past that the oldest rows go
+    // first, so a long history is bounded by memory rather than refused.
+    let full = history
+        .checked_mul(cols * cell + line)
+        .ok_or("terminal storage overflow")?;
+    let history = full.min(byte_limit - screens);
+    Ok(Charge {
+        bytes: screens + history,
+        history,
+    })
 }
 
 /// One row of a terminal's buffer as text.
@@ -444,14 +509,15 @@ impl Engine {
         byte_limit: usize,
         budget: Budget,
     ) -> Result<Self, String> {
-        let bytes = charge(rows, cols, history)?;
-        if bytes > byte_limit {
-            return Err("terminal grid/history exceeds its byte budget".into());
-        }
+        let Charge {
+            bytes,
+            history: history_bytes,
+        } = charge(rows, cols, history, byte_limit)?;
         let lease = budget.reserve(bytes)?;
         let notes = Arc::new(Mutex::new(Notifications::default()));
         let config = Arc::new(Config {
             history,
+            history_bytes: AtomicUsize::new(history_bytes),
             palette: Mutex::new(ColorPalette::default()),
             image_limit: AtomicUsize::new(IMAGE_LIMIT),
         });
@@ -483,15 +549,43 @@ impl Engine {
             cell: (0, 0),
         })
     }
+    /// Stores the history rows well above the screen compressed; cheap when
+    /// none are new.
+    pub fn compact_history(&mut self) {
+        self.term.compact_history();
+    }
+
+    /// Does one block of `compact_history`'s work; false once none is left.
+    pub fn compact_history_step(&mut self) -> bool {
+        self.term.compact_history_step()
+    }
+
+    /// Stores the history rows a read inflated compressed again.
+    pub fn recompress_read_history(&mut self) {
+        self.term.recompress_read_history();
+    }
+
+    /// The bytes the history's rows take, as its byte bound counts them.
+    pub fn history_bytes(&self) -> usize {
+        self.term.screen().history_bytes()
+    }
+
     /// Parses program output into the screen.
     pub fn process(&mut self, bytes: &[u8]) -> Result<(), String> {
         if bytes.len() > 1024 * 1024 {
             return Err("terminal feed exceeds 1 MiB".into());
         }
-        let mut passed = Vec::with_capacity(bytes.len());
-        self.filter.pass(bytes, &mut passed);
+        let filtered;
+        let passed = if self.filter.passes_whole(bytes) {
+            bytes
+        } else {
+            let mut out = Vec::with_capacity(bytes.len());
+            self.filter.pass(bytes, &mut out);
+            filtered = out;
+            &filtered
+        };
         let alternate = self.term.is_alt_screen_active();
-        self.term.advance_bytes(&passed);
+        self.term.advance_bytes(passed);
         self.charge_images();
         // The other screen has rows of its own, so a view into the one left
         // behind no longer applies.
@@ -523,17 +617,16 @@ impl Engine {
     /// storage keeps the largest size it has reached. `cell` is the pixel size
     /// a cell is drawn at, which places images and which programs may ask.
     pub fn resize(&mut self, rows: u16, cols: u16, cell: (u16, u16)) -> Result<(), String> {
-        charge(rows, cols, self.history)?;
-        let bytes = charge(
+        charge(rows, cols, self.history, self.byte_limit)?;
+        let Charge { bytes, history } = charge(
             rows.max(self.max_rows),
             cols.max(self.max_cols),
             self.history,
+            self.byte_limit,
         )?;
-        if bytes > self.byte_limit {
-            return Err("terminal resize exceeds its byte budget".into());
-        }
         self.lease.resize(bytes)?;
         self.charged = bytes;
+        self.config.history_bytes.store(history, Ordering::Relaxed);
         let back = self.scrollback();
         self.term.resize(terminal_size(rows, cols, cell));
         self.cell = cell;
@@ -579,6 +672,10 @@ impl Engine {
     /// Whether arrow keys send application sequences.
     pub fn application_cursor(&self) -> bool {
         self.term.application_cursor_keys_enabled()
+    }
+    /// The flags of kitty's keyboard protocol while the program asked for it.
+    pub fn kitty_keyboard(&self) -> Option<wezterm_term::input_types::KittyKeyboardFlags> {
+        self.term.kitty_keyboard_flags()
     }
     /// Rows of history kept above the screen.
     pub fn history(&self) -> usize {
@@ -649,62 +746,126 @@ impl Engine {
         } else {
             (end.0, end.1 - 1)
         };
-        let tabs = self.term.tab_stops_by_column();
         let mut out = String::new();
         self.with_visible_lines(|lines| {
-            for row in start.0..=last.0 {
-                let line = lines[usize::from(row)];
-                let slots = slots(line, cols);
-                let from = if row == start.0 { start.1 } else { 0 };
-                let to = if row == last.0 { last.1 } else { cols - 1 };
-                let length = slots
-                    .iter()
-                    .rposition(|s| matches!(s, Slot::Cell(t, _, _) if *t != " "))
-                    .map_or(0, |at| at + 1)
-                    .min(usize::from(to) + 1);
-                let mut from = usize::from(from);
-                // A selection that starts on a wide character's second column
-                // takes the whole character.
-                if from > 0 && matches!(slots.get(from), Some(Slot::Continuation)) {
-                    from -= 1;
-                }
-                let mut tab_mode = false;
-                for (col, slot) in slots.iter().enumerate().take(length).skip(from) {
-                    let text = match slot {
-                        Slot::Cell(text, _, _) => *text,
-                        Slot::Continuation => continue,
-                        Slot::Blank => " ",
-                    };
-                    // A tab's blank cells up to the next tab stop are the tab.
-                    if tab_mode {
-                        if tabs.get(col).copied().unwrap_or(false) || text != " " {
-                            tab_mode = false;
-                        } else {
-                            continue;
-                        }
-                    }
-                    if text == "\t" {
-                        tab_mode = true;
-                    }
-                    out.push_str(text);
-                }
-                if to == cols - 1 && !line.last_cell_was_wrapped() {
-                    out.push('\n');
-                }
-            }
+            out = self.copy_lines(
+                &lines[usize::from(start.0)..=usize::from(last.0)],
+                start.1,
+                last.1,
+            );
         });
+        out
+    }
+    /// The text between two positions in stable rows (see
+    /// `stable_top`), end excluded, as `copy` takes it; the rows need not be
+    /// on screen.
+    pub fn copy_stable(&self, start: (isize, u16), end: (isize, u16)) -> String {
+        if end <= start {
+            return String::new();
+        }
+        let (_, cols) = self.size();
+        let last = if end.1 == 0 {
+            (end.0 - 1, cols - 1)
+        } else {
+            (end.0, end.1 - 1)
+        };
+        let screen = self.term.screen();
+        let range = screen.stable_range(&(start.0..last.0 + 1));
+        let mut out = String::new();
+        screen.with_phys_lines(range, |lines| {
+            out = self.copy_lines(lines, start.1, last.1);
+        });
+        out
+    }
+    // The text of `lines`, from column `from` of the first to column `to` of
+    // the last, both included.
+    fn copy_lines(&self, lines: &[&Line], from: u16, to: u16) -> String {
+        let (_, cols) = self.size();
+        let tabs = self.term.tab_stops_by_column();
+        let mut out = String::new();
+        let count = lines.len();
+        for (row, line) in lines.iter().enumerate() {
+            let slots = slots(line, cols);
+            let from = if row == 0 { from } else { 0 };
+            let to = if row + 1 == count { to } else { cols - 1 };
+            let length = slots
+                .iter()
+                .rposition(|s| matches!(s, Slot::Cell(t, _, _) if *t != " "))
+                .map_or(0, |at| at + 1)
+                .min(usize::from(to) + 1);
+            let mut from = usize::from(from);
+            // A selection that starts on a wide character's second column
+            // takes the whole character.
+            if from > 0 && matches!(slots.get(from), Some(Slot::Continuation)) {
+                from -= 1;
+            }
+            let mut tab_mode = false;
+            for (col, slot) in slots.iter().enumerate().take(length).skip(from) {
+                let text = match slot {
+                    Slot::Cell(text, _, _) => *text,
+                    Slot::Continuation => continue,
+                    Slot::Blank => " ",
+                };
+                // A tab's blank cells up to the next tab stop are the tab.
+                if tab_mode {
+                    if tabs.get(col).copied().unwrap_or(false) || text != " " {
+                        tab_mode = false;
+                    } else {
+                        continue;
+                    }
+                }
+                if text == "\t" {
+                    tab_mode = true;
+                }
+                out.push_str(text);
+            }
+            if to == cols - 1 && !line.last_cell_was_wrapped() {
+                out.push('\n');
+            }
+        }
         out.strip_suffix('\n').map(str::to_owned).unwrap_or(out)
     }
-    /// Input for pasting `text`, bracketed when the program asked for it.
-    pub fn paste(&self, text: &str) -> Result<Vec<u8>, String> {
-        if text.len() > 64 * 1024 {
-            return Err("terminal paste exceeds 64 KiB".into());
+    /// The stable row the view shows at its top: a row keeps its number as
+    /// output scrolls it into the history, until the history drops it.
+    pub fn stable_top(&self) -> isize {
+        self.view_top
+            .unwrap_or_else(|| self.term.screen().visible_row_to_stable_row(0))
+    }
+    /// The stable row of the live screen's top.
+    pub fn stable_live(&self) -> isize {
+        self.term.screen().visible_row_to_stable_row(0)
+    }
+    /// The stable row of the oldest history row kept.
+    pub fn stable_first(&self) -> isize {
+        self.stable_live() - self.history() as isize
+    }
+    /// The text of stable row `row`, empty where the buffer keeps none.
+    pub fn stable_row_text(&self, row: isize) -> String {
+        let (_, cols) = self.size();
+        let screen = self.term.screen();
+        let range = screen.stable_range(&(row..row + 1));
+        let mut out = String::new();
+        screen.with_phys_lines(range, |lines| {
+            if let Some(line) = lines.first() {
+                out = row_text(line, cols);
+            }
+        });
+        out
+    }
+    /// `text` as program input, without escape and NUL characters, and what
+    /// ends it: bracketed paste's closing mark when the program asked for it.
+    pub fn paste(&self, text: &str) -> Result<(Vec<u8>, Vec<u8>), String> {
+        if text.len() > PASTE_LIMIT {
+            return Err("terminal paste exceeds 16 MiB".into());
         }
         let clean = text.replace(['\x1b', '\0'], "");
         Ok(if self.term.bracketed_paste_enabled() {
-            format!("\x1b[200~{clean}\x1b[201~").into_bytes()
+            (
+                format!("\x1b[200~{clean}").into_bytes(),
+                b"\x1b[201~".to_vec(),
+            )
         } else {
-            clean.into_bytes()
+            (clean.into_bytes(), Vec::new())
         })
     }
     pub fn charged_bytes(&self) -> usize {
@@ -871,6 +1032,47 @@ fn terminal_size(rows: u16, cols: u16, cell: (u16, u16)) -> TerminalSize {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn input_the_filter_would_leave_alone_is_what_it_passes() {
+        let pieces: [&[u8]; 12] = [
+            b"text ",
+            b"\x1b[31m",
+            b"\x1b7",
+            b"\x1b]0;title\x07",
+            b"\x1bPq#0\x1b\\",
+            b"\x1b_Gx\x1b\\",
+            b"\x1bXsos\x1b\\",
+            b"\x1b^pm\x1b\\",
+            b"\x1b\x1b[m",
+            b"\x1b",
+            "é".as_bytes(),
+            b"abcdefghij",
+        ];
+        for a in pieces {
+            for b in pieces {
+                for c in pieces {
+                    let input = [a, b, c].concat();
+                    let filter = super::Filter::default();
+                    let mut out = Vec::new();
+                    super::Filter::default().pass(&input, &mut out);
+                    if filter.passes_whole(&input) {
+                        assert_eq!(out, input, "{input:?}");
+                    }
+                    for from in 0..input.len() {
+                        assert_eq!(
+                            super::next_escape(&input, from),
+                            input[from..]
+                                .iter()
+                                .position(|&b| b == 0x1b)
+                                .map(|n| from + n),
+                            "{input:?} from {from}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     use super::*;
     #[test]
     fn the_default_limit_holds_the_largest_screen_with_the_default_history() {
@@ -938,7 +1140,10 @@ mod tests {
         e.process(b"\x1b[?1049l").unwrap();
         assert_eq!(e.text(), original);
         e.process(b"\x1b[?2004h").unwrap();
-        assert_eq!(e.paste("one\ntwo").unwrap(), b"\x1b[200~one\ntwo\x1b[201~");
+        assert_eq!(
+            e.paste("one\ntwo").unwrap(),
+            (b"\x1b[200~one\ntwo".to_vec(), b"\x1b[201~".to_vec())
+        );
         drop(frame);
         drop(e);
         assert_eq!(budget.usage().0, 0);
@@ -1064,7 +1269,9 @@ mod tests {
     #[test]
     fn resize_admission_is_atomic_and_tracks_retained_high_water_capacity() {
         let budget = Budget::new(64 * 1024 * 1024);
-        let mut e = Engine::new(24, 80, 1000, 16 * 1024 * 1024, budget).unwrap();
+        // The largest screens, three copies at full width, exceed this limit
+        // on their own; the history only takes what the screens leave.
+        let mut e = Engine::new(24, 80, 1000, 8 * 1024 * 1024, budget).unwrap();
         e.process(b"preserved").unwrap();
         let old = e.charged_bytes();
         assert!(e.resize(256, 512, (0, 0)).is_err());

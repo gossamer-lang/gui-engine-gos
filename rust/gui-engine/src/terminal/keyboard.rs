@@ -1,4 +1,5 @@
-//! Classic xterm keyboard encoding. Extended keyboard protocols are not claimed.
+//! Classic xterm keyboard encoding, which a program has until it asks for
+//! kitty's keyboard protocol (see `widget::kitty_key`).
 #[derive(Clone, Copy, Default)]
 pub struct Mods {
     pub shift: bool,

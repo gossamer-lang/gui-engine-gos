@@ -858,6 +858,7 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
         cx,
         (cw, lh, pad),
     );
+    paint_mode(v, &frame, &style, cx, r, (cw, lh, pad));
     if let Some(bar) = scrollbar(v, &theme, r, rows, (scrolled, history)) {
         cx.fill_round(bar.track, theme.px(3), foreground.with_alpha(28));
         cx.fill_round(bar.thumb, theme.px(3), foreground.with_alpha(110));
@@ -974,6 +975,425 @@ fn paint_cursor(
 }
 
 /// The key a terminal encodes, or None for a key it leaves to the window.
+// A key while copy mode or the hints are on goes to the mode; a Ctrl, Alt
+// or Command chord goes on to the window's commands. Nothing reaches the
+// program. Answers whether a mode is on.
+fn mode_key(v: &View, key: Key, mods: windowing::Mods, rows: i64, cx: &mut EventCx) -> bool {
+    let Some(copying) = with_entry(v.terminal, |e| match &e.mode {
+        Some(super::modes::Mode::Copy(_)) => Some(true),
+        Some(super::modes::Mode::Hints(_)) => Some(false),
+        None => None,
+    })
+    .flatten() else {
+        return false;
+    };
+    if copying && mods.ctrl && mods.shift && key == Key::C {
+        yank(v);
+        redraw(cx);
+        return true;
+    }
+    if mods.ctrl || mods.alt || mods.gui {
+        return true;
+    }
+    if copying {
+        copy_mode_key(v, key, mods.shift, rows);
+    } else {
+        hint_key(v, key, mods.shift, cx);
+    }
+    redraw(cx);
+    true
+}
+
+// The character a key types under `shift`, for a mode's bindings.
+fn mode_char(key: Key, shift: bool) -> Option<char> {
+    match key {
+        Key::Char(c) => Some(if shift { c.to_ascii_uppercase() } else { c }),
+        Key::Num4 if shift => Some('$'),
+        _ => printable(key, shift),
+    }
+}
+
+// Moves the copy-mode cursor, selects, or copies.
+fn copy_mode_key(v: &View, key: Key, shift: bool, rows: i64) {
+    use super::modes::{self, Mode};
+    let c = mode_char(key, shift);
+    let yanking = matches!(key, Key::Return | Key::KpEnter) || c == Some('y');
+    if yanking {
+        return yank(v);
+    }
+    with_entry(v.terminal, |e| {
+        if key == Key::Escape || c == Some('q') {
+            return super::leave(e);
+        }
+        let Some(Mode::Copy(m)) = &mut e.mode else {
+            return;
+        };
+        let (_, cols) = e.engine.size();
+        let first = e.engine.stable_first();
+        let live = e.engine.stable_live();
+        let rows = rows as isize;
+        let last = live + rows - 1;
+        let (mut row, mut col) = m.cursor;
+        let text = |row: isize| e.engine.stable_row_text(row);
+        match (key, c) {
+            (Key::Left, _) | (_, Some('h')) => col = col.saturating_sub(1),
+            (Key::Right, _) | (_, Some('l')) => col = (col + 1).min(cols - 1),
+            (Key::Up, _) | (_, Some('k')) => row -= 1,
+            (Key::Down, _) | (_, Some('j')) => row += 1,
+            (Key::PageUp, _) => row -= rows,
+            (Key::PageDown, _) => row += rows,
+            (Key::Home, _) | (_, Some('0')) => col = 0,
+            (Key::End, _) | (_, Some('$')) => col = modes::line_end(&text(row)),
+            (_, Some('g')) => (row, col) = (first, 0),
+            (_, Some('G')) => {
+                let (cursor_row, cursor_col) = e.engine.cursor();
+                (row, col) = (e.engine.stable_top() + cursor_row as isize, cursor_col);
+            }
+            (_, Some('w')) => match modes::next_word(&text(row), col) {
+                Some(next) => col = next,
+                None if row < last => (row, col) = (row + 1, 0),
+                None => {}
+            },
+            (_, Some('b')) => match modes::previous_word(&text(row), col) {
+                Some(previous) => col = previous,
+                None if row > first => {
+                    row -= 1;
+                    col = modes::previous_word(&text(row), cols).unwrap_or(0);
+                }
+                None => {}
+            },
+            (Key::Space, _) | (_, Some('v')) => {
+                m.anchor = match m.anchor {
+                    Some(_) => None,
+                    None => Some((row, col)),
+                };
+            }
+            _ => {}
+        }
+        let row = row.clamp(first, last.max(first));
+        m.cursor = (row, col);
+        let anchor = m.anchor;
+        // The view follows the cursor.
+        let top = e.engine.stable_top();
+        let target = if row < top {
+            Some(live - row)
+        } else if row > top + rows - 1 {
+            Some(live - (row - rows + 1))
+        } else {
+            None
+        };
+        if let Some(back) = target {
+            e.engine.scroll(back.max(0) as usize);
+            e.scrolled = e.engine.scrollback();
+        }
+        // The selection shows where it crosses the view.
+        let top = e.engine.stable_top();
+        e.selection = anchor.map(|anchor| {
+            let (a, b) = if anchor <= (row, col) {
+                (anchor, (row, col))
+            } else {
+                ((row, col), anchor)
+            };
+            let shown = |(r, c): modes::Place, end: bool| {
+                let view = r - top;
+                if view < 0 {
+                    Cell { row: 0, col: 0 }
+                } else if view >= rows {
+                    Cell {
+                        row: rows as i64 - 1,
+                        col: i64::from(cols),
+                    }
+                } else {
+                    Cell {
+                        row: view as i64,
+                        col: i64::from(c) + i64::from(end),
+                    }
+                }
+            };
+            (shown(a, false), shown(b, true))
+        });
+        e.revision += 1;
+    });
+}
+
+// Copies the copy-mode selection, or the cursor's line without one, and
+// ends copy mode.
+fn yank(v: &View) {
+    use super::modes::Mode;
+    let text = with_entry(v.terminal, |e| {
+        let Some(Mode::Copy(m)) = &e.mode else {
+            return String::new();
+        };
+        let text = match m.anchor {
+            Some(anchor) => {
+                let (a, b) = if anchor <= m.cursor {
+                    (anchor, m.cursor)
+                } else {
+                    (m.cursor, anchor)
+                };
+                e.engine.copy_stable(a, (b.0, b.1 + 1))
+            }
+            None => e.engine.stable_row_text(m.cursor.0).trim_end().to_string(),
+        };
+        super::leave(e);
+        text
+    })
+    .unwrap_or_default();
+    if !text.is_empty() {
+        crate::services::clipboard::set_text(&text);
+    }
+}
+
+// Narrows the hints by a typed key, and opens or copies the link whose label
+// it completes.
+fn hint_key(v: &View, key: Key, shift: bool, cx: &mut EventCx) {
+    use super::modes::{self, Mode, Pick};
+    let chosen = with_entry(v.terminal, |e| {
+        if key == Key::Escape {
+            super::leave(e);
+            return None;
+        }
+        let Some(Mode::Hints(h)) = &mut e.mode else {
+            return None;
+        };
+        if key == Key::Backspace {
+            h.typed.pop();
+            e.revision += 1;
+            return None;
+        }
+        let c = mode_char(key, shift)?.to_ascii_lowercase();
+        let typed = format!("{}{c}", h.typed);
+        let chosen = match modes::pick(h, &typed) {
+            Pick::Chosen(link) => Some((h.copy, link.clone())),
+            Pick::Partial => {
+                h.typed = typed;
+                None
+            }
+            Pick::Unknown => None,
+        };
+        if chosen.is_some() {
+            super::leave(e);
+        }
+        e.revision += 1;
+        chosen
+    })
+    .flatten();
+    let Some((copy, link)) = chosen else {
+        return;
+    };
+    if copy {
+        crate::services::clipboard::set_text(&link.uri);
+        return;
+    }
+    let event = if link.path {
+        match locate(v.terminal, &link.uri) {
+            Some(place) => TerminalEvent::PathActivated(place.path, place.line, place.col),
+            None => return,
+        }
+    } else {
+        TerminalEvent::LinkActivated(link.uri.to_string())
+    };
+    cx.emit(&UiMsg::Terminal(v.terminal, event));
+}
+
+// Draws what a mode shows over the screen: the copy-mode cursor and a frame
+// round the view, or each link's label.
+fn paint_mode(
+    v: &View,
+    frame: &Frame,
+    style: &TextStyle,
+    cx: &mut PaintCx,
+    area: Rect,
+    (cw, lh, pad): (f64, f64, i64),
+) {
+    use super::modes::Mode;
+    enum Shown {
+        Copy(Option<(i64, u16)>),
+        Hints(Vec<(String, u16, u16)>),
+    }
+    let shown = with_entry(v.terminal, |e| match &e.mode {
+        Some(Mode::Copy(m)) => {
+            let row = m.cursor.0 - e.engine.stable_top();
+            Some(Shown::Copy(
+                (0..i64::from(frame.rows()))
+                    .contains(&(row as i64))
+                    .then_some((row as i64, m.cursor.1)),
+            ))
+        }
+        Some(Mode::Hints(h)) => Some(Shown::Hints(
+            h.labels
+                .iter()
+                .filter(|(label, _)| label.starts_with(h.typed.as_str()))
+                .map(|(label, link)| (label[h.typed.len()..].to_string(), link.row, link.start))
+                .collect(),
+        )),
+        None => None,
+    })
+    .flatten();
+    let Some(shown) = shown else {
+        return;
+    };
+    let accent = cx.theme.accent;
+    let line = cx.theme.px(2).max(1);
+    let cell = |row: i64, col: u16, width: usize| {
+        Rect::new(
+            pad + (f64::from(col) * cw) as i64,
+            pad + (row as f64 * lh) as i64,
+            (cw * width.max(1) as f64).ceil() as i64,
+            lh as i64,
+        )
+    };
+    match shown {
+        Shown::Copy(cursor) => {
+            cx.stroke_round(area, 0, line, accent);
+            if let Some((row, col)) = cursor {
+                let at = cell(row, col, 1);
+                cx.fill(at, accent.with_alpha(110));
+                cx.stroke_round(at, 0, 1, accent);
+            }
+        }
+        Shown::Hints(labels) => {
+            let run = style.clone();
+            let origin = cx.abs(area);
+            let ink = cx.theme.accent_text;
+            for (label, row, col) in labels {
+                let at = cell(i64::from(row), col, label.chars().count());
+                cx.fill(at, accent);
+                let laid = layout::layout_uncached(&label, &run, LayoutOptions::single_line());
+                let rise = text_offset(style, lh);
+                layout::draw(
+                    &mut cx.canvas,
+                    &laid,
+                    (origin.x + at.x) as f64,
+                    (origin.y + at.y) as f64 + rise,
+                    &run,
+                    ink,
+                );
+            }
+        }
+    }
+}
+
+fn kitty_flags(v: &View) -> Option<wezterm_term::input_types::KittyKeyboardFlags> {
+    with_entry(v.terminal, |e| e.engine.kitty_keyboard()).flatten()
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum KeyState {
+    Down,
+    Repeat,
+    Up,
+}
+
+// Sends a key under kitty's keyboard protocol. Keys that type text without
+// Ctrl or Alt keep arriving as text, as the protocol has it unless the
+// program asked for every key as an escape code, so input methods and
+// keyboard layouts go on working.
+fn kitty_key(
+    v: &View,
+    key: Key,
+    mods: windowing::Mods,
+    state: KeyState,
+    flags: wezterm_term::input_types::KittyKeyboardFlags,
+    cx: &mut EventCx,
+) {
+    use wezterm_term::input_types::{KeyEvent, KeyboardLedStatus, KittyKeyboardFlags, Modifiers};
+    let every_key = flags.contains(KittyKeyboardFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES);
+    let text_key = printable(key, false).is_some() || matches!(key, Key::Char(_));
+    if text_key && !mods.ctrl && !mods.alt && !every_key {
+        return;
+    }
+    let Some(code) = kitty_code(key) else {
+        return;
+    };
+    let mut modifiers = Modifiers::NONE;
+    for (on, bit) in [
+        (mods.shift, Modifiers::SHIFT),
+        (mods.alt, Modifiers::ALT),
+        (mods.ctrl, Modifiers::CTRL),
+        (mods.gui, Modifiers::SUPER),
+    ] {
+        if on {
+            modifiers |= bit;
+        }
+    }
+    let mut leds = KeyboardLedStatus::empty();
+    if mods.caps_lock {
+        leds |= KeyboardLedStatus::CAPS_LOCK;
+    }
+    if mods.num_lock {
+        leds |= KeyboardLedStatus::NUM_LOCK;
+    }
+    let event = KeyEvent {
+        key: code,
+        modifiers,
+        leds,
+        repeat_count: if state == KeyState::Repeat { 2 } else { 1 },
+        key_is_down: state != KeyState::Up,
+        raw: None,
+        #[cfg(windows)]
+        win32_uni_char: None,
+    };
+    let bytes = event.encode_kitty(flags);
+    if bytes.is_empty() {
+        return;
+    }
+    if let Ok(changed) = super::typed(v.terminal, bytes.as_bytes()) {
+        // The key's text, if the platform also sends it, was in the code.
+        if text_key && state != KeyState::Up {
+            with_entry(v.terminal, |e| e.suppress_text = true);
+        }
+        took_typing(v, changed, cx);
+    }
+}
+
+fn kitty_code(key: Key) -> Option<wezterm_term::input_types::KeyCode> {
+    use wezterm_term::input_types::KeyCode as K;
+    if let Some(c) = printable(key, false) {
+        return Some(K::Char(c));
+    }
+    Some(match key {
+        Key::Char(c) => K::Char(c),
+        Key::Return | Key::KpEnter => K::Char('\r'),
+        Key::Tab => K::Char('\t'),
+        // The protocol's Backspace and Delete are these characters.
+        Key::Backspace => K::Char('\u{8}'),
+        Key::Escape => K::Char('\x1b'),
+        Key::Delete => K::Char('\u{7f}'),
+        Key::Up => K::UpArrow,
+        Key::Down => K::DownArrow,
+        Key::Left => K::LeftArrow,
+        Key::Right => K::RightArrow,
+        Key::Home => K::Home,
+        Key::End => K::End,
+        Key::Insert => K::Insert,
+        Key::PageUp => K::PageUp,
+        Key::PageDown => K::PageDown,
+        Key::F1 => K::Function(1),
+        Key::F2 => K::Function(2),
+        Key::F3 => K::Function(3),
+        Key::F4 => K::Function(4),
+        Key::F5 => K::Function(5),
+        Key::F6 => K::Function(6),
+        Key::F7 => K::Function(7),
+        Key::F8 => K::Function(8),
+        Key::F9 => K::Function(9),
+        Key::F10 => K::Function(10),
+        Key::F11 => K::Function(11),
+        Key::F12 => K::Function(12),
+        Key::LeftShift => K::LeftShift,
+        Key::RightShift => K::RightShift,
+        Key::LeftCtrl => K::LeftControl,
+        Key::RightCtrl => K::RightControl,
+        Key::LeftAlt => K::LeftAlt,
+        Key::RightAlt => K::RightAlt,
+        Key::LeftGui => K::LeftWindows,
+        Key::RightGui => K::RightWindows,
+        Key::CapsLock => K::CapsLock,
+        _ => return None,
+    })
+}
+
 fn encode_key(key: Key, mods: windowing::Mods) -> Option<keyboard::Key> {
     use keyboard::Key as K;
     Some(match key {
@@ -1325,12 +1745,23 @@ pub fn terminal_event(v: &View, node: &Node, ev: &Event, _st: &mut StateStore, c
                 redraw(cx);
             }
         }
-        Event::KeyDown { key, mods, .. } if focused => key_down(v, *key, *mods, rows, cx),
+        Event::KeyDown {
+            key, mods, repeat, ..
+        } if focused => key_down(v, *key, *mods, *repeat, rows, cx),
+        Event::KeyUp { key, mods, .. } if focused => {
+            if let Some(flags) = kitty_flags(v) {
+                kitty_key(v, *key, *mods, KeyState::Up, flags, cx);
+            }
+        }
+        Event::Text(_) if focused && with_entry(v.terminal, |e| e.mode.is_some()) == Some(true) => {
+            cx.consume();
+        }
         Event::Text(text) if focused => {
             let suppressed = with_entry(v.terminal, |e| std::mem::take(&mut e.suppress_text));
-            if suppressed != Some(true) && super::input(v.terminal, text.as_bytes()).is_ok() {
-                ime_area(v, cx);
-                redraw(cx);
+            if suppressed != Some(true)
+                && let Ok(changed) = super::typed(v.terminal, text.as_bytes())
+            {
+                took_typing(v, changed, cx);
             }
         }
         Event::Command(name) if focused => {
@@ -1395,7 +1826,7 @@ fn paste(v: &View, text: &str, cx: &mut EventCx) -> bool {
         ));
         return true;
     }
-    super::paste(v.terminal, text).is_ok()
+    super::paste_from_view(v.terminal, text)
 }
 
 /// Whether pasting `text` could run a command or send control characters:
@@ -1500,10 +1931,13 @@ fn copy_selection(v: &View) -> bool {
     }
 }
 
-fn key_down(v: &View, key: Key, mods: windowing::Mods, rows: i64, cx: &mut EventCx) {
+fn key_down(v: &View, key: Key, mods: windowing::Mods, repeat: bool, rows: i64, cx: &mut EventCx) {
     // On macOS the Command layer belongs to the application, as in
     // Terminal.app; programs read Ctrl and Option.
     if cfg!(target_os = "macos") && mods.gui {
+        return;
+    }
+    if mode_key(v, key, mods, rows, cx) {
         return;
     }
     // Ctrl+Shift+C and Ctrl+Shift+V copy and paste, leaving Ctrl+C and
@@ -1556,6 +1990,14 @@ fn key_down(v: &View, key: Key, mods: windowing::Mods, rows: i64, cx: &mut Event
     if cfg!(target_os = "macos") && mods.alt && !mods.ctrl && !v.options.option_as_meta {
         return;
     }
+    if let Some(flags) = kitty_flags(v) {
+        let state = if repeat {
+            KeyState::Repeat
+        } else {
+            KeyState::Down
+        };
+        return kitty_key(v, key, mods, state, flags, cx);
+    }
     let Some(encoded) = encode_key(key, mods) else {
         return;
     };
@@ -1573,12 +2015,22 @@ fn key_down(v: &View, key: Key, mods: windowing::Mods, rows: i64, cx: &mut Event
     if bytes.is_empty() {
         return;
     }
-    if super::input(v.terminal, &bytes).is_ok() {
+    if let Ok(changed) = super::typed(v.terminal, &bytes) {
         if mods.alt && !mods.ctrl {
             with_entry(v.terminal, |e| e.suppress_text = true);
         }
-        ime_area(v, cx);
-        redraw(cx);
+        took_typing(v, changed, cx);
+    }
+}
+
+// The view repaints for typing only when typing changed it; what the program
+// answers repaints it as output.
+fn took_typing(v: &View, changed: bool, cx: &mut EventCx) {
+    ime_area(v, cx);
+    cx.typed = true;
+    cx.consume();
+    if changed {
+        cx.redraw = true;
     }
 }
 
@@ -1618,7 +2070,7 @@ pub fn terminal_semantics(v: &View, node: &Node) -> Option<AccessNode> {
 pub fn terminal_action(v: &View, action: &str) -> bool {
     match action {
         "copy" => copy_selection(v),
-        "paste" => super::paste(v.terminal, &crate::services::clipboard::text()).is_ok(),
+        "paste" => super::paste_from_view(v.terminal, &crate::services::clipboard::text()),
         _ => false,
     }
 }

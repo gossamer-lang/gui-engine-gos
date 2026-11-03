@@ -13,7 +13,7 @@ use portable_pty::{Child, CommandBuilder, MasterPty};
 
 use super::Command;
 use super::transport::{
-    BATCH, CHUNK, Drain, INPUT, Notify, OUTPUT, Queue, STACK, Slot, check_command, pty_size,
+    BATCH, CHUNK, Drain, Ending, INPUT, Notify, Queue, STACK, Sink, Slot, check_command, pty_size,
 };
 use crate::memory::{Budget, Lease};
 
@@ -21,8 +21,10 @@ use crate::memory::{Budget, Lease};
 pub struct Pty {
     master: Option<Box<dyn MasterPty + Send>>,
     input: Arc<Queue>,
-    output: Arc<Queue>,
+    ending: Arc<Ending>,
     cancel: UnixStream,
+    /// Wakes the reader to hand back memory freed while it waited.
+    release: UnixStream,
     stopping: Arc<AtomicBool>,
     reader: Option<JoinHandle<()>>,
     writer: Option<JoinHandle<()>>,
@@ -97,29 +99,39 @@ fn process_name(_pid: i32) -> Option<String> {
     None
 }
 
-/// Waits until `fd` is ready for `events` or `cancel` is readable; answers
-/// false for cancellation. The thread hands back the memory it freed first.
-fn readiness(fd: i32, cancel: i32, events: i16) -> Result<bool, String> {
+/// What a wait in `readiness` ended on.
+#[derive(Debug, PartialEq, Eq)]
+enum Wake {
+    /// The descriptor is ready.
+    Ready,
+    /// The cancel descriptor is readable.
+    Cancelled,
+    /// The release descriptor is readable.
+    Released,
+}
+
+/// Waits until `fd` is ready for `events`, `cancel` is readable or, when
+/// given, `release` is. The thread hands back the memory it freed first.
+fn readiness(fd: i32, cancel: i32, release: Option<i32>, events: i16) -> Result<Wake, String> {
+    let pollfd = |fd, events| libc::pollfd {
+        fd,
+        events,
+        revents: 0,
+    };
     let mut fds = [
-        libc::pollfd {
-            fd,
-            events,
-            revents: 0,
-        },
-        libc::pollfd {
-            fd: cancel,
-            events: libc::POLLIN,
-            revents: 0,
-        },
+        pollfd(fd, events),
+        pollfd(cancel, libc::POLLIN),
+        pollfd(release.unwrap_or(-1), libc::POLLIN),
     ];
+    let count = if release.is_some() { 3 } else { 2 };
     loop {
         let bound = windowing::idle::thread_idle().map_or(-1, |due| {
             i32::try_from(due.as_micros().div_ceil(1000)).unwrap_or(i32::MAX)
         });
-        // SAFETY: `fds` holds two initialized pollfd records; the PTY
+        // SAFETY: `fds` holds `count` initialized pollfd records; the PTY
         // descriptor stays open until both IO threads have joined and the
-        // cancel descriptor is owned by the calling thread.
-        let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, bound) };
+        // cancel and release descriptors are owned by the calling thread.
+        let result = unsafe { libc::poll(fds.as_mut_ptr(), count, bound) };
         if result == 0 {
             continue;
         }
@@ -131,9 +143,12 @@ fn readiness(fd: i32, cancel: i32, events: i16) -> Result<bool, String> {
             return Err(error.to_string());
         }
         if fds[1].revents != 0 {
-            return Ok(false);
+            return Ok(Wake::Cancelled);
         }
-        return Ok(fds[0].revents != 0);
+        if fds[0].revents != 0 {
+            return Ok(Wake::Ready);
+        }
+        return Ok(Wake::Released);
     }
 }
 
@@ -154,13 +169,13 @@ impl Pty {
         cell: (u16, u16),
         budget: &Budget,
         wake: Arc<dyn Fn() + Send + Sync>,
+        sink: Sink,
     ) -> Result<Self, String> {
         check_command(&command.program, &command.args)?;
         let slot = Slot::acquire()?;
         let notify = Arc::new(Notify::new(wake));
         let dimensions = pty_size(rows, cols, cell)?;
-        let lease =
-            budget.reserve(3 * INPUT + 2 * OUTPUT + 3 * STACK + 4 * CHUNK + BATCH + 64 * 1024)?;
+        let lease = budget.reserve(3 * INPUT + 3 * STACK + 4 * CHUNK + BATCH + 64 * 1024)?;
         let pair = portable_pty::native_pty_system()
             .openpty(dimensions)
             .map_err(|e| e.to_string())?;
@@ -187,6 +202,9 @@ impl Pty {
         }
         let (cancel, signal) = UnixStream::pair().map_err(|e| e.to_string())?;
         let write_signal = signal.try_clone().map_err(|e| e.to_string())?;
+        let (release, released) = UnixStream::pair().map_err(|e| e.to_string())?;
+        release.set_nonblocking(true).map_err(|e| e.to_string())?;
+        released.set_nonblocking(true).map_err(|e| e.to_string())?;
         let child = pair
             .slave
             .spawn_command(builder)
@@ -196,13 +214,14 @@ impl Pty {
             .ok_or("the terminal program has no process identity")?;
         drop(pair.slave);
         let input = Arc::new(Queue::new(INPUT));
-        let output = Arc::new(Queue::new(OUTPUT));
+        let ending = Arc::new(Ending::default());
         let stopping = Arc::new(AtomicBool::new(false));
         let mut pty = Self {
             master: Some(pair.master),
             input: input.clone(),
-            output: output.clone(),
+            ending: ending.clone(),
             cancel,
+            release,
             stopping: stopping.clone(),
             reader: None,
             writer: None,
@@ -213,7 +232,7 @@ impl Pty {
             _slot: slot,
             _lease: lease,
         };
-        let out = output.clone();
+        let end = ending.clone();
         let stop = stopping.clone();
         let wake = notify.clone();
         pty.reader = Some(
@@ -222,13 +241,26 @@ impl Pty {
                 .stack_size(STACK)
                 .spawn(move || {
                     let mut buffer = [0; CHUNK];
-                    // Output is read while the owner parses what is queued; the
-                    // queue's bound holds the program back once it is full.
-                    'reading: while !stop.load(Ordering::Acquire) {
-                        if readiness(fd, signal.as_raw_fd(), libc::POLLIN) != Ok(true) {
-                            break;
+                    let mut batch = Vec::with_capacity(BATCH + CHUNK);
+                    // Output goes to the sink as it is read; while the sink
+                    // parses a batch, the kernel holds what the program
+                    // writes, so a slow sink holds the program back.
+                    while !stop.load(Ordering::Acquire) {
+                        match readiness(
+                            fd,
+                            signal.as_raw_fd(),
+                            Some(released.as_raw_fd()),
+                            libc::POLLIN,
+                        ) {
+                            Ok(Wake::Ready) => (),
+                            // The next wait hands the memory back.
+                            Ok(Wake::Released) => {
+                                let _ = (&released).read(&mut buffer);
+                                continue;
+                            }
+                            Ok(Wake::Cancelled) | Err(_) => break,
                         }
-                        let mut batch = Vec::new();
+                        batch.clear();
                         let ended = loop {
                             match reader.read(&mut buffer) {
                                 Ok(0) => break true,
@@ -243,22 +275,20 @@ impl Pty {
                             }
                         };
                         if !batch.is_empty() {
-                            match out.push(batch, true) {
-                                Ok(true) => wake.fire(),
-                                Ok(false) => (),
-                                Err(_) => break 'reading,
-                            }
+                            sink(&batch);
+                            wake.fire();
                         }
                         if ended {
                             break;
                         }
                     }
-                    out.finish(true, None);
+                    end.finish(true, None);
                     wake.fire();
                 })
                 .map_err(|e| e.to_string())?,
         );
         let stop = stopping.clone();
+        let wake = notify.clone();
         pty.writer = Some(
             thread::Builder::new()
                 .name("gui-pty-write".into())
@@ -267,7 +297,9 @@ impl Pty {
                     while let Some(bytes) = input.pop() {
                         let mut offset = 0;
                         while offset < bytes.len() && !stop.load(Ordering::Acquire) {
-                            if readiness(fd, write_signal.as_raw_fd(), libc::POLLOUT) != Ok(true) {
+                            if readiness(fd, write_signal.as_raw_fd(), None, libc::POLLOUT)
+                                != Ok(Wake::Ready)
+                            {
                                 return;
                             }
                             match writer.write(&bytes[offset..]) {
@@ -276,6 +308,11 @@ impl Pty {
                                 Err(error) if would_block(&error) => (),
                                 Err(_) => return,
                             }
+                        }
+                        input.finished();
+                        // A paste waiting for room goes on from the owner.
+                        if input.take_room_wanted() {
+                            wake.fire();
                         }
                     }
                 })
@@ -316,7 +353,7 @@ impl Pty {
                             break Err(error.to_string());
                         }
                     };
-                    output.finish(false, Some(result));
+                    ending.finish(false, Some(result));
                     notify.fire();
                 })
                 .map_err(|e| e.to_string())?,
@@ -332,7 +369,21 @@ impl Pty {
         if bytes.len() > INPUT {
             return Err("terminal input exceeds 64 KiB".into());
         }
-        self.input.push(bytes.to_vec(), false).map(|_| ())
+        // Input with none queued before it goes to the program from here,
+        // sparing the writer thread's wake; what the kernel leaves, it
+        // writes.
+        let fd = self.master.as_ref().and_then(|m| m.as_raw_fd());
+        self.input
+            .write_or_push(bytes, |bytes| match fd {
+                Some(fd) => {
+                    // SAFETY: `fd` is the open, nonblocking master descriptor
+                    // `master` owns, and `bytes` is valid for its length.
+                    let n = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+                    usize::try_from(n).unwrap_or(0)
+                }
+                None => 0,
+            })
+            .map(|_| ())
     }
 
     /// Tells the program its screen's size, in cells and in the pixels of a
@@ -345,17 +396,33 @@ impl Pty {
             .map_err(|e| e.to_string())
     }
 
-    pub fn drain(&self, limit: usize) -> Drain {
-        super::transport::drain(&self.output, &self.notify, limit)
+    pub fn drain(&self) -> Drain {
+        super::transport::drain(&self.ending, &self.notify)
+    }
+
+    /// The input bytes a write could queue now.
+    pub fn input_room(&self) -> usize {
+        self.input.room()
+    }
+
+    /// Wakes the owner, as output does, once the program takes queued input.
+    pub fn want_input_room(&self) {
+        self.input.want_room();
     }
 
     pub fn has_pending_output(&self) -> bool {
         self.notify.is_pending()
     }
 
-    /// Bytes waiting in the input and output queues.
-    pub fn queued_bytes(&self) -> (usize, usize) {
-        (self.input.bytes(), self.output.bytes())
+    /// Has the reader hand back the memory others freed for it while it
+    /// waits for output, as a compaction of its history does.
+    pub fn release_memory(&self) {
+        let _ = (&self.release).write(&[1]);
+    }
+
+    /// Input bytes waiting for the program.
+    pub fn queued_input(&self) -> usize {
+        self.input.bytes()
     }
 
     pub fn pid(&self) -> u32 {
@@ -430,7 +497,6 @@ impl Pty {
             return Ok(());
         }
         self.input.close();
-        self.output.close();
         let _ = (&self.cancel).write_all(&[1]);
         if let Some(master) = &self.master
             && let Some(fd) = master.as_raw_fd()
@@ -498,18 +564,28 @@ mod tests {
         )
     }
 
-    /// Drains until `done` holds for the collected output and drain state.
+    /// A sink that keeps what the reader hands it.
+    fn sink() -> (Sink, Arc<parking_lot::Mutex<Vec<u8>>>) {
+        let kept = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let into = kept.clone();
+        (
+            Box::new(move |bytes: &[u8]| into.lock().extend_from_slice(bytes)),
+            kept,
+        )
+    }
+
+    /// Waits until `done` holds for the output so far and the drain state.
     fn collect(
         pty: &Pty,
         wakes: &mpsc::Receiver<()>,
+        kept: &parking_lot::Mutex<Vec<u8>>,
         mut done: impl FnMut(&str, &Drain) -> bool,
     ) -> String {
-        let mut output = Vec::new();
         loop {
-            let got = pty.drain(OUTPUT);
-            output.extend_from_slice(&got.bytes);
-            if done(&String::from_utf8_lossy(&output), &got) {
-                return String::from_utf8_lossy(&output).into_owned();
+            let got = pty.drain();
+            let output = String::from_utf8_lossy(&kept.lock()).into_owned();
+            if done(&output, &got) {
+                return output;
             }
             wakes.recv().unwrap();
         }
@@ -519,12 +595,13 @@ mod tests {
     fn real_pty_has_tty_unicode_input_resize_exit_and_all_threads_join() {
         let budget = Budget::new(8 * 1024 * 1024);
         let (wake, wakes) = waker();
+        let (output, kept) = sink();
         let script = "test -t 0 || exit 8; printf 'ready\\r\\n'; read word; \
                       printf 'got:%s\\r\\n' \"$word\"; stty size; exit 7";
-        let mut pty = Pty::spawn(&command(script), 12, 44, (0, 0), &budget, wake).unwrap();
+        let mut pty = Pty::spawn(&command(script), 12, 44, (0, 0), &budget, wake, output).unwrap();
         pty.resize(18, 66, (0, 0)).unwrap();
         let mut sent = false;
-        let text = collect(&pty, &wakes, |text, got| {
+        let text = collect(&pty, &wakes, &kept, |text, got| {
             if !sent && text.contains("ready") {
                 pty.write("héllo 界\n".as_bytes()).unwrap();
                 sent = true;
@@ -533,49 +610,17 @@ mod tests {
         });
         assert!(text.contains("got:héllo 界"), "{text}");
         assert!(text.contains("18 66"), "{text}");
-        assert_eq!(pty.drain(0).exit, Some(Ok(7)));
+        assert_eq!(pty.drain().exit, Some(Ok(7)));
         pty.close().unwrap();
         drop(pty);
         assert_eq!(budget.usage().0, 0);
     }
 
     #[test]
-    fn the_reader_keeps_reading_while_queued_output_waits_and_stops_at_the_bound() {
-        let budget = Budget::new(8 * 1024 * 1024);
-        let (wake, wakes) = waker();
-        let mut pty = Pty::spawn(
-            &command("yes | head -c 300000"),
-            24,
-            80,
-            (0, 0),
-            &budget,
-            wake,
-        )
-        .unwrap();
-        // Nothing is drained: the reader goes on past its first pass until
-        // the queue holds it at its byte or chunk bound. A platform's reads
-        // may be small (about 1 KiB on macOS), so either bound may come first.
-        {
-            let mut state = pty.output.state.lock();
-            while state.bytes < BATCH + CHUNK
-                && state.chunks.len() < super::super::transport::CHUNK_LIMIT
-            {
-                pty.output.changed.wait(&mut state);
-            }
-            assert!(state.chunks.len() > 1, "{} chunks", state.chunks.len());
-            assert!(state.bytes <= OUTPUT);
-            assert!(state.chunks.len() <= super::super::transport::CHUNK_LIMIT);
-        }
-        let text = collect(&pty, &wakes, |_, got| got.eof && !got.more);
-        // The tty writes each newline as a carriage return and newline.
-        assert_eq!(text.len(), 300_000 + 300_000 / 2);
-        pty.close().unwrap();
-    }
-
-    #[test]
     fn control_c_reaches_the_real_foreground_process_group() {
         let budget = Budget::new(8 * 1024 * 1024);
         let (wake, wakes) = waker();
+        let (output, kept) = sink();
         let mut pty = Pty::spawn(
             &command("printf ready; exec sleep 20"),
             24,
@@ -583,17 +628,18 @@ mod tests {
             (0, 0),
             &budget,
             wake,
+            output,
         )
         .unwrap();
         let mut sent = false;
-        collect(&pty, &wakes, |text, got| {
+        collect(&pty, &wakes, &kept, |text, got| {
             if !sent && text.contains("ready") {
                 pty.write(b"\x03").unwrap();
                 sent = true;
             }
             got.exit.is_some()
         });
-        assert_eq!(pty.drain(0).exit, Some(Ok(130)));
+        assert_eq!(pty.drain().exit, Some(Ok(130)));
         pty.close().unwrap();
         drop(pty);
         assert_eq!(budget.usage().0, 0);
@@ -603,13 +649,14 @@ mod tests {
     fn a_sent_signal_reaches_the_foreground_job_and_not_the_shell() {
         let budget = Budget::new(8 * 1024 * 1024);
         let (wake, wakes) = waker();
+        let (output, kept) = sink();
         // An interactive shell runs `sleep` as its foreground job; the shell
         // itself survives the job's SIGTERM and reports its status.
         // The job is in the foreground before it prints.
         let script = "set -m; sh -c 'printf ready; exec sleep 20'; echo \"job:$?\"; exit 4";
-        let mut pty = Pty::spawn(&command(script), 24, 80, (0, 0), &budget, wake).unwrap();
+        let mut pty = Pty::spawn(&command(script), 24, 80, (0, 0), &budget, wake, output).unwrap();
         let mut sent = false;
-        let text = collect(&pty, &wakes, |text, got| {
+        let text = collect(&pty, &wakes, &kept, |text, got| {
             if !sent && text.contains("ready") {
                 let fd = pty.master.as_ref().and_then(|m| m.as_raw_fd()).unwrap();
                 // SAFETY: `fd` is the open master descriptor.
@@ -621,7 +668,7 @@ mod tests {
             got.eof && got.exit.is_some()
         });
         assert!(text.contains("job:143"), "{text}");
-        assert_eq!(pty.drain(0).exit, Some(Ok(4)));
+        assert_eq!(pty.drain().exit, Some(Ok(4)));
         assert!(pty.signal(0).is_err());
         pty.close().unwrap();
         drop(pty);
@@ -632,20 +679,17 @@ mod tests {
     fn saturated_output_and_blocked_input_cancel_without_waiting_for_child_io() {
         let budget = Budget::new(8 * 1024 * 1024);
         let (wake, wakes) = waker();
+        let (output, kept) = sink();
         let script = "trap '' HUP; while :; do printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'; done";
-        let mut pty = Pty::spawn(&command(script), 24, 80, (0, 0), &budget, wake).unwrap();
-        // The reader waits once it has queued a batch; nothing drains it.
-        {
-            let mut state = pty.output.state.lock();
-            while state.chunks.is_empty() {
-                pty.output.changed.wait(&mut state);
-            }
+        let mut pty = Pty::spawn(&command(script), 24, 80, (0, 0), &budget, wake, output).unwrap();
+        // The reader hands the sink one batch after another; nothing else
+        // takes the output.
+        while kept.lock().is_empty() {
+            wakes.recv().unwrap();
         }
-        wakes.recv().unwrap();
-        assert!(pty.queued_bytes().1 <= OUTPUT);
         let _ = pty.write(&[b'a'; INPUT]);
         let _ = pty.write(&[b'b'; INPUT]);
-        assert!(pty.queued_bytes().0 <= INPUT);
+        assert!(pty.queued_input() <= INPUT);
         pty.close().unwrap();
         drop(pty);
         assert_eq!(budget.usage().0, 0);
@@ -655,8 +699,16 @@ mod tests {
     fn idle_reader_cancellation_leaves_no_threads_or_reservations() {
         let budget = Budget::new(8 * 1024 * 1024);
         for _ in 0..20 {
-            let mut pty =
-                Pty::spawn(&command("read x"), 8, 20, (0, 0), &budget, Arc::new(|| {})).unwrap();
+            let mut pty = Pty::spawn(
+                &command("read x"),
+                8,
+                20,
+                (0, 0),
+                &budget,
+                Arc::new(|| {}),
+                Box::new(|_: &[u8]| {}),
+            )
+            .unwrap();
             pty.close().unwrap();
             drop(pty);
             assert_eq!(budget.usage().0, 0);

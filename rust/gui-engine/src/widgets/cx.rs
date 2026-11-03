@@ -419,6 +419,9 @@ pub struct EventCx {
     pub release_capture: bool,
     pub handled: bool,
     pub redraw: bool,
+    /// The pass took typing, which restarts the caret blink in its visible
+    /// phase.
+    pub typed: bool,
     /// The pass moved something layout positions (a scroll offset), so the
     /// window lays out again before it paints and hit-tests.
     pub relayout: bool,
@@ -461,6 +464,7 @@ impl EventCx {
             release_capture: false,
             handled: false,
             redraw: false,
+            typed: false,
             relayout: false,
             open_popups: vec![],
             close_popups: vec![],

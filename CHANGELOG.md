@@ -1,10 +1,18 @@
 # Changelog
 
-## 0.1.5 - Held spin box buttons and faster terminals
+## 0.1.5 - Faster terminals, bounded history, keyboard modes and held spin box buttons
 
-- Requires Gossamer 0.75.17 or later and builds on windowing-gos 0.1.3.
+- Requires Gossamer 0.75.17 or later and builds on windowing-gos 0.1.3 and wezterm-lite 0.1.2.
 - A terminal shows a typed character as soon as the program echoes it, instead of up to a frame later.
-- A terminal reads a program's output while it parses what came before, so plain text floods show about twice as fast.
+- A typed key reaches the program from the session's thread when no input waits before it, and a keystroke repaints only when it changes the view, so an echoed character shows sooner.
+- A terminal parses a program's output on its reader thread while the session paints, and hands output with no OSC, DCS or APC string to the parser without copying it: plain text shows about twice as fast as in 0.1.4, colored text about 1.8 times and mixed Unicode about 2.4 times.
+- While a window waits for its next frame, more terminal output does not wake the session again, so a flood of output wakes it about 230 times a second instead of 2,000, and its frames arrive more evenly.
+- A terminal's history is bounded by memory as well as by rows, so a long history no longer refuses the terminal. Once the windows show all of a terminal's output, its history well above the screen is compressed on a thread of its own, so a flood's rows are not compressed only to be dropped.
+- A paste of up to 16 MiB goes to the program as fast as it reads it, as one paste: input typed meanwhile follows it, and Escape or Ctrl+C stops it. A paste from the view that fails is reported as `Refused`.
+- A program that asks for kitty's keyboard protocol gets keys encoded under it, key releases included when it asks; others keep classic xterm keys.
+- Terminal copy mode (`terminal::copy_mode`) moves a cursor of its own over the screen and the history to select and copy; link hints (`terminal::hints`) label the links on the screen for a key to open or copy; `terminal::leave_mode` ends either.
+- `terminal::save_text` writes the history or the selection to a file, each wrapped row joined into its line.
+- `Session::set_remember_size(false)` opens windows at the size the application asks for instead of the size they last closed at; they still open where they were.
 - Holding a spin box's - or + button keeps stepping, as in GTK: after half a second, then 20 steps a second until the button is released or the value reaches its bound.
 
 ## 0.1.4 - F11, accent overrides, activation tokens and SVG icons

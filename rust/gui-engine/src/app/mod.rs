@@ -262,6 +262,9 @@ pub struct Session {
     /// Whether the application's own windows open with surfaces that can be
     /// see-through (`Session::allow_transparency`).
     see_through: bool,
+    /// Whether windows open at the size they last closed at rather than the
+    /// size the application asks for (`Session::set_remember_size`).
+    remember_size: bool,
     shell: Option<Shell>,
     disposed: Option<DisposedCallback>,
     timers: Vec<Timer>,
@@ -417,6 +420,7 @@ pub fn start(name: &str, app_id: &str) -> Result<Session, errors::Error> {
         scale_override: None,
         transparent: false,
         see_through: false,
+        remember_size: true,
         shell: None,
         disposed: None,
         timers: vec![],
@@ -613,8 +617,8 @@ impl Session {
             services::load_window_placement(&self.app_id, key)
         };
         let (units_w, units_h) = match placement {
-            Some(p) => (p.width, p.height),
-            None => (width, height),
+            Some(p) if self.remember_size => (p.width, p.height),
+            _ => (width, height),
         };
         let display = windowing::display::primary().ok();
         let content = display
@@ -653,7 +657,7 @@ impl Session {
         if let Some(p) = placement {
             options.x = Some(p.x);
             options.y = Some(p.y);
-            options.maximized = p.maximized;
+            options.maximized = p.maximized && self.remember_size;
         }
         let native = self.app.window_with(&options)?;
         let scale = self
@@ -810,6 +814,13 @@ impl Session {
     /// call reaches them while they are open.
     pub fn allow_transparency(&mut self) {
         self.see_through = true;
+    }
+
+    /// Whether windows open from now on at the size, and maximized state,
+    /// they last closed with (the default), or at the size the application
+    /// asks for; either way they open where they last were.
+    pub fn set_remember_size(&mut self, remember: bool) {
+        self.remember_size = remember;
     }
 
     /// Makes window `key` `width` by `height` interface units.
@@ -1071,6 +1082,7 @@ impl Session {
         if self.quit || self.windows.is_empty() {
             return Ok(false);
         }
+        crate::terminal::before_wait(self.windows.iter().all(|w| !w.output_dirty));
         let ev = self.next_event()?;
         if let Some(e) = ev {
             self.handle(&e)?;
@@ -1166,7 +1178,16 @@ impl Session {
                 self.run_job(&services::jobs::Job::SyntaxLines(request));
             }
             self.drain_inbox();
-            let (terminals_changed, terminal_events) = crate::terminal::pump(&self.budget);
+            // A window that waits to paint output paints all there is when its
+            // frame is due, so output meanwhile need not wake the loop.
+            let now = self.now();
+            let held = paced
+                && self.windows.iter().any(|w| {
+                    w.output_dirty
+                        && w.output_presented
+                            .is_some_and(|at| now - at < OUTPUT_FRAME_MS)
+                });
+            let (terminals_changed, terminal_events) = crate::terminal::pump(&self.budget, held);
             // An animated image whose frame is due repaints like new output.
             let terminals_changed = terminals_changed
                 || crate::terminal::animation_due().is_some_and(|due| due <= self.now());
@@ -2872,9 +2893,11 @@ impl Session {
         for id in &cx.run {
             self.run_command(w, id)
         }
-        // Typing restarts the caret blink in the visible phase.
-        if cx.redraw && !self.windows[w as usize].caret_on {
+        // Typing restarts the caret blink in the visible phase; a caret
+        // hidden until now shows by painting.
+        if (cx.redraw || cx.typed) && !self.windows[w as usize].caret_on {
             self.windows[w as usize].caret_on = true;
+            self.windows[w as usize].dirty = true;
         }
     }
 
@@ -6812,6 +6835,36 @@ mod dialog_scope_tests {
             assert!(s.dialog_ids().is_empty(), "{:?}", s.dialog_ids());
             assert!(events(&s).contains("setup=Values"), "{}", events(&s));
             s.shutdown()
+        })
+    }
+
+    #[test]
+    fn a_window_opens_at_its_saved_size_unless_sizes_are_not_remembered() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let app = "dev.gossamer.gui-remember-size-test";
+            let saved = crate::services::WindowPlacement {
+                x: 40,
+                y: 30,
+                width: 500,
+                height: 300,
+                maximized: false,
+            };
+            let opened = |remember: bool| {
+                crate::services::save_window_placement(app, "main", saved).unwrap();
+                let mut s = super::start("Sizes", app).unwrap();
+                s.set_remember_size(remember);
+                s.prepare_window("main", "Sizes", 640, 480).unwrap();
+                s.flush().unwrap();
+                let size = s.windows[0].node.rect.size();
+                s.shutdown();
+                (size.width, size.height)
+            };
+            assert_eq!(opened(true), (500, 300));
+            assert_eq!(opened(false), (640, 480));
         })
     }
 

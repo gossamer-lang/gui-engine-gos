@@ -17,7 +17,7 @@ use windows_sys::Win32::System::Threading::{
 
 use super::Command;
 use super::transport::{
-    BATCH, CHUNK, Drain, INPUT, Notify, OUTPUT, Queue, STACK, Slot, check_command, pty_size,
+    BATCH, CHUNK, Drain, Ending, INPUT, Notify, Queue, STACK, Sink, Slot, check_command, pty_size,
 };
 use crate::memory::{Budget, Lease};
 
@@ -27,7 +27,7 @@ pub struct Pty {
     process: OwnedHandle,
     pid: u32,
     input: Arc<Queue>,
-    output: Arc<Queue>,
+    ending: Arc<Ending>,
     closing: Arc<AtomicBool>,
     reader: Option<JoinHandle<()>>,
     writer: Option<JoinHandle<()>>,
@@ -89,12 +89,12 @@ impl Pty {
         cell: (u16, u16),
         budget: &Budget,
         wake: Arc<dyn Fn() + Send + Sync>,
+        sink: Sink,
     ) -> Result<Self, String> {
         check_command(&command.program, &command.args)?;
         let slot = Slot::acquire()?;
         let notify = Arc::new(Notify::new(wake));
-        let lease =
-            budget.reserve(3 * INPUT + 2 * OUTPUT + 4 * STACK + 4 * CHUNK + BATCH + 64 * 1024)?;
+        let lease = budget.reserve(3 * INPUT + 4 * STACK + 4 * CHUNK + BATCH + 64 * 1024)?;
         let pair = portable_pty::native_pty_system()
             .openpty(pty_size(rows, cols, cell)?)
             .map_err(|e| e.to_string())?;
@@ -125,14 +125,14 @@ impl Pty {
         };
         drop(pair.slave);
         let input = Arc::new(Queue::new(INPUT));
-        let output = Arc::new(Queue::new(OUTPUT));
+        let ending = Arc::new(Ending::default());
         let closing = Arc::new(AtomicBool::new(false));
         let mut pty = Self {
             master: Some(pair.master),
             process,
             pid,
             input: input.clone(),
-            output: output.clone(),
+            ending: ending.clone(),
             closing: closing.clone(),
             reader: None,
             writer: None,
@@ -141,7 +141,7 @@ impl Pty {
             _slot: slot,
             _lease: lease,
         };
-        let out = output.clone();
+        let end = ending.clone();
         let stop = closing.clone();
         let wake = notify.clone();
         pty.reader = Some(
@@ -150,30 +150,29 @@ impl Pty {
                 .stack_size(STACK)
                 .spawn(move || {
                     let mut buffer = vec![0; BATCH];
-                    // Output is read while the owner parses what is queued; the
-                    // queue's bound holds the program back once it is full.
+                    // Output goes to the sink as it is read; while the sink
+                    // parses, the pipe holds what the program writes.
                     loop {
                         match reader.read(&mut buffer) {
                             Ok(0) => break,
                             // Closing flushes output synchronously; it is read
                             // and discarded so the close can finish.
                             Ok(_) if stop.load(Ordering::Acquire) => (),
-                            Ok(n) => match out.push(buffer[..n].to_vec(), true) {
-                                Ok(true) => wake.fire(),
-                                Ok(false) => (),
-                                Err(_) if stop.load(Ordering::Acquire) => (),
-                                Err(_) => break,
-                            },
+                            Ok(n) => {
+                                sink(&buffer[..n]);
+                                wake.fire();
+                            }
                             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => (),
                             Err(_) => break,
                         }
                     }
-                    out.finish(true, None);
+                    end.finish(true, None);
                     wake.fire();
                 })
                 .map_err(|e| e.to_string())?,
         );
         let stop = closing;
+        let wake = notify.clone();
         pty.writer = Some(
             thread::Builder::new()
                 .name("gui-conpty-write".into())
@@ -182,6 +181,11 @@ impl Pty {
                     while let Some(bytes) = input.pop() {
                         if stop.load(Ordering::Acquire) || writer.write_all(&bytes).is_err() {
                             break;
+                        }
+                        input.finished();
+                        // A paste waiting for room goes on from the owner.
+                        if input.take_room_wanted() {
+                            wake.fire();
                         }
                     }
                 })
@@ -196,7 +200,7 @@ impl Pty {
                         .wait()
                         .map(|status| status.exit_code())
                         .map_err(|e| e.to_string().chars().take(1024).collect());
-                    output.finish(false, Some(result));
+                    ending.finish(false, Some(result));
                     notify.fire();
                 })
                 .map_err(|e| e.to_string())?,
@@ -212,7 +216,8 @@ impl Pty {
         if bytes.len() > INPUT {
             return Err("terminal input exceeds 64 KiB".into());
         }
-        self.input.push(bytes.to_vec(), false).map(|_| ())
+        // The pipe's writes block, so input goes through the writer thread.
+        self.input.write_or_push(bytes, |_| 0).map(|_| ())
     }
 
     /// Tells the program its screen's size, in cells and in the pixels of a
@@ -225,17 +230,31 @@ impl Pty {
             .map_err(|e| e.to_string())
     }
 
-    pub fn drain(&self, limit: usize) -> Drain {
-        super::transport::drain(&self.output, &self.notify, limit)
+    pub fn drain(&self) -> Drain {
+        super::transport::drain(&self.ending, &self.notify)
     }
+
+    /// The input bytes a write could queue now.
+    pub fn input_room(&self) -> usize {
+        self.input.room()
+    }
+
+    /// Wakes the owner, as output does, once the program takes queued input.
+    pub fn want_input_room(&self) {
+        self.input.want_room();
+    }
+
+    /// The reader waits in a pipe read nothing wakes; it hands back memory
+    /// freed for it once output next arrives.
+    pub fn release_memory(&self) {}
 
     pub fn has_pending_output(&self) -> bool {
         self.notify.is_pending()
     }
 
-    /// Bytes waiting in the input and output queues.
-    pub fn queued_bytes(&self) -> (usize, usize) {
-        (self.input.bytes(), self.output.bytes())
+    /// Input bytes waiting for the program.
+    pub fn queued_input(&self) -> usize {
+        self.input.bytes()
     }
 
     pub fn pid(&self) -> u32 {
@@ -271,7 +290,6 @@ impl Pty {
             return Ok(());
         }
         self.input.close();
-        self.output.close();
         let terminated = terminate(&self.process);
         if let Some(writer) = self.writer.take() {
             // SAFETY: the writer thread is alive until joined below; cancelling
@@ -321,6 +339,8 @@ mod tests {
             ],
             ..Command::default()
         };
+        let kept = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let into = kept.clone();
         let mut pty = Pty::spawn(
             &command,
             24,
@@ -330,14 +350,13 @@ mod tests {
             Arc::new(move || {
                 let _ = send.send(());
             }),
+            Box::new(move |bytes: &[u8]| into.lock().extend_from_slice(bytes)),
         )
         .unwrap();
-        let mut output = Vec::new();
         let mut answered = 0;
         loop {
-            let got = pty.drain(OUTPUT);
-            output.extend(got.bytes);
-            let text = String::from_utf8_lossy(&output).into_owned();
+            let got = pty.drain();
+            let text = String::from_utf8_lossy(&kept.lock()).into_owned();
             // The pseudo-console inherits the cursor: it asks where the cursor
             // is and renders nothing until the terminal answers, as a
             // session's engine does.
@@ -374,7 +393,16 @@ mod tests {
             ..Command::default()
         };
         for _ in 0..5 {
-            let mut pty = Pty::spawn(&command, 24, 80, (0, 0), &budget, Arc::new(|| {})).unwrap();
+            let mut pty = Pty::spawn(
+                &command,
+                24,
+                80,
+                (0, 0),
+                &budget,
+                Arc::new(|| {}),
+                Box::new(|_: &[u8]| {}),
+            )
+            .unwrap();
             pty.close().unwrap();
             assert!(exited(&pty.process));
             drop(pty);

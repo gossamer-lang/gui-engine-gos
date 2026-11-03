@@ -22,7 +22,14 @@ fn args<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, String> {
 /// Runs terminal operation `method` on terminal `id` with JSON `text`
 /// arguments, answering JSON.
 pub fn call(method: &str, id: i64, text: &str) -> Result<String, String> {
-    if text.len() > 2 * 1024 * 1024 {
+    // A paste carries its whole text, which JSON escapes may make six times
+    // as long; other requests are small.
+    let limit = if method == "paste" {
+        6 * super::engine::PASTE_LIMIT + 64
+    } else {
+        2 * 1024 * 1024
+    };
+    if text.len() > limit {
         return Err("terminal request exceeds its byte budget".into());
     }
     let answer = match method {
@@ -90,6 +97,22 @@ pub fn call(method: &str, id: i64, text: &str) -> Result<String, String> {
             Answer::Done
         }
         "copy" => Answer::Text(super::copy(id)?),
+        "copy_mode" => {
+            super::copy_mode(id)?;
+            Answer::Done
+        }
+        "hints" => {
+            let copy: bool = args(text)?;
+            Answer::Rows(super::hints(id, copy)?)
+        }
+        "leave_mode" => {
+            super::leave_mode(id)?;
+            Answer::Done
+        }
+        "save_text" => {
+            let (path, selection): (String, bool) = args(text)?;
+            Answer::Rows(super::save_text(id, &path, selection)?)
+        }
         "snapshot" => Answer::Snapshot(super::snapshot(id)?),
         "close" => {
             super::close(id);

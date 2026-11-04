@@ -6889,8 +6889,10 @@ mod dialog_scope_tests {
             while !shows("one") || s.windows[0].output_dirty {
                 s.step().unwrap();
             }
-            // With the clock still, a frame for new output waits.
+            // With the clock still and a frame just presented, a frame for
+            // new output waits.
             s.clock_held = Some(s.now());
+            s.windows[0].output_presented = s.clock_held;
             crate::terminal::input(id, b"\n").unwrap();
             while !s.windows[0].output_dirty {
                 s.step().unwrap();

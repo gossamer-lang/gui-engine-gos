@@ -382,23 +382,74 @@ fn severity_icon(s: Severity) -> (Icon, Tone, String) {
     }
 }
 
-fn button_for(inst: &Instance, a: &DialogAction) -> Widget {
-    let id = inst.cid(&format!("action:{}", a.id));
-    match a.role {
-        ButtonRole::Accept => {
-            let mut b = crate::widgets::buttons::Button::new(
-                &id,
-                &a.label,
-                crate::widgets::buttons::ButtonKind::Primary,
-            );
-            b.is_default = true;
-            Widget::Button(b).disabled(
-                matches!(inst.request, DialogRequest::Shortcut { .. }) && !inst.error.is_empty(),
-            )
+/// Each button's accelerator among `actions`: the action id and the byte
+/// offset of its letter in the label. A button takes the first letter of
+/// its label, else the first of a later word, else any letter, that no
+/// button before it took.
+pub fn accelerators(actions: &[DialogAction]) -> Vec<(String, usize)> {
+    let mut taken: Vec<String> = vec![];
+    let mut out = vec![];
+    for a in actions {
+        let letters: Vec<(usize, char)> = a
+            .label
+            .char_indices()
+            .filter(|(_, c)| c.is_alphanumeric())
+            .collect();
+        let initials = a.label.char_indices().filter(|&(i, c)| {
+            c.is_alphanumeric()
+                && (i == 0
+                    || !a.label[..i]
+                        .chars()
+                        .last()
+                        .is_some_and(char::is_alphanumeric))
+        });
+        let free = |c: char| !taken.contains(&c.to_lowercase().to_string());
+        let pick = initials
+            .clone()
+            .find(|&(_, c)| free(c))
+            .or_else(|| letters.iter().copied().find(|&(_, c)| free(c)));
+        if let Some((at, c)) = pick {
+            taken.push(c.to_lowercase().to_string());
+            out.push((a.id.clone(), at));
         }
-        ButtonRole::Destructive => Widget::danger_button(&id, &a.label),
-        _ => Widget::button(&id, &a.label),
     }
+    out
+}
+
+/// The control the letter `letter` activates in the dialog, or "".
+pub fn accelerated(inst: &Instance, letter: &str) -> String {
+    let actions = ordered(&actions_of(inst));
+    for (id, at) in accelerators(&actions) {
+        let Some(a) = actions.iter().find(|a| a.id == id) else {
+            continue;
+        };
+        let key = a.label[at..]
+            .chars()
+            .next()
+            .map(|c| c.to_lowercase().to_string());
+        if key.as_deref() == Some(letter) {
+            return inst.cid(&format!("action:{}", a.id));
+        }
+    }
+    String::new()
+}
+
+fn button_for(inst: &Instance, a: &DialogAction, accelerator: i64) -> Widget {
+    let id = inst.cid(&format!("action:{}", a.id));
+    let kind = match a.role {
+        ButtonRole::Accept => crate::widgets::buttons::ButtonKind::Primary,
+        ButtonRole::Destructive => crate::widgets::buttons::ButtonKind::Danger,
+        _ => crate::widgets::buttons::ButtonKind::Normal,
+    };
+    let mut b = crate::widgets::buttons::Button::new(&id, &a.label, kind);
+    b.accelerator = accelerator;
+    if a.role == ButtonRole::Accept {
+        b.is_default = true;
+        return Widget::Button(b).disabled(
+            matches!(inst.request, DialogRequest::Shortcut { .. }) && !inst.error.is_empty(),
+        );
+    }
+    Widget::Button(b)
 }
 
 /// The dialog panel: title bar, body, and button row.
@@ -440,17 +491,28 @@ pub fn panel(inst: &Instance, body: Widget) -> Widget {
                 &crate::localization::tr("Checking\u{2026}"),
             ))
         }
+        let keys = accelerators(&actions);
+        let accelerator = |a: &DialogAction| {
+            keys.iter()
+                .find(|(id, _)| *id == a.id)
+                .map_or(-1, |(_, at)| *at as i64)
+        };
         // Restore defaults stands apart from the buttons that close.
         let (apart, closing): (Vec<_>, Vec<_>) =
             actions.into_iter().partition(|a| a.id == "defaults");
         for a in apart {
-            buttons.push(button_for(inst, &a))
+            buttons.push(button_for(inst, &a, accelerator(&a)))
         }
         buttons.push(Widget::stretch());
         for a in closing {
-            buttons.push(button_for(inst, &a))
+            buttons.push(button_for(inst, &a, accelerator(&a)))
         }
-        rows.push(Widget::row(&buttons, 8))
+        // The arrows move between the buttons, as in a toolbar.
+        rows.push(
+            Widget::row(&buttons, 8)
+                .key(&inst.cid("buttons"))
+                .role(Role::Toolbar),
+        )
     }
     let panel = Widget::flex(
         crate::widgets::Axis::Vertical,
@@ -1299,6 +1361,27 @@ mod tests {
         let inst = Instance::new(&request::info("i", "Done", "Saved."), "t");
         let (_, o, _) = finish_action(inst, "ok", &[]);
         assert_eq!(o, Some(crate::dialogs::Outcome::Accepted))
+    }
+
+    #[test]
+    fn each_button_takes_its_first_free_letter_preferring_word_initials() {
+        use crate::dialogs::request::ButtonRole;
+        let actions = [
+            DialogAction::new("save", "Save", ButtonRole::Accept),
+            DialogAction::new("all", "Save All", ButtonRole::Other),
+            DialogAction::new("sync", "Sas", ButtonRole::Other),
+            DialogAction::new("cancel", "Cancel", ButtonRole::Reject),
+        ];
+        let keys = crate::dialogs::host::accelerators(&actions);
+        let letter = |id: &str| {
+            let (_, at) = keys.iter().find(|(k, _)| k == id).unwrap();
+            let label = &actions.iter().find(|a| a.id == id).unwrap().label;
+            label[*at..].chars().next().unwrap()
+        };
+        assert_eq!(letter("save"), 'S');
+        assert_eq!(letter("all"), 'A');
+        assert_eq!(letter("cancel"), 'C');
+        assert!(!keys.iter().any(|(k, _)| k == "sync"), "{keys:?}");
     }
 
     #[test]

@@ -38,6 +38,9 @@ pub enum Operation {
     WriteText(String, String),
     Analyze(String, String),
     Complete(std::sync::Arc<[CompletionItem]>, String, MatchMode, i64),
+    /// GETs a URL over HTTP or HTTPS with these headers, answered by
+    /// `Outcome::Fetched` with the status and the body as text.
+    Fetch(String, Vec<(String, String)>),
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -67,6 +70,8 @@ pub enum Outcome {
     Analysis(std::sync::Arc<syntax::Document>),
     Completions(Vec<CompletionItem>),
     Progress(i64, i64),
+    /// A fetch's HTTP status and body.
+    Fetched(i64, String),
     Failed(String),
     Cancelled,
 }
@@ -91,6 +96,7 @@ impl Work {
             Operation::WriteText(..) => 11,
             Operation::Analyze(..) => 12,
             Operation::Complete(..) => 13,
+            Operation::Fetch(..) => 18,
         }
     }
     pub fn answer(&self, context: &Context, progress: &mut impl FnMut(i64, i64)) -> UiMsg {
@@ -246,6 +252,7 @@ impl Work {
             Operation::ReadText(path) => {
                 read_text(path, context, progress).map(|text| Outcome::Text(path.clone(), text))
             }
+            Operation::Fetch(url, headers) => fetch(url, headers, self.timeout_ms, progress),
             Operation::WriteText(path, text) => write_text(path, text, context, progress)
                 .map(|()| Outcome::Saved(path.clone(), text.clone())),
             Operation::Analyze(text, language) => {
@@ -362,6 +369,38 @@ pub(crate) fn write_bytes(
     Ok(())
 }
 
+// GETs `url`, giving up after `timeout_ms`; any status answers, an
+// unreachable server or a body past the text limit fails.
+fn fetch(
+    url: &str,
+    headers: &[(String, String)],
+    timeout_ms: i64,
+    progress: &mut impl FnMut(i64, i64),
+) -> Result<Outcome, String> {
+    progress(0, 1);
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_millis(
+            timeout_ms.clamp(1, 600_000) as u64,
+        )))
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let mut request = agent.get(url);
+    for (name, value) in headers {
+        request = request.header(name.as_str(), value.as_str());
+    }
+    let mut response = request.call().map_err(|e| e.to_string())?;
+    let status = i64::from(response.status().as_u16());
+    let body = response
+        .body_mut()
+        .with_config()
+        .limit(TEXT_LIMIT as u64)
+        .read_to_string()
+        .map_err(|e| e.to_string())?;
+    progress(1, 1);
+    Ok(Outcome::Fetched(status, body))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,6 +414,71 @@ mod tests {
             operation,
         }
     }
+    #[test]
+    fn a_fetch_sends_its_headers_and_answers_the_status_and_body() {
+        use std::io::{BufRead, BufReader};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut head = Vec::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                head.push(line.trim_end().to_string());
+            }
+            let mut stream = stream;
+            stream
+                .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 5\r\nConnection: close\r\n\r\nnope!")
+                .unwrap();
+            head
+        });
+        let request = work(Operation::Fetch(
+            format!("http://{address}/latest"),
+            vec![("User-Agent".into(), "probe/1".into())],
+        ));
+        let context = Context::standalone(Duration::from_secs(5));
+        let answer = request.answer(&context, &mut |_, _| {});
+        let head = server.join().unwrap();
+        assert!(head[0].starts_with("GET /latest "), "{head:?}");
+        assert!(
+            head.iter()
+                .any(|h| h.eq_ignore_ascii_case("user-agent: probe/1")),
+            "{head:?}"
+        );
+        assert_eq!(
+            answer,
+            UiMsg::Worked(
+                "document".into(),
+                1,
+                7,
+                Outcome::Fetched(404, "nope!".into())
+            )
+        );
+    }
+
+    #[test]
+    fn a_fetch_from_a_closed_port_fails() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let request = work(Operation::Fetch(
+            format!("http://127.0.0.1:{port}/"),
+            vec![],
+        ));
+        let context = Context::standalone(Duration::from_secs(5));
+        assert!(matches!(
+            request.answer(&context, &mut |_, _| {}),
+            UiMsg::Worked(_, _, _, Outcome::Failed(_))
+        ));
+    }
+
     #[test]
     fn superseded_native_analysis_and_search_cancel_without_user_errors() {
         let id = crate::editing::documents::create(

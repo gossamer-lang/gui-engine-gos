@@ -71,6 +71,8 @@ pub struct ViewOptions {
     /// When the scrollbar shows: "always", "scrolling" (while the view is
     /// scrolled back) or "never".
     pub scrollbar: String,
+    /// Which edge the scrollbar lies along: "right" or "left".
+    pub scrollbar_side: String,
     /// New output brings a view scrolled back to the live screen.
     pub scroll_on_output: bool,
     /// Typing brings a view scrolled back to the live screen.
@@ -112,6 +114,7 @@ impl Default for ViewOptions {
             legible: true,
             padding: PAD,
             scrollbar: "never".to_string(),
+            scrollbar_side: "right".to_string(),
             scroll_on_output: false,
             scroll_on_keystroke: true,
             word_chars: WORD_CHARS.to_string(),
@@ -144,6 +147,17 @@ fn scrollbar_room(v: &View, theme: &Theme) -> i64 {
     } else {
         0
     }
+}
+
+// The screen's left edge in the view, in pixels: past the padding, and past
+// an always-shown scrollbar on the left.
+fn left_of(v: &View, theme: &Theme) -> i64 {
+    let lead = if v.options.scrollbar_side == "left" {
+        scrollbar_room(v, theme)
+    } else {
+        0
+    };
+    pad_of(v, theme) + lead
 }
 
 /// A terminal's colors, each `#rrggbb`: the default text and background,
@@ -311,7 +325,8 @@ fn grid(v: &View, theme: &Theme, size: Size) -> (i64, i64) {
 fn cell_at(v: &View, theme: &Theme, x: i64, y: i64, rows: i64, cols: i64) -> Cell {
     let (cw, lh, _) = metrics(v, theme);
     let pad = pad_of(v, theme) as f64;
-    let col = ((x as f64 - pad) / cw).round() as i64;
+    let left = left_of(v, theme) as f64;
+    let col = ((x as f64 - left) / cw).round() as i64;
     let row = ((y as f64 - pad) / lh).floor() as i64;
     Cell {
         row: row.clamp(0, rows - 1),
@@ -323,7 +338,8 @@ fn cell_at(v: &View, theme: &Theme, x: i64, y: i64, rows: i64, cols: i64) -> Cel
 fn cell_under(v: &View, theme: &Theme, x: i64, y: i64) -> Option<(u16, u16)> {
     let (cw, lh, _) = metrics(v, theme);
     let pad = pad_of(v, theme) as f64;
-    let col = ((x as f64 - pad) / cw).floor();
+    let left = left_of(v, theme) as f64;
+    let col = ((x as f64 - left) / cw).floor();
     let row = ((y as f64 - pad) / lh).floor();
     (col >= 0.0 && row >= 0.0 && col < f64::from(u16::MAX) && row < f64::from(u16::MAX))
         .then_some((row as u16, col as u16))
@@ -659,13 +675,14 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
         .filter(|l| hovered.as_ref() == Some(&l.uri))
         .collect();
     let pad = pad_of(v, &theme);
+    let left = left_of(v, &theme);
     let rise = text_offset(&style, lh);
     let origin = cx.abs(r);
     let mut pictures =
         with_entry(v.terminal, |entry| std::mem::take(&mut entry.pictures)).unwrap_or_default();
     let mut used = images::Used::default();
     let image_grid = images::Grid {
-        x: (origin.x + pad) as f64,
+        x: (origin.x + left) as f64,
         y: (origin.y + pad) as f64,
         cell_width: cw,
         cell_height: lh,
@@ -766,8 +783,8 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
                 }
             }
             let span = if cell.wide { 2 } else { end - col };
-            let x = pad + (col as f64 * cw) as i64;
-            let width = pad + ((col + span) as f64 * cw) as i64 - x;
+            let x = left + (col as f64 * cw) as i64;
+            let width = left + ((col + span) as f64 * cw) as i64 - x;
             if bg != background {
                 cx.fill(Rect::new(x, y, width, height), bg);
             }
@@ -856,9 +873,9 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
         &v.options,
         shown(colors.cursor_bg),
         cx,
-        (cw, lh, pad),
+        (cw, lh, left, pad),
     );
-    paint_mode(v, &frame, &style, cx, r, (cw, lh, pad));
+    paint_mode(v, &frame, &style, cx, r, (cw, lh, left, pad));
     if let Some(bar) = scrollbar(v, &theme, r, rows, (scrolled, history)) {
         cx.fill_round(bar.track, theme.px(3), foreground.with_alpha(28));
         cx.fill_round(bar.thumb, theme.px(3), foreground.with_alpha(110));
@@ -894,7 +911,7 @@ fn scrollbar(
     (scrolled, history): (i64, i64),
 ) -> Option<Scrollbar> {
     let shows = match v.options.scrollbar.as_str() {
-        "always" => history > 0,
+        "always" => true,
         "scrolling" => scrolled > 0,
         _ => false,
     };
@@ -903,8 +920,13 @@ fn scrollbar(
     }
     let width = theme.px(SCROLLBAR);
     let inset = theme.px(2);
+    let edge = if v.options.scrollbar_side == "left" {
+        0
+    } else {
+        area.width - width
+    };
     let track = Rect::new(
-        area.width - width + inset,
+        edge + inset,
         inset,
         width - 2 * inset,
         area.height - 2 * inset,
@@ -948,13 +970,13 @@ fn paint_cursor(
     options: &ViewOptions,
     color: Color,
     cx: &mut PaintCx,
-    (cw, lh, pad): (f64, f64, i64),
+    (cw, lh, left, pad): (f64, f64, i64, i64),
 ) {
     if frame.hide_cursor() {
         return;
     }
     let (row, col) = frame.cursor();
-    let x = pad + (f64::from(col) * cw) as i64;
+    let x = left + (f64::from(col) * cw) as i64;
     let y = pad + (f64::from(row) * lh) as i64;
     let cell = Rect::new(x, y, cw.ceil() as i64, lh as i64);
     let line = cx.theme.px(2).max(1);
@@ -1204,7 +1226,7 @@ fn paint_mode(
     style: &TextStyle,
     cx: &mut PaintCx,
     area: Rect,
-    (cw, lh, pad): (f64, f64, i64),
+    (cw, lh, left, pad): (f64, f64, i64, i64),
 ) {
     use super::modes::Mode;
     enum Shown {
@@ -1237,7 +1259,7 @@ fn paint_mode(
     let line = cx.theme.px(2).max(1);
     let cell = |row: i64, col: u16, width: usize| {
         Rect::new(
-            pad + (f64::from(col) * cw) as i64,
+            left + (f64::from(col) * cw) as i64,
             pad + (row as f64 * lh) as i64,
             (cw * width.max(1) as f64).ceil() as i64,
             lh as i64,
@@ -1502,7 +1524,7 @@ fn ime_area(v: &View, cx: &mut EventCx) {
     if let Some((row, col)) = cursor {
         let (cw, lh, _) = metrics(v, &cx.theme);
         let pad = pad_of(v, &cx.theme);
-        let x = pad + (f64::from(col) * cw) as i64;
+        let x = left_of(v, &cx.theme) + (f64::from(col) * cw) as i64;
         let y = pad + (f64::from(row) * lh) as i64;
         cx.ime = Some((
             cx.to_window(Rect::new(x, y, cw.ceil() as i64, lh as i64)),
@@ -1794,6 +1816,7 @@ pub fn terminal_event(v: &View, node: &Node, ev: &Event, _st: &mut StateStore, c
         Event::FocusIn => {
             ime_area(v, cx);
             cx.redraw = true;
+            cx.emit(&UiMsg::Terminal(v.terminal, TerminalEvent::Focused));
         }
         Event::FocusOut => cx.redraw = true,
         _ => {}
@@ -2140,6 +2163,40 @@ mod tests {
         assert!(style.ligatures);
         view.options.ligatures = false;
         assert!(!metrics(&view, &theme).2.ligatures);
+    }
+
+    #[test]
+    fn an_always_shown_scrollbar_shows_without_history_on_the_side_chosen() {
+        let theme = Theme::default();
+        let area = Rect::new(0, 0, 400, 300);
+        let mut view = View::new("term", 1, "Shell");
+        view.options.scrollbar = "always".into();
+        let right = scrollbar(&view, &theme, area, 20, (0, 0)).map(|b| b.track.x);
+        assert_eq!(right, Some(400 - theme.px(SCROLLBAR) + theme.px(2)));
+        view.options.scrollbar_side = "left".into();
+        let left = scrollbar(&view, &theme, area, 20, (0, 0)).map(|b| b.track.x);
+        assert_eq!(left, Some(theme.px(2)));
+        view.options.scrollbar = "scrolling".into();
+        assert!(scrollbar(&view, &theme, area, 20, (0, 100)).is_none());
+    }
+
+    #[test]
+    fn a_left_scrollbar_moves_the_cells_past_it() {
+        let theme = Theme::default();
+        let mut view = View::new("term", 1, "Shell");
+        view.options.scrollbar = "always".into();
+        view.options.scrollbar_side = "left".into();
+        let (cw, _, _) = metrics(&view, &theme);
+        let first = pad_of(&view, &theme) + theme.px(SCROLLBAR);
+        assert_eq!(
+            cell_under(&view, &theme, first + 1, 10).map(|c| c.1),
+            Some(0)
+        );
+        assert_eq!(
+            cell_under(&view, &theme, first + cw.ceil() as i64 + 1, 10).map(|c| c.1),
+            Some(1)
+        );
+        assert_eq!(cell_under(&view, &theme, first - 2, 10), None);
     }
 
     #[test]

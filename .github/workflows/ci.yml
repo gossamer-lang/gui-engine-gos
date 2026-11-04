@@ -12,11 +12,11 @@ permissions:
 env:
   GOSSAMER_REPO: gossamer-lang/gossamer
   # The toolchain release CI installs: the one this library requires.
-  GOSSAMER_VERSION: v0.75.17
+  GOSSAMER_VERSION: v0.76.0
   WINDOWING_REPO: gossamer-lang/windowing-gos
   # The windowing release project.toml depends on. The Rust crates check
   # against a checkout of the same tag beside this one.
-  WINDOWING_REF: ${{ vars.WINDOWING_REF || 'v0.1.3' }}
+  WINDOWING_REF: ${{ vars.WINDOWING_REF || 'v0.1.4' }}
   RUSTUP_TOOLCHAIN: 1.95.0
   # Every job draws into SDL's offscreen driver, which needs no display.
   SDL_VIDEO_DRIVER: offscreen

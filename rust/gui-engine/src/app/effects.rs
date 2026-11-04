@@ -51,6 +51,24 @@ pub enum Effect {
     /// Asks the desktop to draw the user to a window that lacks focus, until
     /// it gains it; a focused window needs no attention and is left alone.
     RequestAttention(String),
+    /// Shows (true) and focuses a window, or hides it without closing it.
+    SetWindowVisible(String, bool),
+    /// Keeps a window above every other (true) or lets it stack normally.
+    SetAlwaysOnTop(String, bool),
+    /// Makes a window `width` by `height` fractions of the usable area of
+    /// the display it is on, centered along that area's top edge.
+    DockTop(String, f64, f64),
+    /// Asks the desktop to deliver a shortcut (`Shortcut::parse` text) as
+    /// `UiMsg::Hotkey(id)` while any application has focus; `description`
+    /// names it where the desktop lists shortcuts. A refusal answers
+    /// `UiMsg::Task(id, Failed(why))`. Registering an id again replaces it.
+    RegisterHotkey {
+        id: String,
+        shortcut: String,
+        description: String,
+    },
+    /// Gives the hotkey `id` back to the desktop.
+    UnregisterHotkey(String),
     /// Ends the session (after asking documents, when close is deferred).
     Quit,
     /// Moves keyboard focus to the widget `id` in the main window.

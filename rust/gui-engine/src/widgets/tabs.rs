@@ -835,7 +835,11 @@ pub fn tabs_event(t: &Tabs, node: &Node, ev: &Event, st: &mut StateStore, cx: &m
             if dragging {
                 let lx = x - cx.origin_x;
                 let ly = y - cx.origin_y;
-                if ly < -theme.px(40) || ly > h + theme.px(40) {
+                // Beside the strip is out of it too, as onto a window next to
+                // this one at the same height.
+                let away =
+                    ly < -theme.px(40) || ly > h + theme.px(40) || lx < 0 || lx >= node.rect.width;
+                if away {
                     if t.detachable {
                         cx.emit(&UiMsg::TabDrop(t.id.clone(), key, *x, *y))
                     }

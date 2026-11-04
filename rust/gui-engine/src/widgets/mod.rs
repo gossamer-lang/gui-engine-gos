@@ -226,6 +226,14 @@ pub struct ThemeOverride {
     /// within this subtree.
     #[serde(default)]
     pub accent: Option<Color>,
+    /// Replaces the raised surface (a joined tab strip's active tab, a
+    /// popup's body) within this subtree.
+    #[serde(default)]
+    pub surface: Option<Color>,
+    /// Replaces the field color (inputs, and the ground a joined tab strip
+    /// and menu bar sit on) within this subtree.
+    #[serde(default)]
+    pub field: Option<Color>,
 }
 
 impl ThemeOverride {
@@ -251,6 +259,12 @@ impl ThemeOverride {
         }
         if let Some(color) = self.focus {
             t.focus = color;
+        }
+        if let Some(color) = self.surface {
+            t.surface = color;
+        }
+        if let Some(color) = self.field {
+            t.field = color;
         }
         t
     }
@@ -1500,6 +1514,8 @@ impl Widget {
             tokens: None,
             focus: None,
             accent: None,
+            surface: None,
+            field: None,
         })
     }
 
@@ -2560,11 +2576,34 @@ mod tests {
             tokens: Some(tokens),
             focus: None,
             accent: None,
+            surface: None,
+            field: None,
         };
         let t = change.apply(crate::style::Theme::light());
         assert!(t.is_dark());
         assert_eq!(t.radius(), 3);
         assert_eq!(t.icons, "brand")
+    }
+
+    #[test]
+    fn a_subtree_surface_and_field_replace_the_themes_own() {
+        let ground = crate::style::color::Color::rgb(42, 46, 50);
+        let shade = crate::style::color::Color::rgb(30, 33, 36);
+        let change = super::ThemeOverride {
+            kind: None,
+            density: None,
+            rtl: None,
+            text_scale: 0.0,
+            tokens: None,
+            focus: None,
+            accent: None,
+            surface: Some(ground),
+            field: Some(shade),
+        };
+        let base = crate::style::Theme::dark();
+        let t = change.apply(base.clone());
+        assert_eq!((t.surface, t.field), (ground, shade));
+        assert_eq!(t.background, base.background);
     }
 
     #[test]
@@ -2578,6 +2617,8 @@ mod tests {
             tokens: None,
             focus: None,
             accent: Some(bronze),
+            surface: None,
+            field: None,
         };
         let base =
             crate::style::Theme::light().with_accent(crate::style::color::Color::rgb(30, 100, 220));

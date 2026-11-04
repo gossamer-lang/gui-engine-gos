@@ -14,6 +14,7 @@ use crate::geometry::{Constraints, Rect, Size};
 use crate::render::icons::Icon;
 use crate::services::clipboard;
 use crate::style::{TextRole, Theme};
+use crate::text::fonts::Family;
 use crate::text::layout;
 use crate::text::layout::{LayoutOptions, TextLayout, TextStyle};
 use crate::text::offsets::ScalarIndex;
@@ -73,6 +74,14 @@ pub struct TextInput {
     /// Source spans for the current committed text, in UTF-8 bytes.
     pub syntax: Vec<crate::text::syntax::Span>,
     pub mono: bool,
+    /// An installed font family the text is set in; empty keeps the
+    /// theme's face. `mono` takes precedence.
+    #[serde(default)]
+    pub family: String,
+    /// The text size in points, scaled with the theme as interface text
+    /// is; 0 keeps the theme's size.
+    #[serde(default)]
+    pub font_points: f64,
     /// Soft-wrap a text area (otherwise it scrolls horizontally).
     pub wrap: bool,
     /// Tab inserts a tab character in a text area instead of moving focus.
@@ -103,6 +112,9 @@ impl PartialEq for TextInput {
             && self.max_length == other.max_length
             && self.leading_icon == other.leading_icon
             && self.leading_image == other.leading_image
+            && self.mono == other.mono
+            && self.family == other.family
+            && self.font_points == other.font_points
     }
 }
 
@@ -130,6 +142,8 @@ impl TextInput {
             leading_image: None,
             syntax: vec![],
             mono: false,
+            family: String::new(),
+            font_points: 0.0,
             wrap: true,
             tab_inserts: false,
             required: false,
@@ -143,12 +157,34 @@ impl TextInput {
     }
 }
 
-fn style_of(t: &TextInput, theme: &Theme) -> TextStyle {
+// The face the theme gives the field's text, before `font_points`.
+fn face_of(t: &TextInput, theme: &Theme) -> TextStyle {
     if t.mono {
         theme.font(TextRole::Mono)
-    } else {
+    } else if t.family.is_empty() {
         theme.font(TextRole::Body)
+    } else {
+        theme.font_family(TextRole::Body, &Family::Named(t.family.clone()))
     }
+}
+
+fn style_of(t: &TextInput, theme: &Theme) -> TextStyle {
+    let mut style = face_of(t, theme);
+    if t.font_points > 0.0 {
+        style.size = t.font_points * 96.0 / 72.0 * theme.scale * theme.text_scale;
+    }
+    style
+}
+
+// A line field's height: the control height, scaled with a text size set in
+// points as the theme's text scale scales it.
+fn line_height(t: &TextInput, theme: &Theme) -> i64 {
+    let control = theme.control_height();
+    if t.font_points <= 0.0 {
+        return control;
+    }
+    let ratio = style_of(t, theme).size / face_of(t, theme).size.max(1.0);
+    (control as f64 * ratio).round() as i64
 }
 
 fn trailing_button(t: &TextInput) -> bool {
@@ -175,7 +211,7 @@ fn geometry(t: &TextInput, theme: &Theme, width: i64) -> (Rect, Rect, Rect) {
     let box_h = if t.multiline() {
         (lh * t.rows.max(1) as f64) as i64 + pad * 2
     } else {
-        theme.control_height()
+        line_height(t, theme)
     };
     let field = Rect::new(0, 0, width, box_h);
     let button = if trailing_button(t) {
@@ -2047,6 +2083,52 @@ mod tests {
     use crate::style::Theme;
     use crate::widgets::cx::{Event, EventCx, LayoutCx, UiMsg};
     use crate::widgets::state::StateStore;
+
+    #[test]
+    fn a_field_sets_its_text_in_its_family_unless_it_is_monospace() {
+        use crate::text::fonts::Family;
+        let theme = Theme::light();
+        let mut input = TextInput::new("run", "a", "Run", InputKind::Line);
+        assert_eq!(super::style_of(&input, &theme).family, Family::Sans);
+        input.family = "Serif Test".to_string();
+        let named = super::style_of(&input, &theme);
+        assert_eq!(named.family, Family::Named("Serif Test".to_string()));
+        assert_eq!(named.size, theme.font(crate::style::TextRole::Body).size);
+        input.mono = true;
+        assert_eq!(super::style_of(&input, &theme).family, Family::Monospace);
+        let mut sent =
+            serde_json::to_value(TextInput::new("run", "", "", InputKind::Line)).unwrap();
+        sent.as_object_mut().unwrap().remove("family");
+        sent.as_object_mut().unwrap().remove("font_points");
+        let read: TextInput = serde_json::from_value(sent).unwrap();
+        assert!(read.family.is_empty());
+        assert_eq!(read.font_points, 0.0);
+    }
+
+    #[test]
+    fn a_field_sized_in_points_grows_with_its_text_and_scales_with_the_theme() {
+        let mut theme = Theme::light();
+        let mut input = TextInput::new("run", "a", "Run", InputKind::Line);
+        let body = super::style_of(&input, &theme).size;
+        let (plain, plain_text, _) = super::geometry(&input, &theme, 400);
+        assert_eq!(plain.height, theme.control_height());
+        input.font_points = 24.0;
+        assert_eq!(super::style_of(&input, &theme).size, 32.0);
+        let (large, large_text, _) = super::geometry(&input, &theme, 400);
+        assert!(
+            large_text.height > plain_text.height,
+            "{plain_text:?} {large_text:?}"
+        );
+        let ratio = 32.0 / body;
+        assert_eq!(
+            large.height,
+            (theme.control_height() as f64 * ratio).round() as i64
+        );
+        theme.text_scale = 1.5;
+        assert_eq!(super::style_of(&input, &theme).size, 48.0);
+        input.font_points = 0.0;
+        assert_eq!(super::style_of(&input, &theme).size, body * 1.5);
+    }
 
     #[test]
     fn application_icons_paint_in_results_and_follow_the_highlight_in_the_entry() {

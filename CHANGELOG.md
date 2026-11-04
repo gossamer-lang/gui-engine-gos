@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.1.6 - Global shortcuts, fetching and window visibility
+
+- Requires Gossamer 0.76.0 or later.
+- Builds on windowing-gos 0.1.4 and wezterm-lite 0.1.4.
+- A terminal's cursor at the start of its line keeps its place when the terminal changes width, so a shell's prompt returns where it was after a full-screen program exits.
+- Delete reaches a program that turned on the kitty keyboard protocol as Delete, not as Backspace.
+- `Effect::RegisterHotkey` delivers a shortcut as `UiMsg::Hotkey(id)` while any application has focus, and answers a refusal as `UiMsg::Task(id, Failed(why))`; `Effect::UnregisterHotkey` gives it back.
+- `Effect::SetWindowVisible` hides a window without closing it and shows it again focused, `Effect::SetAlwaysOnTop` keeps it above other windows, and `Effect::DockTop` sizes it to fractions of its display's usable area along the top edge.
+- A window docked with `DockTop` that the user resizes reports its new share of the display as `UiMsg::DockResized(window, width, height)`, and a docked window no longer saves its size and place over the one remembered for its key.
+- A launch forwarded to a single-instance application shows its main window when it was hidden.
+- A terminal's scrollbar set to "always" shows whether or not there is history, and `ViewOptions::scrollbar_side` puts it on the left or the right.
+- A terminal reports `Event::Focused` when its view takes keyboard focus.
+- `Operation::Fetch` GETs a URL over HTTP or HTTPS on the session's worker, with Rustls and the Mozilla root certificates, and answers `Outcome::Fetched` with the status and body.
+- Every dialog button has a keyboard accelerator, its first free letter, drawn underlined: the letter alone presses it, or Alt and the letter while a field has focus. Left and Right move between a dialog's buttons, and Enter presses the focused one.
+- A tab dropped beside its window, as onto a window next to it, leaves the strip (`TabMove` or `TabDetach`) instead of reordering.
+- A context menu opened by a right press stays open when that press is released where it was made, even where the menu opens under the pointer; releasing after moving onto an item still chooses it.
+- `ThemeOverride` takes `surface` and `field` colors for its subtree, which a joined tab strip and menu bar draw with.
+- `TextInput::family` sets a field's text in an installed font family, and `TextInput::font_points` sets its size in points; a line field's height follows that size.
+
 ## 0.1.5 - Faster terminals, bounded history, keyboard modes and held spin box buttons
 
 - Requires Gossamer 0.75.17 or later and builds on windowing-gos 0.1.3 and wezterm-lite 0.1.2.

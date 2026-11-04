@@ -532,9 +532,14 @@ mod session {
             };
             s.click_with(lx, ly, chord).unwrap();
             let link = "https://example.org/x".to_string();
+            // The first click also gives the view keyboard focus.
             assert_eq!(
                 *events.borrow(),
-                [Event::LinkPointed(link.clone()), Event::LinkActivated(link)]
+                [
+                    Event::LinkPointed(link.clone()),
+                    Event::Focused,
+                    Event::LinkActivated(link)
+                ]
             );
             let (ox, oy) = at(2.0, 4.0);
             s.right_click_at(ox, oy).unwrap();

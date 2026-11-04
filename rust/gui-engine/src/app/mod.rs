@@ -129,6 +129,9 @@ pub struct WindowState {
     pub caret_on: bool,
     pub active: bool,
     pub close_policy: ClosePolicy,
+    /// The fractions of its display a window docked along the top takes;
+    /// `None` for a window placed as usual.
+    pub docked: Option<(f64, f64)>,
     /// The key of the window a dialog window belongs to; "" for the
     /// application's own windows.
     pub owner: String,
@@ -227,6 +230,8 @@ type DisposedCallback = Box<dyn FnMut(&str)>;
 
 pub struct Session {
     app: windowing::App,
+    /// The application's id for each global shortcut it registered.
+    hotkeys: HashMap<windowing::HotkeyId, String>,
     memory_limit: usize,
     budget: crate::memory::Budget,
     auxiliary: Option<crate::memory::Lease>,
@@ -404,6 +409,7 @@ pub fn start(name: &str, app_id: &str) -> Result<Session, errors::Error> {
         pending_leases: Vec::new(),
         resource_error: String::new(),
         renderers: HashMap::new(),
+        hotkeys: HashMap::new(),
         started: false,
         windows: vec![],
         app_id: app_id.to_string(),
@@ -729,6 +735,7 @@ impl Session {
             caret_on: true,
             active: true,
             close_policy: ClosePolicy::Close,
+            docked: None,
             owner: String::new(),
             see_through: options.transparent,
             transparent: options.transparent && self.transparent,
@@ -844,6 +851,105 @@ impl Session {
         )?;
         self.invalidate(w, "window resized");
         Ok(())
+    }
+
+    // Places window `key` along the top edge of its display's usable area,
+    // `width` and `height` fractions of that area.
+    fn dock_top(&mut self, key: &str, width: f64, height: f64) -> Result<(), errors::Error> {
+        let w = self.find(key);
+        if w < 0 {
+            return Ok(());
+        }
+        let native = self.windows[w as usize].native;
+        let area = native.display()?.usable;
+        let (width, height) = (width.clamp(0.1, 1.0), height.clamp(0.1, 1.0));
+        let wide = ((area.width as f64) * width).round() as i64;
+        let tall = ((area.height as f64) * height).round() as i64;
+        self.windows[w as usize].docked = Some((width, height));
+        native.set_size(wide, tall)?;
+        // Wayland places windows itself; elsewhere a driver may refuse the move.
+        if windowing::video_driver() != "wayland"
+            && let Err(e) = native.set_position(area.x + (area.width - wide) / 2, area.y)
+        {
+            self.log_line(&format!("window placement unavailable: {}", e))
+        }
+        self.invalidate(w, "window docked");
+        Ok(())
+    }
+
+    // A docked window the user resized reports the share of its display it
+    // now takes; a size within a pixel of the docked one is the dock's own.
+    fn dock_resized(&mut self, w: i64) {
+        let Some((width, height)) = self.windows[w as usize].docked else {
+            return;
+        };
+        let native = self.windows[w as usize].native;
+        let Ok(display) = native.display() else {
+            return;
+        };
+        let area = display.usable;
+        if area.width <= 0 || area.height <= 0 {
+            return;
+        }
+        let (wide, tall) = native.size();
+        let near = |size: i64, fraction: f64, whole: i64| {
+            (size - (whole as f64 * fraction).round() as i64).abs() <= 1
+        };
+        if near(wide, width, area.width) && near(tall, height, area.height) {
+            return;
+        }
+        let now = (
+            (wide as f64 / area.width as f64).clamp(0.1, 1.0),
+            (tall as f64 / area.height as f64).clamp(0.1, 1.0),
+        );
+        self.windows[w as usize].docked = Some(now);
+        let key = self.windows[w as usize].key.clone();
+        self.pending.push(UiMsg::DockResized(key, now.0, now.1));
+    }
+
+    fn register_hotkey(&mut self, id: String, shortcut: &str, description: &str) {
+        self.unregister_hotkey(&id);
+        let stroke = crate::input::Shortcut::parse(shortcut)
+            .filter(|s| !s.is_chord())
+            .and_then(|s| s.strokes.first().copied());
+        let Some(stroke) = stroke else {
+            let why = format!("{shortcut:?} is not one key with modifiers");
+            self.pending.push(UiMsg::Task(
+                id,
+                crate::widgets::cx::TaskOutcome::Failed(why),
+            ));
+            return;
+        };
+        let mac = crate::input::platform_is_macos();
+        let mods = windowing::Mods {
+            shift: stroke.shift,
+            ctrl: stroke.ctrl || (stroke.primary && !mac),
+            alt: stroke.alt,
+            gui: stroke.meta || (stroke.primary && mac),
+            ..windowing::Mods::default()
+        };
+        match self.app.register_hotkey(stroke.key, mods, description) {
+            Ok(hotkey) => {
+                self.hotkeys.insert(hotkey, id);
+            }
+            Err(e) => self.pending.push(UiMsg::Task(
+                id,
+                crate::widgets::cx::TaskOutcome::Failed(e.to_string()),
+            )),
+        }
+    }
+
+    fn unregister_hotkey(&mut self, id: &str) {
+        let held: Vec<windowing::HotkeyId> = self
+            .hotkeys
+            .iter()
+            .filter(|(_, owner)| owner.as_str() == id)
+            .map(|(hotkey, _)| *hotkey)
+            .collect();
+        for hotkey in held {
+            self.hotkeys.remove(&hotkey);
+            self.app.unregister_hotkey(hotkey);
+        }
     }
 
     /// Makes window `key` `height` interface units tall and lets it grow
@@ -1411,8 +1517,11 @@ impl Session {
                 self.pending
                     .push(UiMsg::Dialog(d.id.clone(), Outcome::Disposed))
             }
-            if let Err(e) =
-                services::save_window_placement(&self.app_id, &win.key, placement_of(win))
+            // A docked window's place is the dock's, not one to remember for
+            // the window under its key.
+            if win.docked.is_none()
+                && let Err(e) =
+                    services::save_window_placement(&self.app_id, &win.key, placement_of(win))
             {
                 warnings.push(format!(
                     "could not save where window \"{}\" was: {}",
@@ -1572,6 +1681,19 @@ impl Session {
                 self.serve_instance_requests()
             }
             windowing::Event::MenuSelected { source, item } => self.menu_selected(*source, *item),
+            windowing::Event::Hotkey { hotkey } => {
+                if let Some(id) = self.hotkeys.get(hotkey) {
+                    self.pending.push(UiMsg::Hotkey(id.clone()))
+                }
+            }
+            windowing::Event::HotkeyFailed { hotkey, reason } => {
+                if let Some(id) = self.hotkeys.remove(hotkey) {
+                    self.pending.push(UiMsg::Task(
+                        id,
+                        crate::widgets::cx::TaskOutcome::Failed(reason.clone()),
+                    ))
+                }
+            }
             windowing::Event::DragFinished { drag, operation } => {
                 let raw: u64 = (*drag).into();
                 if let Some(id) = self.drags.remove(&raw) {
@@ -2451,6 +2573,20 @@ impl Session {
         }
         if handled {
             return Ok(());
+        }
+        // A dialog's buttons answer their accelerator letters, alone or with
+        // Alt, and only with Alt while a field takes the typing.
+        let dialog = self.key_dialog(w);
+        if dialog >= 0 && !mods.ctrl && !mods.gui && (mods.alt || !self.focus_takes_text(w)) {
+            let letter = crate::input::key_name(key).to_lowercase();
+            if letter.chars().count() == 1 {
+                let target =
+                    host::accelerated(&self.windows[w as usize].dialogs[dialog as usize], &letter);
+                if !target.is_empty() {
+                    self.pending.push(UiMsg::Click(target));
+                    return Ok(());
+                }
+            }
         }
         // A key the focused widget took was input to it (a caret move, a
         // shell's history), not a move of focus, so only one left to the
@@ -3643,6 +3779,8 @@ impl Session {
             match forwarded.request {
                 windowing::instance::Request::Activate => {
                     if !self.windows.is_empty() {
+                        // A launch asks for the window whether or not it was hidden.
+                        let _ = self.windows[0].native.show();
                         let _ = self.windows[0]
                             .native
                             .focus_with_context(&forwarded.activation);
@@ -3787,6 +3925,35 @@ impl Session {
                         self.log_line(&format!("window attention unavailable: {}", e))
                     }
                 }
+                Effect::SetWindowVisible(window, shown) => {
+                    let w = self.find(&window);
+                    if w >= 0 {
+                        let native = self.windows[w as usize].native;
+                        let changed = if shown {
+                            native.show().and_then(|()| native.focus())
+                        } else {
+                            native.hide()
+                        };
+                        if let Err(e) = changed {
+                            self.log_line(&format!("window visibility unavailable: {}", e))
+                        }
+                    }
+                }
+                Effect::SetAlwaysOnTop(window, on) => {
+                    let w = self.find(&window);
+                    if w >= 0
+                        && let Err(e) = self.windows[w as usize].native.set_always_on_top(on)
+                    {
+                        self.log_line(&format!("keeping a window on top unavailable: {}", e))
+                    }
+                }
+                Effect::DockTop(window, width, height) => self.dock_top(&window, width, height)?,
+                Effect::RegisterHotkey {
+                    id,
+                    shortcut,
+                    description,
+                } => self.register_hotkey(id, &shortcut, &description),
+                Effect::UnregisterHotkey(id) => self.unregister_hotkey(&id),
                 Effect::SetFullscreen(window, on) => {
                     let w = self.find(&window);
                     if w >= 0
@@ -4265,6 +4432,7 @@ impl Session {
     // Marks window `w` for layout, noting `cause` for the inspector.
     fn resized(&mut self, w: i64) {
         self.invalidate(w, "window resized");
+        self.dock_resized(w);
         // A window that grows for its popups is resized only by the session,
         // to show them; it places them again instead.
         if self.windows[w as usize].grow_base <= 0 {
@@ -4445,7 +4613,9 @@ impl Session {
             self.pending
                 .push(UiMsg::Dialog(d.id.clone(), Outcome::Disposed))
         }
-        if let Err(e) = services::save_window_placement(&self.app_id, &win.key, placement_of(&win))
+        if win.docked.is_none()
+            && let Err(e) =
+                services::save_window_placement(&self.app_id, &win.key, placement_of(&win))
         {
             self.warn(&format!(
                 "could not save where window \"{}\" was: {}",
@@ -5943,6 +6113,40 @@ mod popup_tests {
     }
 
     #[test]
+    fn a_right_click_leaves_its_context_menu_open_though_it_opened_under_the_pointer() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            // A window shorter than the menu places it over the pointer.
+            let mut s = crate::application(
+                "Popups",
+                "dev.gossamer.gui-popup-release-test",
+                || 0,
+                |m: i64, _msg: UiMsg| m,
+                view,
+            )
+            .size(420, 60)
+            .start()
+            .unwrap();
+            let r = s.rect_of("target").unwrap();
+            let (x, y) = (r.x + r.width / 2, r.y + r.height / 2);
+            s.right_click_at(x, y).unwrap();
+            let owners = || {
+                s.popup_owners()
+                    .iter()
+                    .map(|p| p.0.clone())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(owners(), vec!["ctx"]);
+            s.click_at(x, y).unwrap();
+            assert!(s.popup_owners().is_empty(), "{:?}", s.popup_owners());
+            s.shutdown();
+        })
+    }
+
+    #[test]
     fn an_open_context_menu_is_in_the_semantic_tree() {
         crate::testing::on_ui_thread(|| {
             let config = crate::services::private_test_config();
@@ -6024,6 +6228,10 @@ mod dialog_scope_tests {
         let mut n = m;
         match msg {
             UiMsg::Click(id) => n.events.push(id.to_string()),
+            // Without quotes, which end the log `events` reads.
+            UiMsg::Dialog(id, crate::dialogs::Outcome::Action(a)) => {
+                n.events.push(format!("{}=Action {}", id, a))
+            }
             UiMsg::Dialog(id, outcome) => n.events.push(format!("{}={:?}", id, outcome)),
             UiMsg::Listed(id, request, found) => {
                 n.events
@@ -6295,6 +6503,67 @@ mod dialog_scope_tests {
                 s.flush().unwrap();
                 assert!(s.dialog_ids().is_empty(), "{id} stayed open");
             }
+            s.shutdown()
+        })
+    }
+
+    #[test]
+    fn a_dialog_button_answers_its_letter_and_the_arrows_move_between_buttons() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::application(
+                "Small",
+                "dev.gossamer.gui-dialog-keys-test",
+                Log::default,
+                log_update,
+                log_view,
+            )
+            .size(640, 360)
+            .start()
+            .unwrap();
+            let ask = |s: &mut crate::Session, id: &str| {
+                crate::perform(Effect::OpenDialog(request::confirm(
+                    id,
+                    "A program is still running",
+                    "vim is running. Closing the window ends it.",
+                    "Exit Anyway",
+                    true,
+                )));
+                s.flush().unwrap();
+                assert_eq!(s.dialog_ids(), vec![id.to_string()]);
+            };
+            // Cancel, the safe choice, starts focused; the destructive
+            // button sits before it.
+            ask(&mut s, "arrows");
+            let back = if s.windows[0].theme.rtl {
+                Key::Right
+            } else {
+                Key::Left
+            };
+            s.press(back, Mods::default()).unwrap();
+            s.press(Key::Return, Mods::default()).unwrap();
+            s.flush().unwrap();
+            assert!(
+                events(&s).contains("arrows=Action accept"),
+                "{}",
+                events(&s)
+            );
+            ask(&mut s, "letter");
+            s.press(Key::E, Mods::default()).unwrap();
+            s.flush().unwrap();
+            assert!(
+                events(&s).contains("letter=Action accept"),
+                "{}",
+                events(&s)
+            );
+            ask(&mut s, "cancel");
+            s.press(Key::C, Mods::default()).unwrap();
+            s.flush().unwrap();
+            assert!(s.dialog_ids().is_empty());
+            assert!(events(&s).contains("cancel=Cancelled"), "{}", events(&s));
             s.shutdown()
         })
     }
@@ -7663,6 +7932,182 @@ mod window_command_tests {
                 assert_eq!(which.label, key);
                 assert_eq!(which.checked, i64::from(key == "second"));
             }
+            s.shutdown()
+        })
+    }
+
+    #[test]
+    fn a_hotkey_the_platform_refuses_answers_its_task_and_a_press_reaches_its_id() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _cleanup = scopeguard::guard((), |_| crate::services::remove_test_config(&config));
+            let mut s = start("Hotkeys", "dev.gossamer.hotkeys").unwrap();
+            let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let log = seen.clone();
+            s.set_shell(
+                move |m| log.borrow_mut().push(m),
+                Widget::label,
+                |_| Vec::new(),
+            );
+            s.open_window("main", "Main", 320, 200).unwrap();
+            effects::perform(Effect::RegisterHotkey {
+                id: "chord".into(),
+                shortcut: "Ctrl+K Ctrl+C".into(),
+                description: "Chord".into(),
+            });
+            effects::perform(Effect::RegisterHotkey {
+                id: "drop".into(),
+                shortcut: "F12".into(),
+                description: "Drop down".into(),
+            });
+            s.flush().unwrap();
+            let failed = |id: &str| {
+                seen.borrow().iter().any(|m| {
+                    matches!(m, UiMsg::Task(owner, crate::widgets::cx::TaskOutcome::Failed(_)) if owner == id)
+                })
+            };
+            assert!(failed("chord"));
+            // The offscreen driver has no desktop to take a global shortcut.
+            assert!(failed("drop"));
+            let hotkey = windowing::HotkeyId(77);
+            s.hotkeys.insert(hotkey, "drop".into());
+            s.handle(&windowing::Event::Hotkey { hotkey }).unwrap();
+            s.flush().unwrap();
+            assert!(seen.borrow().contains(&UiMsg::Hotkey("drop".into())));
+            s.handle(&windowing::Event::HotkeyFailed {
+                hotkey,
+                reason: "declined".into(),
+            })
+            .unwrap();
+            s.flush().unwrap();
+            assert!(s.hotkeys.is_empty());
+            s.shutdown()
+        })
+    }
+
+    #[test]
+    fn a_tab_dropped_beside_its_window_leaves_the_strip_instead_of_reordering() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _cleanup = scopeguard::guard((), |_| crate::services::remove_test_config(&config));
+            let mut s = start("Tab drop", "dev.gossamer.tab-drop").unwrap();
+            let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let heard = seen.clone();
+            s.set_shell(
+                move |m| heard.borrow_mut().push(m),
+                |_| {
+                    let items = [
+                        crate::widgets::tabs::TabItem::new("one", "One"),
+                        crate::widgets::tabs::TabItem::new("two", "Two"),
+                    ];
+                    let pages = HashMap::from([
+                        ("one".to_string(), Widget::label("first")),
+                        ("two".to_string(), Widget::label("second")),
+                    ]);
+                    Widget::tab_pages("tabs", "workspace", &items, "one", &pages)
+                },
+                |_| Vec::new(),
+            );
+            s.open_window("main", "Main", 400, 200).unwrap();
+            s.flush().unwrap();
+            let strip = crate::widgets::tree::find_kind(
+                &s.windows[0].root,
+                &s.windows[0].node,
+                &s.windows[0].theme,
+                "tabs",
+            );
+            let second = strip[0].node.parts[2];
+            let (x, y) = (
+                strip[0].x + second.center_x(),
+                strip[0].y + second.center_y(),
+            );
+            s.drag(x, y, -60, y).unwrap();
+            let messages = seen.borrow();
+            assert!(
+                messages
+                    .iter()
+                    .any(|m| matches!(m, UiMsg::TabDetach(strip, key, _, _) if strip == "tabs" && key == "two")),
+                "{messages:?}"
+            );
+            assert!(!messages.iter().any(|m| matches!(m, UiMsg::Reorder(..))));
+            drop(messages);
+            s.shutdown()
+        })
+    }
+
+    #[test]
+    fn a_docked_window_reports_a_resize_and_keeps_no_placement_of_its_own() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _cleanup = scopeguard::guard((), |_| crate::services::remove_test_config(&config));
+            let mut s = start("Docked", "dev.gossamer.docked").unwrap();
+            let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let heard = seen.clone();
+            s.set_shell(
+                move |m| heard.borrow_mut().push(m),
+                Widget::label,
+                |_| Vec::new(),
+            );
+            s.open_window("main", "Main", 320, 200).unwrap();
+            effects::perform(Effect::DockTop("main".into(), 1.0, 0.5));
+            s.flush().unwrap();
+            let docked = |m: &UiMsg| matches!(m, UiMsg::DockResized(..));
+            assert!(
+                !seen.borrow().iter().any(docked),
+                "docking reported a resize"
+            );
+            let area = s.windows[0].native.display().unwrap().usable;
+            s.windows[0]
+                .native
+                .set_size(area.width / 2, area.height / 4)
+                .unwrap();
+            s.inject(&windowing::Event::Resized {
+                window: s.windows[0].native.id(),
+                width: area.width / 2,
+                height: area.height / 4,
+            })
+            .unwrap();
+            s.flush().unwrap();
+            let reports: Vec<UiMsg> = seen
+                .borrow()
+                .iter()
+                .filter(|m| docked(m))
+                .cloned()
+                .collect();
+            assert_eq!(reports.len(), 1, "{reports:?}");
+            let UiMsg::DockResized(key, wide, tall) = &reports[0] else {
+                unreachable!()
+            };
+            assert_eq!(key, "main");
+            assert!(
+                (wide - 0.5).abs() < 0.01 && (tall - 0.25).abs() < 0.01,
+                "{wide} {tall}"
+            );
+            s.shutdown();
+            assert!(
+                crate::services::load_window_placement("dev.gossamer.docked", "main").is_none()
+            );
+        })
+    }
+
+    #[test]
+    fn a_hidden_window_shows_again_and_a_docked_one_spans_its_display_top() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _cleanup = scopeguard::guard((), |_| crate::services::remove_test_config(&config));
+            let mut s = start("Visibility", "dev.gossamer.visibility").unwrap();
+            s.set_shell(|_| {}, Widget::label, |_| Vec::new());
+            s.open_window("main", "Main", 320, 200).unwrap();
+            effects::perform(Effect::SetWindowVisible("main".into(), false));
+            s.flush().unwrap();
+            assert!(!s.windows[0].native.is_visible());
+            effects::perform(Effect::SetWindowVisible("main".into(), true));
+            s.flush().unwrap();
+            assert!(s.windows[0].native.is_visible());
+            let area = s.windows[0].native.display().unwrap().usable;
+            effects::perform(Effect::DockTop("main".into(), 1.0, 0.5));
+            s.flush().unwrap();
+            assert_eq!(s.windows[0].native.size(), (area.width, area.height / 2));
             s.shutdown()
         })
     }

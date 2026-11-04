@@ -125,6 +125,8 @@ pub enum Event {
     /// A paste of several lines or of control characters waits for the
     /// application to confirm it, which then pastes the text itself.
     PasteHeld(String),
+    /// The terminal's view took keyboard focus, as a click on it gives it.
+    Focused,
 }
 
 /// The state of a terminal an application reads.

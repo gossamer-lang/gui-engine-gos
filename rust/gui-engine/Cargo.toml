@@ -1,6 +1,6 @@
 [package]
 name = "gui-engine"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 publish = false
 
@@ -30,7 +30,10 @@ unicase = "2"
 unicode-normalization = "0.1"
 unicode-properties = { version = "0.1", default-features = false, features = ["general-category"] }
 unicode-segmentation = "1"
-wezterm-term = { git = "https://github.com/gossamer-lang/wezterm-lite", tag = "v0.1.2", features = ["images"] }
+# Fetches over HTTPS with Rustls and the Mozilla roots, as Gossamer's own
+# HTTP client does.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+wezterm-term = { git = "https://github.com/gossamer-lang/wezterm-lite", tag = "v0.1.4", features = ["images"] }
 portable-pty = "=0.9.0"
 encoding_rs = "0.8"
 regex = "1"

@@ -54,6 +54,14 @@ pub struct Button {
     pub expander: bool,
     /// A color a tool button shows in place of an icon (a palette swatch).
     pub swatch: Option<Color>,
+    /// The byte offset in `label` of the letter that activates the button,
+    /// drawn underlined, or -1 for none.
+    #[serde(default = "no_accelerator")]
+    pub accelerator: i64,
+}
+
+fn no_accelerator() -> i64 {
+    -1
 }
 
 impl Button {
@@ -71,6 +79,7 @@ impl Button {
             split: false,
             expander: false,
             swatch: None,
+            accelerator: -1,
         }
     }
 }
@@ -409,6 +418,17 @@ pub fn paint_button(b: &Button, node: &Node, cx: &mut PaintCx) {
         }
         let ty = abs.y + (abs.height - l.height.ceil() as i64) / 2;
         layout::draw(&mut cx.canvas, &l, x as f64, ty as f64, &style, fg);
+        if b.accelerator >= 0 && (b.accelerator as usize) < b.label.len() && !l.lines.is_empty() {
+            let x0 = l.caret_x(b.accelerator);
+            let x1 = l.caret_x(l.next_boundary(b.accelerator));
+            cx.canvas.rect(
+                x + x0 as i64,
+                ty + l.lines[0].baseline.ceil() as i64 + theme.px(2),
+                (x1 - x0).max(1.0) as i64,
+                theme.px(1).max(1),
+                fg,
+            )
+        }
         if b.menu_arrow {
             let s = theme.px(theme.shape.small_icon);
             cx.icon(

@@ -118,6 +118,10 @@ pub struct MenuState {
     pub at_y: i64,
     pub typeahead: String,
     pub typeahead_time: i64,
+    /// Where the press that opened a context menu is still held (window
+    /// pixels): its release there is the end of that click, not a choice.
+    #[serde(default)]
+    pub held: Option<(i64, i64)>,
 }
 
 impl Default for MenuState {
@@ -131,6 +135,7 @@ impl Default for MenuState {
             at_y: 0,
             typeahead: String::new(),
             typeahead_time: 0,
+            held: None,
         }
     }
 }
@@ -918,7 +923,11 @@ pub fn panel_event(
         s.path.push(-1)
     }
     match ev {
-        Event::PointerMove { y, .. } => {
+        Event::PointerMove { x, y, .. } => {
+            if s.held.is_some_and(|at| at != (*x, *y)) {
+                s.held = None;
+                st.set(owner, WState::Menu(s.clone()));
+            }
             let row = row_at(&items, &cx.theme, rect.width, y - rect.y);
             if row >= 0
                 && row != s.path[level as usize]
@@ -943,8 +952,14 @@ pub fn panel_event(
             }
             cx.consume()
         }
-        Event::PointerUp { y, button, .. } => {
-            if *button == MouseButton::Left || *button == MouseButton::Right {
+        Event::PointerUp { x, y, button, .. } => {
+            // The release of the press that opened the menu, where it was
+            // pressed, leaves the menu open for a choice.
+            let still = s.held == Some((*x, *y));
+            if s.held.take().is_some() {
+                st.set(owner, WState::Menu(s));
+            }
+            if !still && (*button == MouseButton::Left || *button == MouseButton::Right) {
                 let row = row_at(&items, &cx.theme, rect.width, y - rect.y);
                 if row >= 0 {
                     activate(root, owner, level, row, rect, false, st, cx)
@@ -1231,6 +1246,9 @@ pub fn context_event(
                 st,
                 cx,
             );
+            let mut s = st.menu(&m.id);
+            s.held = Some((*x, *y));
+            st.set(&m.id, WState::Menu(s));
             cx.consume()
         }
         Event::Command(name) if name == "gui.context-menu" => {

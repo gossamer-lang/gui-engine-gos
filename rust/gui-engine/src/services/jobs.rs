@@ -145,9 +145,9 @@ impl Job {
                     bytes.max(256 * 1024 * 1024)
                 }
                 super::work::Operation::ReadRichImage(..) => bytes.max(128 * 1024 * 1024),
-                super::work::Operation::ReadText(_) | super::work::Operation::ReadDocument(_) => {
-                    bytes.max(super::work::TEXT_LIMIT * 2)
-                }
+                super::work::Operation::ReadText(_)
+                | super::work::Operation::ReadDocument(_)
+                | super::work::Operation::Fetch(..) => bytes.max(super::work::TEXT_LIMIT * 2),
                 super::work::Operation::SaveSession(..)
                 | super::work::Operation::RestoreSession(..) => bytes.max(256 * 1024 * 1024),
                 super::work::Operation::SearchDocument(..)

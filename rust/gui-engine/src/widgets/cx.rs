@@ -328,6 +328,9 @@ pub enum UiMsg {
     CloseRequested(String),
     /// The window gained (true) or lost keyboard focus.
     WindowFocus(String, bool),
+    /// The user resized a window docked with `Effect::DockTop`: its width
+    /// and height as fractions of its display's usable area.
+    DockResized(String, f64, f64),
     /// Files were dropped on the widget `id`.
     Dropped(String, Vec<String>),
     /// A completion provider of `id` needs results for `query`
@@ -335,6 +338,8 @@ pub enum UiMsg {
     CompletionRequest(String, i64, String, i64),
     /// A custom widget's message.
     Custom(String, String),
+    /// The global shortcut `id` (`Effect::RegisterHotkey`) was pressed.
+    Hotkey(String),
 }
 
 /// Where a popup sits relative to its anchor.

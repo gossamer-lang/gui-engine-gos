@@ -189,8 +189,6 @@ pub(crate) fn drain(ending: &Ending, notify: &Notify) -> Drain {
     }
 }
 
-/// Takes the output a transport's reader collects, on the reader's own
-/// thread, so output is parsed while the session's thread paints. The flag
 /// Where a transport's reader hands what it reads, on the reader's own
 /// thread, so output is parsed while the session's thread paints.
 pub(crate) type Sink = Box<dyn Fn(&[u8]) + Send>;

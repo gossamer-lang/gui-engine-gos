@@ -1152,8 +1152,19 @@ impl Session {
     // `settle`, painting terminal output no more often than `OUTPUT_FRAME_MS`
     // when `paced`.
     fn settle_paced(&mut self, paced: bool) -> Result<(), errors::Error> {
+        // A pass that held the terminals' wakes and then painted every frame
+        // that waited has no frame left to take them back, so another pass
+        // takes them, with what came meanwhile.
+        while self.settle_pass(paced)? {}
+        Ok(())
+    }
+
+    // One pass of `settle_paced`; answers whether it left the terminals' wakes
+    // held with no frame waiting to take them.
+    fn settle_pass(&mut self, paced: bool) -> Result<bool, errors::Error> {
         self.check_memory()?;
         let mut rounds = 0;
+        let mut held_any = false;
         loop {
             if crate::text::fonts::take_catalog_request() {
                 self.run_job(&services::jobs::Job::Fonts("gui:font-catalog".into()));
@@ -1187,6 +1198,7 @@ impl Session {
                         && w.output_presented
                             .is_some_and(|at| now - at < OUTPUT_FRAME_MS)
                 });
+            held_any |= held;
             let (terminals_changed, terminal_events) = crate::terminal::pump(&self.budget, held);
             // An animated image whose frame is due repaints like new output.
             let terminals_changed = terminals_changed
@@ -1254,7 +1266,7 @@ impl Session {
         for request in crate::text::document_syntax::take_requests() {
             self.run_job(&services::jobs::Job::SyntaxLines(request));
         }
-        Ok(())
+        Ok(held_any && !self.windows.iter().any(|w| w.output_dirty))
     }
 
     // The next event, waiting no longer than the next timer. Runs of
@@ -6835,6 +6847,71 @@ mod dialog_scope_tests {
             assert!(s.dialog_ids().is_empty(), "{:?}", s.dialog_ids());
             assert!(events(&s).contains("setup=Values"), "{}", events(&s));
             s.shutdown()
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_repaint_while_terminal_wakes_are_held_takes_them_back() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = super::start("Held", "dev.gossamer.gui-held-wake-test").unwrap();
+            let budget = crate::app::effects::current_budget();
+            let options = crate::terminal::Options {
+                rows: 8,
+                cols: 40,
+                scrollback: 100,
+                ..crate::terminal::Options::default()
+            };
+            let id = crate::terminal::create(&options, budget).unwrap();
+            s.set_shell(
+                |_| {},
+                move |_| Widget::Terminal(crate::terminal::widget::View::new("term", id, "Held")),
+                |_| Vec::new(),
+            );
+            s.open_window("main", "Held", 400, 300).unwrap();
+            crate::terminal::spawn(
+                id,
+                &crate::terminal::Command {
+                    program: "/bin/sh".into(),
+                    args: vec![
+                        "-c".into(),
+                        "printf one; read a; printf two; read b; printf three; read c".into(),
+                    ],
+                    ..crate::terminal::Command::default()
+                },
+            )
+            .unwrap();
+            let shows = |text: &str| crate::terminal::snapshot(id).unwrap().text.contains(text);
+            while !shows("one") || s.windows[0].output_dirty {
+                s.step().unwrap();
+            }
+            // With the clock still, a frame for new output waits.
+            s.clock_held = Some(s.now());
+            crate::terminal::input(id, b"\n").unwrap();
+            while !s.windows[0].output_dirty {
+                s.step().unwrap();
+            }
+            // More output while that frame waits wakes the loop once; its
+            // settles hold the wake, so no queued event is left.
+            crate::terminal::input(id, b"\n").unwrap();
+            while !shows("three") {
+                std::thread::yield_now();
+            }
+            s.step().unwrap();
+            assert!(s.windows[0].output_dirty);
+            assert!(crate::terminal::output_wake_taken(id));
+            // A repaint for another reason paints the waiting frame. The loop
+            // would then wait with no frame due, so the wake must be taken back.
+            s.windows[0].dirty = true;
+            s.settle_paced(true).unwrap();
+            assert!(!s.windows[0].output_dirty);
+            assert!(!crate::terminal::output_wake_taken(id));
+            crate::terminal::close(id);
+            s.shutdown();
         })
     }
 

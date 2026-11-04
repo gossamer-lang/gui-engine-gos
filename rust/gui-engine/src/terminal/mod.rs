@@ -1056,6 +1056,16 @@ pub(crate) fn pump(budget: &Budget, held: bool) -> (bool, Vec<UiMsg>) {
     (changed, events)
 }
 
+/// Whether terminal `id`'s output wake is taken: output since the last pump
+/// that took it does not wake the session.
+#[cfg(all(test, unix))]
+pub(crate) fn output_wake_taken(id: i64) -> bool {
+    with_entry(id, |e| {
+        e.transport.as_ref().is_some_and(|t| t.has_pending_output())
+    })
+    .unwrap_or(false)
+}
+
 /// Readies the terminals for the session's thread to wait: their history
 /// rows its reads inflated, drawing or searching, are compressed again. Once
 /// the windows show all the output there is (`presented`), each terminal

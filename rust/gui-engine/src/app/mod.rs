@@ -7967,8 +7967,13 @@ mod window_command_tests {
                 })
             };
             assert!(failed("chord"));
-            // The offscreen driver has no desktop to take a global shortcut.
-            assert!(failed("drop"));
+            // A registration is either held or answered as refused. Which one
+            // F12 gets depends on the platform: macOS takes it, Windows keeps
+            // it for its debugger, and Linux's offscreen driver has no desktop.
+            let held = s.hotkeys.values().any(|owner| owner == "drop");
+            assert_ne!(held, failed("drop"));
+            s.unregister_hotkey("drop");
+            assert!(s.hotkeys.is_empty());
             let hotkey = windowing::HotkeyId(77);
             s.hotkeys.insert(hotkey, "drop".into());
             s.handle(&windowing::Event::Hotkey { hotkey }).unwrap();

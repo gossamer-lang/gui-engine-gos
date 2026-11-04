@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.7 - windowing-gos 0.1.5
+
+- Builds on windowing-gos 0.1.5.
+
 ## 0.1.6 - Global shortcuts, fetching and window visibility
 
 - Requires Gossamer 0.76.0 or later.

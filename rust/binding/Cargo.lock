@@ -719,7 +719,6 @@ dependencies = [
 [[package]]
 name = "gossamer-binding"
 version = "0.75.17"
-source = "git+https://github.com/gossamer-lang/gossamer?tag=v0.75.17#a17712795107cf0b9dcdb788d50fa5a32f3711a1"
 dependencies = [
  "gossamer-binding-abi",
  "gossamer-binding-macros",
@@ -732,12 +731,10 @@ dependencies = [
 [[package]]
 name = "gossamer-binding-abi"
 version = "0.75.17"
-source = "git+https://github.com/gossamer-lang/gossamer?tag=v0.75.17#a17712795107cf0b9dcdb788d50fa5a32f3711a1"
 
 [[package]]
 name = "gossamer-binding-macros"
 version = "0.75.17"
-source = "git+https://github.com/gossamer-lang/gossamer?tag=v0.75.17#a17712795107cf0b9dcdb788d50fa5a32f3711a1"
 dependencies = [
  "proc-macro2",
  "quote",

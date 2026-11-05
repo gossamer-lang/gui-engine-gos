@@ -270,6 +270,9 @@ pub enum UiMsg {
     TabMove(String, String, String, i64),
     /// A detached page and its requested logical desktop placement.
     TabDetach(String, String, i64, i64),
+    /// A page dropped onto another window of the session away from any strip
+    /// it could join: the strip, the page, and the window under the drop.
+    TabToWindow(String, String, String),
     /// A tree item or expander opened (`true`) or closed.
     Expand(String, String, bool),
     /// A collection item was activated (double-click or Enter).

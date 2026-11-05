@@ -15,6 +15,16 @@ use crate::widgets::completion::CompletionItem;
 use crate::widgets::menus::MenuItem;
 
 /// One request from application code.
+/// An edge of a display a window can dock along.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Edge {
+    #[default]
+    Top,
+    Bottom,
+    Left,
+    Right,
+}
+
 #[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Effect {
     /// Runs revisioned file IO, analysis or completion on the bounded worker.
@@ -55,9 +65,16 @@ pub enum Effect {
     SetWindowVisible(String, bool),
     /// Keeps a window above every other (true) or lets it stack normally.
     SetAlwaysOnTop(String, bool),
+    /// Shows a window on every virtual desktop (true) or on its own alone;
+    /// X11 and macOS, where the desktop lets an application ask.
+    SetOnAllDesktops(String, bool),
     /// Makes a window `width` by `height` fractions of the usable area of
     /// the display it is on, centered along that area's top edge.
     DockTop(String, f64, f64),
+    /// Hangs a window from an edge of the usable area of the display it is
+    /// on: it spans `length` of that edge, centered along it, and reaches
+    /// `depth` of the way across, both fractions.
+    Dock(String, Edge, f64, f64),
     /// Asks the desktop to deliver a shortcut (`Shortcut::parse` text) as
     /// `UiMsg::Hotkey(id)` while any application has focus; `description`
     /// names it where the desktop lists shortcuts. A refusal answers

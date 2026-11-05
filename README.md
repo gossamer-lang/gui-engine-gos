@@ -34,7 +34,7 @@ The toolkit is documented with gui-gos:
 ## Requirements
 
 Gossamer 0.76.0 or newer and a Rust toolchain. windowing-gos, which brings
-SDL 3, comes in as a dependency at its v0.1.5 release, which `gos fetch`
+SDL 3, comes in as a dependency at its v0.1.7 release, which `gos fetch`
 prepares. On Linux, D-Bus (accessibility, notifications, single instance) is
 spoken directly, so libdbus is not needed.
 

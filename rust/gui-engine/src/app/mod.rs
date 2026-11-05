@@ -20,6 +20,8 @@ pub mod mailbox;
 use crate::strext::StrExt;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Instant;
 
 use crate::errors;
@@ -28,7 +30,7 @@ use windowing;
 use windowing::{Key, Mods, MouseButton};
 
 use crate::accessibility::AccessNode;
-use crate::app::effects::Effect;
+use crate::app::effects::{Edge, Effect};
 use crate::app::mailbox::{Inbox, Mailbox};
 use crate::commands;
 use crate::commands::{Command, CommandTable, KeyResult};
@@ -129,9 +131,13 @@ pub struct WindowState {
     pub caret_on: bool,
     pub active: bool,
     pub close_policy: ClosePolicy,
-    /// The fractions of its display a window docked along the top takes;
-    /// `None` for a window placed as usual.
-    pub docked: Option<(f64, f64)>,
+    /// The edge a docked window hangs from, with the fractions of that edge
+    /// it spans and of the display it reaches across; `None` for a window
+    /// placed as usual.
+    pub docked: Option<(Edge, f64, f64)>,
+    /// A docked window's size as its far-edge grip reads it, kept current
+    /// as the window resizes.
+    grip: Option<DockGrip>,
     /// The key of the window a dialog window belongs to; "" for the
     /// application's own windows.
     pub owner: String,
@@ -464,6 +470,60 @@ pub fn start(name: &str, app_id: &str) -> Result<Session, errors::Error> {
 }
 
 // Pixel coordinates from the window's logical event coordinates.
+// The size of a window docked along `edge` of `area`, spanning `length` of
+// that edge and reaching `depth` across.
+fn docked_size(area: windowing::Rect, edge: Edge, length: f64, depth: f64) -> (i64, i64) {
+    let part = |whole: i64, fraction: f64| ((whole as f64) * fraction).round() as i64;
+    match edge {
+        Edge::Top | Edge::Bottom => (part(area.width, length), part(area.height, depth)),
+        Edge::Left | Edge::Right => (part(area.width, depth), part(area.height, length)),
+    }
+}
+
+/// The size a docked window's edge grip reads, shared with the window
+/// manager's hit test; two are equal when they are the same share.
+#[derive(Clone, Debug)]
+pub struct DockGrip(Arc<(AtomicI64, AtomicI64)>);
+
+impl PartialEq for DockGrip {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+// The logical pixels along a docked window's far edge that resize it.
+const DOCK_GRIP: f64 = 6.0;
+
+// What a point at `x`, `y` of a `size` window docked along `edge` is to the
+// window manager: the band along the edge facing the display resizes it.
+fn dock_grip(edge: Edge, size: (i64, i64), x: f64, y: f64) -> windowing::HitArea {
+    let (wide, tall) = (size.0 as f64, size.1 as f64);
+    match edge {
+        Edge::Top if y >= tall - DOCK_GRIP => windowing::HitArea::ResizeBottom,
+        Edge::Bottom if y < DOCK_GRIP => windowing::HitArea::ResizeTop,
+        Edge::Left if x >= wide - DOCK_GRIP => windowing::HitArea::ResizeRight,
+        Edge::Right if x < DOCK_GRIP => windowing::HitArea::ResizeLeft,
+        _ => windowing::HitArea::Normal,
+    }
+}
+
+// Where a `wide` by `tall` window docked along `edge` of `area` sits:
+// against that edge, centered along it.
+fn docked_place(area: windowing::Rect, edge: Edge, wide: i64, tall: i64) -> (i64, i64) {
+    match edge {
+        Edge::Top => (area.x + (area.width - wide) / 2, area.y),
+        Edge::Bottom => (
+            area.x + (area.width - wide) / 2,
+            area.y + area.height - tall,
+        ),
+        Edge::Left => (area.x, area.y + (area.height - tall) / 2),
+        Edge::Right => (
+            area.x + area.width - wide,
+            area.y + (area.height - tall) / 2,
+        ),
+    }
+}
+
 fn pixel_coordinate(value: f64, logical: i64, pixels: i64) -> i64 {
     (value * pixels as f64 / logical.max(1) as f64).floor() as i64
 }
@@ -736,6 +796,7 @@ impl Session {
             active: true,
             close_policy: ClosePolicy::Close,
             docked: None,
+            grip: None,
             owner: String::new(),
             see_through: options.transparent,
             transparent: options.transparent && self.transparent,
@@ -855,21 +916,45 @@ impl Session {
 
     // Places window `key` along the top edge of its display's usable area,
     // `width` and `height` fractions of that area.
-    fn dock_top(&mut self, key: &str, width: f64, height: f64) -> Result<(), errors::Error> {
+    fn dock(
+        &mut self,
+        key: &str,
+        edge: Edge,
+        length: f64,
+        depth: f64,
+    ) -> Result<(), errors::Error> {
         let w = self.find(key);
         if w < 0 {
             return Ok(());
         }
         let native = self.windows[w as usize].native;
         let area = native.display()?.usable;
-        let (width, height) = (width.clamp(0.1, 1.0), height.clamp(0.1, 1.0));
-        let wide = ((area.width as f64) * width).round() as i64;
-        let tall = ((area.height as f64) * height).round() as i64;
-        self.windows[w as usize].docked = Some((width, height));
+        let (length, depth) = (length.clamp(0.1, 1.0), depth.clamp(0.1, 1.0));
+        let (wide, tall) = docked_size(area, edge, length, depth);
+        self.windows[w as usize].docked = Some((edge, length, depth));
         native.set_size(wide, tall)?;
+        // A docked window has no frame, so the edge facing the rest of the
+        // display resizes it.
+        let size = DockGrip(Arc::new((AtomicI64::new(wide), AtomicI64::new(tall))));
+        let read = size.0.clone();
+        let grip = move |x: f64, y: f64| {
+            let now = (
+                read.0.load(Ordering::Relaxed),
+                read.1.load(Ordering::Relaxed),
+            );
+            dock_grip(edge, now, x, y)
+        };
+        if let Err(e) = native.set_hit_test(Some(Box::new(grip))) {
+            self.log_line(&format!(
+                "resizing a docked window from its edge unavailable: {}",
+                e
+            ))
+        }
+        self.windows[w as usize].grip = Some(size);
+        let (x, y) = docked_place(area, edge, wide, tall);
         // Wayland places windows itself; elsewhere a driver may refuse the move.
         if windowing::video_driver() != "wayland"
-            && let Err(e) = native.set_position(area.x + (area.width - wide) / 2, area.y)
+            && let Err(e) = native.set_position(x, y)
         {
             self.log_line(&format!("window placement unavailable: {}", e))
         }
@@ -880,10 +965,15 @@ impl Session {
     // A docked window the user resized reports the share of its display it
     // now takes; a size within a pixel of the docked one is the dock's own.
     fn dock_resized(&mut self, w: i64) {
-        let Some((width, height)) = self.windows[w as usize].docked else {
+        let Some((edge, length, depth)) = self.windows[w as usize].docked else {
             return;
         };
         let native = self.windows[w as usize].native;
+        if let Some(grip) = &self.windows[w as usize].grip {
+            let (wide, tall) = native.size();
+            grip.0.0.store(wide, Ordering::Relaxed);
+            grip.0.1.store(tall, Ordering::Relaxed);
+        }
         let Ok(display) = native.display() else {
             return;
         };
@@ -892,17 +982,18 @@ impl Session {
             return;
         }
         let (wide, tall) = native.size();
-        let near = |size: i64, fraction: f64, whole: i64| {
-            (size - (whole as f64 * fraction).round() as i64).abs() <= 1
-        };
-        if near(wide, width, area.width) && near(tall, height, area.height) {
+        let near = |size: i64, other: i64| (size - other).abs() <= 1;
+        let (want_wide, want_tall) = docked_size(area, edge, length, depth);
+        if near(wide, want_wide) && near(tall, want_tall) {
             return;
         }
-        let now = (
-            (wide as f64 / area.width as f64).clamp(0.1, 1.0),
-            (tall as f64 / area.height as f64).clamp(0.1, 1.0),
-        );
-        self.windows[w as usize].docked = Some(now);
+        let across = (wide as f64 / area.width as f64).clamp(0.1, 1.0);
+        let down = (tall as f64 / area.height as f64).clamp(0.1, 1.0);
+        let now = match edge {
+            Edge::Top | Edge::Bottom => (across, down),
+            Edge::Left | Edge::Right => (down, across),
+        };
+        self.windows[w as usize].docked = Some((edge, now.0, now.1));
         let key = self.windows[w as usize].key.clone();
         self.pending.push(UiMsg::DockResized(key, now.0, now.1));
     }
@@ -3947,7 +4038,23 @@ impl Session {
                         self.log_line(&format!("keeping a window on top unavailable: {}", e))
                     }
                 }
-                Effect::DockTop(window, width, height) => self.dock_top(&window, width, height)?,
+                Effect::SetOnAllDesktops(window, on) => {
+                    let w = self.find(&window);
+                    if w >= 0
+                        && let Err(e) = self.windows[w as usize].native.set_on_all_desktops(on)
+                    {
+                        self.log_line(&format!(
+                            "keeping a window on every desktop unavailable: {}",
+                            e
+                        ))
+                    }
+                }
+                Effect::DockTop(window, width, height) => {
+                    self.dock(&window, Edge::Top, width, height)?
+                }
+                Effect::Dock(window, edge, length, depth) => {
+                    self.dock(&window, edge, length, depth)?
+                }
                 Effect::RegisterHotkey {
                     id,
                     shortcut,
@@ -4296,6 +4403,28 @@ impl Session {
                     }
                 }
                 target += 1;
+            }
+            // Dropped on another window, but on no strip there: a window
+            // showing one page may draw none. A drop still inside the source
+            // window lands on the source, which is above anything behind it.
+            let inside = |native: windowing::Window| {
+                let (x, y) = native.position();
+                let (w, h) = native.size();
+                gx >= x && gx < x + w && gy >= y && gy < y + h
+            };
+            if !inside(source_window)
+                && let Some(target) = (0..self.windows.len()).find(|&t| {
+                    t != source as usize
+                        && self.floor_layer(t as i64) < 0
+                        && inside(self.windows[t].native)
+                })
+            {
+                self.pending.push(UiMsg::TabToWindow(
+                    strip.to_string(),
+                    key.to_string(),
+                    self.windows[target].key.clone(),
+                ));
+                return;
             }
         }
         self.pending
@@ -5840,6 +5969,7 @@ pub fn msg_id(m: &UiMsg) -> String {
         | UiMsg::TabDrop(id, _, _, _)
         | UiMsg::TabMove(id, _, _, _)
         | UiMsg::TabDetach(id, _, _, _)
+        | UiMsg::TabToWindow(id, _, _)
         | UiMsg::Expand(id, _, _)
         | UiMsg::Activate(id, _)
         | UiMsg::CellEdit(id, _, _, _)
@@ -8041,6 +8171,63 @@ mod window_command_tests {
     }
 
     #[test]
+    fn a_tab_dropped_on_another_window_without_a_strip_moves_to_that_window() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _cleanup = scopeguard::guard((), |_| crate::services::remove_test_config(&config));
+            let mut s = start("Tab to window", "dev.gossamer.tab-to-window").unwrap();
+            let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let heard = seen.clone();
+            s.set_shell(
+                move |m| heard.borrow_mut().push(m),
+                |key| {
+                    if key != "main" {
+                        return Widget::label("one page, no strip");
+                    }
+                    let items = [
+                        crate::widgets::tabs::TabItem::new("one", "One"),
+                        crate::widgets::tabs::TabItem::new("two", "Two"),
+                    ];
+                    let pages = HashMap::from([
+                        ("one".to_string(), Widget::label("first")),
+                        ("two".to_string(), Widget::label("second")),
+                    ]);
+                    Widget::tab_pages("tabs", "workspace", &items, "one", &pages)
+                },
+                |_| Vec::new(),
+            );
+            s.open_window("main", "Main", 400, 200).unwrap();
+            s.open_window("other", "Other", 900, 700).unwrap();
+            s.flush().unwrap();
+            let (ox, oy) = s.windows[1].native.position();
+            let (mx, my) = s.windows[0].native.position();
+            let strip = crate::widgets::tree::find_kind(
+                &s.windows[0].root,
+                &s.windows[0].node,
+                &s.windows[0].theme,
+                "tabs",
+            );
+            let second = strip[0].node.parts[2];
+            let (x, y) = (
+                strip[0].x + second.center_x(),
+                strip[0].y + second.center_y(),
+            );
+            // A point of the larger window beside the smaller one.
+            s.drag(x, y, ox + 20 - mx, oy + 20 - my).unwrap();
+            let messages = seen.borrow();
+            assert!(
+                messages
+                    .iter()
+                    .any(|m| matches!(m, UiMsg::TabToWindow(strip, key, window)
+                    if strip == "tabs" && key == "two" && window == "other")),
+                "{messages:?}"
+            );
+            drop(messages);
+            s.shutdown()
+        })
+    }
+
+    #[test]
     fn a_docked_window_reports_a_resize_and_keeps_no_placement_of_its_own() {
         crate::testing::on_ui_thread(|| {
             let config = crate::services::private_test_config();
@@ -8096,7 +8283,8 @@ mod window_command_tests {
     }
 
     #[test]
-    fn a_hidden_window_shows_again_and_a_docked_one_spans_its_display_top() {
+    fn a_hidden_window_shows_again_a_docked_one_spans_its_display_top_and_one_joins_every_desktop()
+    {
         crate::testing::on_ui_thread(|| {
             let config = crate::services::private_test_config();
             let _cleanup = scopeguard::guard((), |_| crate::services::remove_test_config(&config));
@@ -8113,8 +8301,76 @@ mod window_command_tests {
             effects::perform(Effect::DockTop("main".into(), 1.0, 0.5));
             s.flush().unwrap();
             assert_eq!(s.windows[0].native.size(), (area.width, area.height / 2));
+            effects::perform(Effect::SetOnAllDesktops("main".into(), true));
+            s.flush().unwrap();
+            assert!(s.windows[0].native.on_all_desktops());
+            effects::perform(Effect::SetOnAllDesktops("main".into(), false));
+            s.flush().unwrap();
+            assert!(!s.windows[0].native.on_all_desktops());
             s.shutdown()
         })
+    }
+
+    #[test]
+    fn a_window_docks_along_each_edge_spanning_its_length_and_reaching_its_depth() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _cleanup = scopeguard::guard((), |_| crate::services::remove_test_config(&config));
+            let mut s = start("Edges", "dev.gossamer.edges").unwrap();
+            s.set_shell(|_| {}, Widget::label, |_| Vec::new());
+            s.open_window("main", "Main", 320, 200).unwrap();
+            let a = s.windows[0].native.display().unwrap().usable;
+            let along_top = (a.width / 2, a.height / 4);
+            let along_side = (a.width / 4, a.height / 2);
+            for (edge, size) in [
+                (Edge::Top, along_top),
+                (Edge::Bottom, along_top),
+                (Edge::Left, along_side),
+                (Edge::Right, along_side),
+            ] {
+                effects::perform(Effect::Dock("main".into(), edge, 0.5, 0.25));
+                s.flush().unwrap();
+                assert_eq!(s.windows[0].native.size(), size, "{edge:?}");
+                assert_eq!(s.windows[0].docked, Some((edge, 0.5, 0.25)));
+            }
+            s.shutdown()
+        })
+    }
+
+    #[test]
+    fn a_docked_window_resizes_from_the_edge_facing_the_display() {
+        use windowing::HitArea::*;
+        let size = (800, 400);
+        assert_eq!(
+            super::dock_grip(Edge::Top, size, 300.0, 397.0),
+            ResizeBottom
+        );
+        assert_eq!(super::dock_grip(Edge::Top, size, 300.0, 390.0), Normal);
+        assert_eq!(super::dock_grip(Edge::Top, size, 300.0, 1.0), Normal);
+        assert_eq!(super::dock_grip(Edge::Bottom, size, 300.0, 2.0), ResizeTop);
+        assert_eq!(
+            super::dock_grip(Edge::Left, size, 797.0, 200.0),
+            ResizeRight
+        );
+        assert_eq!(super::dock_grip(Edge::Right, size, 3.0, 200.0), ResizeLeft);
+        assert_eq!(super::dock_grip(Edge::Right, size, 797.0, 200.0), Normal);
+    }
+
+    #[test]
+    fn a_docked_window_sits_against_its_edge_centered_along_it() {
+        let area = windowing::Rect {
+            x: 100,
+            y: 30,
+            width: 1000,
+            height: 800,
+        };
+        assert_eq!(super::docked_place(area, Edge::Top, 500, 200), (350, 30));
+        assert_eq!(
+            super::docked_place(area, Edge::Bottom, 500, 200),
+            (350, 630)
+        );
+        assert_eq!(super::docked_place(area, Edge::Left, 250, 400), (100, 230));
+        assert_eq!(super::docked_place(area, Edge::Right, 250, 400), (850, 230));
     }
 
     #[test]

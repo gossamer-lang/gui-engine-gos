@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.8 - Docking on any edge, tab drops on any window
+
+- Builds on windowing-gos 0.1.7: on X11 every press of a global shortcut arrives, and a window it brings forward takes focus.
+- `Effect::Dock(window, edge, length, depth)` docks a window along the top, bottom, left or right of its display's usable area, spanning `length` of that edge and reaching `depth` across; `DockResized` reports a docked window's new length and depth. A docked window's edge facing the rest of the display resizes it when dragged.
+- `Effect::SetOnAllDesktops` shows a window on every virtual desktop where the desktop lets an application ask (X11, macOS).
+- A tab dropped onto another window of the session away from any strip there arrives as `UiMsg::TabToWindow(strip, key, window)`, so a window that shows one page without a strip still takes tabs.
+
 ## 0.1.7 - windowing-gos 0.1.5
 
 - Builds on windowing-gos 0.1.5.

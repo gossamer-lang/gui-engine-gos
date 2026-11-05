@@ -1767,6 +1767,12 @@ fn request(
     let query = s.text.slice(a as usize, b as usize);
     let cs_id = format!("{}#completion", t.id);
     let mut cs = st.choice(&cs_id);
+    // New text is a new question whose best answer leads; the same text asked
+    // again keeps the row the user moved to.
+    if cs.query != query {
+        cs.highlight.clear();
+        cs.first = 0;
+    }
     cs.query = query.to_string();
     cs.revision = s.revision;
     cs.request += 1;
@@ -1790,8 +1796,7 @@ fn request(
             cs.set_items(&found)
         }
         Source::Async(_) => {
-            // Results for an earlier query are not choices for this one; the
-            // highlighted key stays, so it survives into matching results.
+            // Results for an earlier query are not choices for this one.
             cs.items = Default::default();
             cs.loading = true;
             cs.error = "".to_string();
@@ -2562,5 +2567,47 @@ mod document_tests {
         drop(states);
         drop(snapshot);
         assert_eq!(budget.usage().0, 0);
+    }
+
+    #[test]
+    fn new_text_highlights_its_best_match_instead_of_the_row_chosen_before() {
+        use crate::widgets::completion::{Completion, CompletionItem, MatchMode};
+        let mut input = TextInput::new("run", "", "Run", InputKind::Line);
+        input.completion = Some(Completion::local(
+            &[
+                CompletionItem::new("inner", "xab"),
+                CompletionItem::new("start", "ab"),
+            ],
+            MatchMode::Substring,
+        ));
+        let theme = Theme::default();
+        let mut l = LayoutCx::new(&theme, &StateStore::new(), Size::new(320, 80));
+        let node = layout_input(&input, Constraints::loose(l.window), &mut l);
+        let mut st = StateStore::new();
+        let send = |ev: Event, st: &mut StateStore| {
+            let mut cx = EventCx::new(&theme, "run", 0, Rect::new(0, 0, 320, 80));
+            input_event(&input, &node, &ev, st, &mut cx);
+        };
+        send(Event::Text("a".into()), &mut st);
+        assert_eq!(st.choice("run#completion").highlight, "start");
+        send(
+            Event::KeyDown {
+                key: windowing::Key::Down,
+                mods: windowing::Mods::default(),
+                repeat: false,
+            },
+            &mut st,
+        );
+        assert_eq!(st.choice("run#completion").highlight, "inner");
+        send(Event::Text("b".into()), &mut st);
+        let cs = st.choice("run#completion");
+        assert_eq!(
+            cs.items
+                .iter()
+                .map(|it| it.key.as_str())
+                .collect::<Vec<_>>(),
+            ["start", "inner"]
+        );
+        assert_eq!(cs.highlight, "start");
     }
 }

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.9 - Close requests over a dialog
+
+- A window's close button, or any request from the desktop to close a window, leaves the modal dialog it shows open and focuses the window, as a dialog in a window of its own already did. A second close request no longer cancels a question such as a confirmation to close.
+- Builds on wezterm-lite 0.1.5: a terminal narrowed while a full-screen program runs over a full scrollback returns its shell prompt to its own line, at column zero, when the program exits.
+- New text in a field with completions highlights its best match, instead of keeping the row chosen for the earlier text.
+
 ## 0.1.8 - Docking, tab drops and forwarded command lines
 
 - Builds on windowing-gos 0.1.8: on X11 every press of a global shortcut arrives, and a window it brings forward takes focus.

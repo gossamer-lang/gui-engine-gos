@@ -1817,6 +1817,10 @@ impl Session {
                 let w = self.find_native(*window);
                 if w >= 0 && self.blocked(w) {
                     let _ = self.windows[self.blocker(w) as usize].native.focus();
+                } else if w >= 0 && self.floor_layer(w) >= 0 {
+                    // The window's modal dialog holds a question only its own
+                    // buttons answer, so the close leaves it asking.
+                    let _ = self.windows[w as usize].native.focus();
                 } else if w >= 0 {
                     self.close_requested(w)
                 }
@@ -8068,6 +8072,39 @@ mod window_command_tests {
                 .unwrap();
             s.open_dialog_in(0, &info("keyboard"));
             assert!(s.windows[0].focus_visible);
+            s.shutdown()
+        })
+    }
+
+    #[test]
+    fn a_close_request_leaves_the_windows_open_dialog_asking() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _cleanup = scopeguard::guard((), |_| crate::services::remove_test_config(&config));
+            let mut s = start("Close twice", "dev.gossamer.close-twice").unwrap();
+            let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let heard = seen.clone();
+            s.set_shell(
+                move |m| heard.borrow_mut().push(m),
+                Widget::label,
+                |_| Vec::new(),
+            );
+            s.open_window("main", "Main", 320, 200).unwrap();
+            s.set_close_policy("main", ClosePolicy::Ask);
+            let window = s.windows[0].native.id();
+            s.handle(&windowing::Event::CloseRequested { window })
+                .unwrap();
+            s.flush().unwrap();
+            assert_eq!(seen.borrow().len(), 1);
+            s.open_dialog_in(
+                0,
+                &crate::dialogs::request::confirm("close", "Close?", "A job runs.", "Close", true),
+            );
+            s.handle(&windowing::Event::CloseRequested { window })
+                .unwrap();
+            s.flush().unwrap();
+            assert_eq!(s.dialog_ids(), vec!["close".to_string()]);
+            assert_eq!(seen.borrow().len(), 1, "{:?}", seen.borrow());
             s.shutdown()
         })
     }

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.1 - Typing after full screen TUI apps
+
+- The first character typed after a full screen TUI app that used kitty's keyboard protocol exits on Ctrl+C or Ctrl+D reaches the shell; it used to be dropped.
+
 ## 0.2.0 - Event and command names
 
 - `UiMsg` events are named for what happened: `Clicked`, `Toggled`, `Checked`, `Chosen`, `Submitted`, `Selected`, `SelectedMany`, `Expanded`, `Activated`, `Reordered`, `SortRequested`, `OpenRequested`, `OpenUriRequested`, `TextChanged`, `CaretMoved`, `ValueChanged`, `RangeChanged`, `ColorChanged`, `DateChanged`, `TabSelected`, `SplitMoved`, `CellEdited`, `ColumnResized`, `TabMoved`, `TabDropped`, `TabDetached`, `TabMovedToWindow`, `TabDocked`, `WorkFinished`, `PrintProgress` and `WindowFocusChanged` replace `Click`, `Toggle`, `Check`, `Choose`, `Submit`, `Select`, `SelectMany`, `Expand`, `Activate`, `Reorder`, `Sort`, `Open`, `OpenUri`, `Text`, `Caret`, `Value`, `Range`, `Color`, `Date`, `Tab`, `Split`, `CellEdit`, `ColumnResize`, `TabMove`, `TabDrop`, `TabDetach`, `TabToWindow`, `Dock`, `Worked`, `Print` and `WindowFocus`.

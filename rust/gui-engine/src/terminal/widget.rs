@@ -1769,8 +1769,14 @@ pub fn terminal_event(v: &View, node: &Node, ev: &Event, _st: &mut StateStore, c
         }
         Event::KeyDown {
             key, mods, repeat, ..
-        } if focused => key_down(v, *key, *mods, *repeat, rows, cx),
+        } if focused => {
+            // A key's text arrives between its press and its release, so a
+            // suppression set for an earlier key never reaches this one.
+            with_entry(v.terminal, |e| e.suppress_text = false);
+            key_down(v, *key, *mods, *repeat, rows, cx)
+        }
         Event::KeyUp { key, mods, .. } if focused => {
+            with_entry(v.terminal, |e| e.suppress_text = false);
             if let Some(flags) = kitty_flags(v) {
                 kitty_key(v, *key, *mods, KeyState::Up, flags, cx);
             }

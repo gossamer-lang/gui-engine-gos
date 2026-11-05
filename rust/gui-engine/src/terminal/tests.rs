@@ -864,6 +864,37 @@ mod session {
         })
     }
 
+    #[test]
+    fn typing_after_a_program_leaves_kittys_protocol_reaches_the_shell_whole() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| crate::services::remove_test_config(&config));
+            let ctrl = windowing::Mods {
+                ctrl: true,
+                ..windowing::Mods::default()
+            };
+            // The program asks for kitty's protocol, reads Ctrl+C as its
+            // escape code (CSI 99;5u, 7 bytes), gives the protocol back, and
+            // reports the first byte typed after that.
+            let script = "stty -icanon -echo min 1; printf '\\033[>1uready\\r\\n'; \
+                 dd bs=1 count=7 >/dev/null 2>&1; printf '\\033[<uback\\r\\n'; \
+                 v=$(dd bs=1 count=1 2>/dev/null | od -An -tx1 | tr -d ' \\n'); \
+                 printf 'got:%s\\r\\n' \"$v\"; read x";
+            let (mut s, id, _) = shown_program("kitty-exit", script);
+            s.press(windowing::Key::C, ctrl).unwrap();
+            step_until(&mut s, || snapshot(id).unwrap().text.contains("back"));
+            s.press(windowing::Key::L, windowing::Mods::default())
+                .unwrap();
+            s.type_text("l").unwrap();
+            s.type_text("m").unwrap();
+            step_until(&mut s, || snapshot(id).unwrap().text.contains("got:"));
+            let text = snapshot(id).unwrap().text;
+            assert!(text.contains("got:6c"), "{text}");
+            close(id);
+            s.shutdown();
+        })
+    }
+
     fn keys(s: &mut crate::Session, typed: &str) {
         for c in typed.chars() {
             let (key, shift) = match c {

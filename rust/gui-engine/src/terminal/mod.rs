@@ -177,8 +177,8 @@ struct Entry {
     bells_seen: u64,
     /// Changes whenever the screen, its scrolling or its selection does.
     revision: u64,
-    /// Set after a key with Alt is encoded, whose text a platform may also
-    /// deliver.
+    /// Set after a key is encoded whose text a platform may also deliver;
+    /// it lasts until that key's release or the next key's press.
     suppress_text: bool,
     /// The view size the screen last refused, so each refusal is reported
     /// once, and the report waiting for the next pump.

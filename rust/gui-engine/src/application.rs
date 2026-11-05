@@ -43,6 +43,11 @@ pub struct App<M> {
     /// Files a later launch hands to the running instance, when the
     /// application keeps one instance.
     pub instance_files: Option<Vec<String>>,
+    /// The command line a later launch hands to the running instance, which
+    /// receives it as `UiMsg::CommandLine`.
+    pub instance_command_line: Option<Vec<String>>,
+    /// The name the single instance is claimed under; the app id when empty.
+    pub instance: String,
     /// The icon every window of the application shows.
     pub icon: Option<AppIcon>,
 }
@@ -74,6 +79,8 @@ pub fn application<M>(
         grows_for_popups: false,
         style: WindowStyle::default(),
         instance_files: None,
+        instance_command_line: None,
+        instance: String::new(),
         icon: None,
     }
 }
@@ -164,6 +171,21 @@ impl<M: 'static> App<M> {
         self
     }
 
+    /// Keeps one running instance: a later launch hands its command line
+    /// `arguments` and working directory to the first, which receives them as
+    /// `UiMsg::CommandLine`, and exits.
+    pub fn single_instance_command_line(mut self, arguments: Vec<String>) -> Self {
+        self.instance_command_line = Some(arguments);
+        self
+    }
+
+    /// Claims the single instance under `name` instead of the app id, so one
+    /// application can keep more than one kind of instance.
+    pub fn instance(mut self, name: &str) -> Self {
+        self.instance = name.to_string();
+        self
+    }
+
     /// Opens the first window and answers the session without running the
     /// loop (tests and embedding drive `step`).
     pub fn start(self) -> Result<Session, errors::Error> {
@@ -239,10 +261,17 @@ impl<M: 'static> App<M> {
             return std::fs::write(&path, icon.to_png())
                 .map_err(|e| errors::new(format!("writing the icon to {path}: {e}")));
         }
-        let Some(files) = self.instance_files.clone() else {
-            return self.begin(true)?.run();
+        let name = if self.instance.is_empty() {
+            self.app_id.clone()
+        } else {
+            self.instance.clone()
         };
-        let listener = match launch(&self.app_id, &files) {
+        let claimed = match (&self.instance_command_line, &self.instance_files) {
+            (Some(arguments), _) => launch_command_line(&name, arguments),
+            (None, Some(files)) => launch(&name, files),
+            (None, None) => return self.begin(true)?.run(),
+        };
+        let listener = match claimed {
             Launch::Forwarded => return Ok(()),
             Launch::Failed(error) => return Err(errors::new(error)),
             Launch::Alone => return self.begin(true)?.run(),
@@ -282,6 +311,30 @@ pub enum Launch {
     Alone,
 }
 
+/// Claims the single instance named `instance`, handing it this launch's
+/// command line `arguments`, read in the working directory, when another
+/// process already runs.
+pub fn launch_command_line(instance: &str, arguments: &[String]) -> Launch {
+    let directory = std::env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "/".to_string());
+    claim(
+        instance,
+        instance::Request::CommandLine {
+            directory,
+            arguments: arguments.to_vec(),
+        },
+    )
+}
+
+fn claim(instance: &str, request: instance::Request) -> Launch {
+    match instance::claim(instance, request) {
+        Ok(instance::Claim::Forwarded) => Launch::Forwarded,
+        Ok(instance::Claim::Primary(l)) => Launch::Primary(l),
+        Err(error) => Launch::Failed(error.to_string()),
+    }
+}
+
 /// Claims the application's single instance, handing `files` (relative
 /// paths resolved against the working directory) to it when another
 /// process already runs.
@@ -304,9 +357,5 @@ pub fn launch(app_id: &str, files: &[String]) -> Launch {
     } else {
         instance::Request::Open { uris }
     };
-    match instance::claim(app_id, request) {
-        Ok(instance::Claim::Forwarded) => Launch::Forwarded,
-        Ok(instance::Claim::Primary(l)) => Launch::Primary(l),
-        Err(error) => Launch::Failed(error.to_string()),
-    }
+    claim(app_id, request)
 }

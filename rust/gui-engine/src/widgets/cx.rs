@@ -297,6 +297,9 @@ pub enum UiMsg {
     /// it, or the files of a later launch of a single-instance application.
     Open(String),
     OpenUri(String),
+    /// A later launch of a single-instance application that forwards its
+    /// command line: the folder it ran in and its arguments.
+    CommandLine(String, Vec<String>),
     DocumentChanged(String, i64, i64),
     WindowCommand(String, String),
     QuitRequested,

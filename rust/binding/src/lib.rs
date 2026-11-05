@@ -230,6 +230,10 @@ register_module!(
         outside::claim(&app_id, &files)
     }
 
+    fn claim_command_line(instance: String, arguments: String) -> Result<String, String> {
+        outside::claim_command_line(&instance, &arguments)
+    }
+
     fn serve_instance(s: i64, listener: i64) -> Result<(), String> {
         let listener = outside::take_listener(listener)?;
         session::with(s, |session| {

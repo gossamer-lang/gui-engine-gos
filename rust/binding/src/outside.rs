@@ -62,7 +62,20 @@ pub fn release_mailbox(id: i64) {
 /// process's listener.
 pub fn claim(app_id: &str, files: &str) -> Result<String, String> {
     let files: Vec<String> = serde_json::from_str(files).map_err(|e| format!("files: {e}"))?;
-    Ok(match gui_engine::launch(app_id, &files) {
+    answer(gui_engine::launch(app_id, &files))
+}
+
+/// Claims the single instance `instance`, handing the JSON list `arguments`
+/// (this launch's command line) to the running one when there is one;
+/// answered as `claim` answers.
+pub fn claim_command_line(instance: &str, arguments: &str) -> Result<String, String> {
+    let arguments: Vec<String> =
+        serde_json::from_str(arguments).map_err(|e| format!("arguments: {e}"))?;
+    answer(gui_engine::launch_command_line(instance, &arguments))
+}
+
+fn answer(launch: gui_engine::Launch) -> Result<String, String> {
+    Ok(match launch {
         gui_engine::Launch::Failed(error) => return Err(error),
         gui_engine::Launch::Forwarded => "\"forwarded\"".to_string(),
         gui_engine::Launch::Alone => "\"alone\"".to_string(),

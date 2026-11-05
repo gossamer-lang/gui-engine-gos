@@ -91,6 +91,13 @@ pub fn claim(app_id: String, files: String) -> Result<String, String> {
     gui_engine_host::claim(app_id, files)
 }
 
+/// Claims the single instance `instance`, handing the JSON list `arguments`
+/// (this launch's command line) to the running one when there is one;
+/// answered as `claim` answers.
+pub fn claim_command_line(instance: String, arguments: String) -> Result<String, String> {
+    gui_engine_host::claim_command_line(instance, arguments)
+}
+
 /// Has session `s` serve listener `listener`'s later launches.
 pub fn serve_instance(s: i64, listener: i64) -> Result<(), String> {
     gui_engine_host::serve_instance(s, listener)

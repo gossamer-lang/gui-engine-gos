@@ -238,6 +238,9 @@ pub struct Session {
     app: windowing::App,
     /// The application's id for each global shortcut it registered.
     hotkeys: HashMap<windowing::HotkeyId, String>,
+    /// The desktop's activation context of a forwarded command line, spent
+    /// by the next window the application opens in answer.
+    launch_activation: Option<windowing::instance::Activation>,
     memory_limit: usize,
     budget: crate::memory::Budget,
     auxiliary: Option<crate::memory::Lease>,
@@ -416,6 +419,7 @@ pub fn start(name: &str, app_id: &str) -> Result<Session, errors::Error> {
         resource_error: String::new(),
         renderers: HashMap::new(),
         hotkeys: HashMap::new(),
+        launch_activation: None,
         started: false,
         windows: vec![],
         app_id: app_id.to_string(),
@@ -3867,29 +3871,41 @@ impl Session {
             return;
         };
         for forwarded in listener.take_forwarded() {
-            match forwarded.request {
-                windowing::instance::Request::Activate => {
-                    if !self.windows.is_empty() {
-                        // A launch asks for the window whether or not it was hidden.
-                        let _ = self.windows[0].native.show();
-                        let _ = self.windows[0]
-                            .native
-                            .focus_with_context(&forwarded.activation);
+            self.answer_launch(forwarded)
+        }
+    }
+
+    // Answers one later launch's request.
+    fn answer_launch(&mut self, forwarded: windowing::instance::ForwardedRequest) {
+        match forwarded.request {
+            windowing::instance::Request::Activate => {
+                if !self.windows.is_empty() {
+                    // A launch asks for the window whether or not it was hidden.
+                    let _ = self.windows[0].native.show();
+                    let _ = self.windows[0]
+                        .native
+                        .focus_with_context(&forwarded.activation);
+                }
+            }
+            windowing::instance::Request::CommandLine {
+                directory,
+                arguments,
+            } => {
+                self.pending.push(UiMsg::CommandLine(directory, arguments));
+                self.launch_activation = Some(forwarded.activation);
+            }
+            windowing::instance::Request::Open { uris } => {
+                for uri in uris {
+                    if let Some(path) = windowing::instance::uri_path(&uri) {
+                        self.pending.push(UiMsg::Open(path))
+                    } else {
+                        self.pending.push(UiMsg::OpenUri(uri))
                     }
                 }
-                windowing::instance::Request::Open { uris } => {
-                    for uri in uris {
-                        if let Some(path) = windowing::instance::uri_path(&uri) {
-                            self.pending.push(UiMsg::Open(path))
-                        } else {
-                            self.pending.push(UiMsg::OpenUri(uri))
-                        }
-                    }
-                    if !self.windows.is_empty() {
-                        let _ = self.windows[0]
-                            .native
-                            .focus_with_context(&forwarded.activation);
-                    }
+                if !self.windows.is_empty() {
+                    let _ = self.windows[0]
+                        .native
+                        .focus_with_context(&forwarded.activation);
                 }
             }
         }
@@ -3980,6 +3996,18 @@ impl Session {
                         self.windows[0].close_policy
                     };
                     self.open_window(&key, &title, width, height)?;
+                    // A window answering a forwarded launch takes focus as
+                    // the launch's own.
+                    if let Some(activation) = self.launch_activation.take() {
+                        let w = self.find(&key);
+                        if w >= 0
+                            && let Err(e) = self.windows[w as usize]
+                                .native
+                                .focus_with_context(&activation)
+                        {
+                            self.log_line(&format!("focusing the launched window failed: {}", e))
+                        }
+                    }
                     self.set_close_policy(&key, policy)
                 }
                 Effect::CloseWindow(key) => {
@@ -8223,6 +8251,53 @@ mod window_command_tests {
                 "{messages:?}"
             );
             drop(messages);
+            s.shutdown()
+        })
+    }
+
+    #[test]
+    fn a_forwarded_command_line_reaches_the_application_and_its_window_takes_focus() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _cleanup = scopeguard::guard((), |_| crate::services::remove_test_config(&config));
+            let mut s = start("Command line", "dev.gossamer.command-line").unwrap();
+            let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let heard = seen.clone();
+            s.set_shell(
+                move |m| heard.borrow_mut().push(m),
+                |_| Widget::label("hi"),
+                |_| Vec::new(),
+            );
+            s.open_window("main", "Main", 300, 200).unwrap();
+            s.answer_launch(windowing::instance::ForwardedRequest {
+                request: windowing::instance::Request::CommandLine {
+                    directory: "/srv/a folder".into(),
+                    arguments: vec!["-e".into(), "top".into()],
+                },
+                activation: windowing::instance::Activation::default(),
+            });
+            s.flush().unwrap();
+            assert!(
+                seen.borrow()
+                    .iter()
+                    .any(|m| matches!(m, UiMsg::CommandLine(directory, arguments)
+                if directory == "/srv/a folder" && arguments == &["-e", "top"]))
+            );
+            assert!(
+                s.launch_activation.is_some(),
+                "kept for the window that answers"
+            );
+            effects::perform(Effect::OpenWindow {
+                key: "second".into(),
+                title: "Second".into(),
+                width: 300,
+                height: 200,
+            });
+            s.flush().unwrap();
+            assert!(
+                s.launch_activation.is_none(),
+                "spent by the window opened next"
+            );
             s.shutdown()
         })
     }

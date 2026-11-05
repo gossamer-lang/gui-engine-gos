@@ -41,7 +41,7 @@ pub mod widgets;
 
 pub use app::effects::perform;
 pub use app::{Session, start};
-pub use application::{App, Launch, application, launch};
+pub use application::{App, Launch, application, launch, launch_command_line};
 pub use callback::Callback;
 
 /// A `HashMap` from `key => value` pairs, the toolkit's spelling of a map

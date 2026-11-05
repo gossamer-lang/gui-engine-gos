@@ -27,7 +27,7 @@ pub struct ScrollState {
     pub x: i64,
     pub y: i64,
     /// Pointer offset into the thumb while dragging it, or -1.
-    pub drag: i64,
+    pub drag_offset: i64,
     pub drag_horizontal: bool,
 }
 
@@ -202,8 +202,8 @@ impl StateStore {
             };
             match &mut state {
                 WState::Edit(edit) => {
-                    edit.undo = Vec::new();
-                    edit.redo = Vec::new();
+                    edit.undo_stack = Vec::new();
+                    edit.redo_stack = Vec::new();
                 }
                 WState::Collection(collection) => {
                     collection.extents = Vec::new();
@@ -448,7 +448,7 @@ impl StateStore {
 
     // Typed accessors: each answers the default state when none is stored.
 
-    pub fn edit(&self, id: &str) -> EditState {
+    pub fn edit_state(&self, id: &str) -> EditState {
         match self.entries.get(id).map(Arc::as_ref) {
             Some(WState::Edit(s)) => {
                 if s.document > 0 {
@@ -467,20 +467,20 @@ impl StateStore {
             _ => ScrollState {
                 x: 0,
                 y: 0,
-                drag: -1,
+                drag_offset: -1,
                 drag_horizontal: false,
             },
         }
     }
 
-    pub fn drag(&self, id: &str) -> DragState {
+    pub fn drag_state(&self, id: &str) -> DragState {
         match self.entries.get(id).map(Arc::as_ref) {
             Some(WState::Drag(s)) => *s,
             _ => DragState::default(),
         }
     }
 
-    pub fn choice(&self, id: &str) -> ChoiceState {
+    pub fn choice_state(&self, id: &str) -> ChoiceState {
         match self.entries.get(id).map(Arc::as_ref) {
             Some(WState::Choice(s)) => s.clone(),
             _ => ChoiceState::default(),
@@ -547,7 +547,7 @@ mod tests {
             WState::Scroll(ScrollState {
                 x: 1,
                 y: 2,
-                drag: -1,
+                drag_offset: -1,
                 drag_horizontal: false,
             }),
         );

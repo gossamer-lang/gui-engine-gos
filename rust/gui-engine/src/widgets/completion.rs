@@ -42,7 +42,7 @@ pub struct CompletionItem {
     pub key: String,
     pub label: String,
     /// Text inserted on acceptance ("" inserts the label).
-    pub insert: String,
+    pub insert_text: String,
     pub detail: String,
     pub icon: Option<crate::render::icons::Icon>,
     /// Decoded application icon, preferred over the built-in glyph.
@@ -60,7 +60,7 @@ impl Default for CompletionItem {
         CompletionItem {
             key: String::new(),
             label: String::new(),
-            insert: String::new(),
+            insert_text: String::new(),
             detail: String::new(),
             icon: None,
             image: None,
@@ -94,10 +94,10 @@ impl CompletionItem {
     }
 
     pub fn inserted(&self) -> String {
-        if self.insert.is_empty() {
+        if self.insert_text.is_empty() {
             self.label.clone()
         } else {
-            self.insert.clone()
+            self.insert_text.clone()
         }
     }
 }
@@ -119,7 +119,7 @@ pub enum Source {
     /// A function answering synchronously from the query.
     Provider(crate::Callback<dyn Fn(String) -> Vec<CompletionItem>>),
     /// The application answers `UiMsg::CompletionRequest` with
-    /// `Effect::Complete` after `debounce` ms.
+    /// `Effect::AnswerCompletion` after `debounce` ms.
     Async(i64),
 }
 
@@ -248,7 +248,7 @@ pub struct ChoiceState {
     pub items: SharedItems,
     /// Unfiltered source used to reconcile an open choice after model changes.
     pub model_items: SharedItems,
-    pub highlight: String,
+    pub highlighted: String,
     /// First visible row.
     pub first: i64,
     pub query: String,
@@ -450,7 +450,7 @@ impl CompletionItem {
     pub(crate) fn owned_bytes(&self) -> usize {
         self.key.capacity()
             + self.label.capacity()
-            + self.insert.capacity()
+            + self.insert_text.capacity()
             + self.detail.capacity()
             + self.category.capacity()
             + self.matches.capacity() * size_of::<(i64, i64)>()
@@ -476,10 +476,10 @@ pub fn sort_ranked(items: &mut [CompletionItem]) {
 
 impl ChoiceState {
     /// Index of the highlighted item, or -1.
-    pub fn highlight_index(&self) -> i64 {
+    pub fn highlighted_index(&self) -> i64 {
         let mut i = 0;
         while i < self.items.len() {
-            if self.items[i].key == self.highlight {
+            if self.items[i].key == self.highlighted {
                 return i as i64;
             };
             i += 1;
@@ -497,13 +497,14 @@ impl ChoiceState {
         self.items = items;
         self.loading = false;
         self.error = "".to_string();
-        if self.highlight_index() < 0
-            || (self.highlight_index() >= 0 && self.items[self.highlight_index() as usize].disabled)
+        if self.highlighted_index() < 0
+            || (self.highlighted_index() >= 0
+                && self.items[self.highlighted_index() as usize].disabled)
         {
-            self.highlight = "".to_string();
+            self.highlighted = "".to_string();
             for it in &self.items {
                 if !it.disabled {
-                    self.highlight = it.key.clone();
+                    self.highlighted = it.key.clone();
                     break;
                 }
             }
@@ -516,7 +517,7 @@ impl ChoiceState {
     pub fn placed(&mut self, height: i64, theme: &Theme) {
         self.rows = rows_in(height, theme);
         self.first = self.first.min(self.items.len() as i64 - self.rows).max(0);
-        let at = self.highlight_index();
+        let at = self.highlighted_index();
         if at >= 0 && at >= self.first + self.rows {
             self.first = at - self.rows + 1
         }
@@ -538,7 +539,7 @@ impl ChoiceState {
         if n == 0 {
             return;
         }
-        let mut i = self.highlight_index();
+        let mut i = self.highlighted_index();
         let dir = if step >= 0 { 1 } else { -1 };
         let mut remaining = step.abs().max(1);
         let mut guard = 0;
@@ -563,7 +564,7 @@ impl ChoiceState {
         if self.items[i as usize].disabled {
             return;
         };
-        self.highlight = self.items[i as usize].key.clone();
+        self.highlighted = self.items[i as usize].key.clone();
         self.reveal(i, rows)
     }
 
@@ -575,7 +576,7 @@ impl ChoiceState {
             i += if last { -1 } else { 1 };
         }
         if i >= 0 && i < n {
-            self.highlight = self.items[i as usize].key.clone();
+            self.highlighted = self.items[i as usize].key.clone();
             self.reveal(i, rows)
         }
     }
@@ -592,7 +593,7 @@ impl ChoiceState {
 
     /// The highlighted item, when one is highlighted and enabled.
     pub fn current(&self) -> Option<CompletionItem> {
-        let i = self.highlight_index();
+        let i = self.highlighted_index();
         if self.loading || !self.error.is_empty() || i < 0 || self.items[i as usize].disabled {
             None
         } else {
@@ -602,7 +603,7 @@ impl ChoiceState {
 
     /// Typeahead: the next enabled item whose label starts with the
     /// accumulated letters (reset after a pause of `pause` ms).
-    pub fn typeahead_key(&mut self, c: &str, now: i64, pause: i64) -> Option<String> {
+    pub fn type_ahead(&mut self, c: &str, now: i64, pause: i64) -> Option<String> {
         if now - self.typeahead_time > pause {
             self.typeahead = "".to_string();
         }
@@ -614,7 +615,7 @@ impl ChoiceState {
         }
         let needle = fold(&self.typeahead);
         let n = self.items.len();
-        let start = self.highlight_index();
+        let start = self.highlighted_index();
         let mut k = 1;
         if !cycling {
             k = 0
@@ -623,7 +624,7 @@ impl ChoiceState {
             let i = (start.max(0) + k as i64) % n.max(1) as i64;
             let item = &self.items[i as usize];
             if !item.disabled && fold(&item.label).starts_with(&needle) {
-                self.highlight = item.key.clone();
+                self.highlighted = item.key.clone();
                 return Some(item.key.clone());
             }
             k += 1;
@@ -769,7 +770,7 @@ pub fn paint_list(
     let end = (state.first + state.visible_rows()).min(state.items.len() as i64);
     while i < end {
         let it = &state.items[i as usize];
-        let lit = it.key == state.highlight;
+        let lit = it.key == state.highlighted;
         if lit {
             cx.canvas.round_rect(
                 rect.x + pad,
@@ -933,7 +934,7 @@ pub fn list_semantics(
         let mut item = AccessNode::new(Role::ListItem, &it.label);
         item.id = format!("{}#{}", item_prefix, it.key);
         item.description = it.detail.clone();
-        item.selected = it.key == state.highlight;
+        item.selected = it.key == state.highlighted;
         item.checked = if !checked.is_empty() && it.key == checked {
             1
         } else {
@@ -1112,15 +1113,15 @@ mod tests {
             "two".to_string(),
             "three".to_string(),
         ]));
-        assert_eq!(s.highlight, "k0");
+        assert_eq!(s.highlighted, "k0");
         s.move_highlight(1, 8, false);
-        assert_eq!(s.highlight, "k1");
+        assert_eq!(s.highlighted, "k1");
         let mut reordered = items(&["zero".to_string(), "one".to_string(), "two".to_string()]);
         reordered[1].key = "kx".to_string();
         reordered[2].key = "k1".to_string();
         s.set_items(&reordered);
-        assert_eq!(s.highlight, "k1");
-        assert_eq!(s.highlight_index(), 2)
+        assert_eq!(s.highlighted, "k1");
+        assert_eq!(s.highlighted_index(), 2)
     }
 
     #[test]
@@ -1130,9 +1131,9 @@ mod tests {
         let mut s = ChoiceState::default();
         s.set_items(&list);
         s.move_highlight(1, 8, false);
-        assert_eq!(s.highlight, "k2");
+        assert_eq!(s.highlighted, "k2");
         s.move_highlight(1, 8, false);
-        assert_eq!(s.highlight, "k0")
+        assert_eq!(s.highlighted, "k0")
     }
 
     #[test]
@@ -1144,11 +1145,11 @@ mod tests {
             "cherry".to_string(),
             "bread".to_string(),
         ]));
-        assert_eq!(s.typeahead_key("b", 0, 1000), Some("k0".to_string()));
-        assert_eq!(s.typeahead_key("l", 100, 1000), Some("k1".to_string()));
-        assert_eq!(s.typeahead_key("c", 5000, 1000), Some("k2".to_string()));
-        assert_eq!(s.typeahead_key("b", 9000, 1000), Some("k3".to_string()));
-        assert_eq!(s.typeahead_key("b", 9100, 1000), Some("k0".to_string()))
+        assert_eq!(s.type_ahead("b", 0, 1000), Some("k0".to_string()));
+        assert_eq!(s.type_ahead("l", 100, 1000), Some("k1".to_string()));
+        assert_eq!(s.type_ahead("c", 5000, 1000), Some("k2".to_string()));
+        assert_eq!(s.type_ahead("b", 9000, 1000), Some("k3".to_string()));
+        assert_eq!(s.type_ahead("b", 9100, 1000), Some("k0".to_string()))
     }
 
     #[test]

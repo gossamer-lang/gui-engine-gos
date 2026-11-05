@@ -157,13 +157,13 @@ impl<M: 'static> App<M> {
     }
 
     /// Focuses the widget `id` when the first window opens.
-    pub fn focus(mut self, id: &str) -> Self {
+    pub fn initial_focus(mut self, id: &str) -> Self {
         self.initial_focus = id.to_string();
         self
     }
 
     /// Keeps one running instance: a later launch hands `files` (its own
-    /// file arguments) to the first, which receives each as `UiMsg::Open`,
+    /// file arguments) to the first, which receives each as `UiMsg::OpenRequested`,
     /// and exits. Where the platform cannot claim an instance, every launch
     /// runs on its own.
     pub fn single_instance(mut self, files: Vec<String>) -> Self {

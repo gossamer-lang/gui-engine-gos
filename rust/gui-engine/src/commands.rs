@@ -211,7 +211,7 @@ impl CommandTable {
         self.chord_deadline = 0;
     }
 
-    pub fn chord_pending(&self) -> bool {
+    pub fn is_chord_pending(&self) -> bool {
         !self.pressed.is_empty()
     }
 

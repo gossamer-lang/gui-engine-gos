@@ -1,6 +1,6 @@
 //! Background print and export jobs. Pagination, PDF output and spooling run
 //! on a thread of their own, check cancellation between pages, and answer
-//! the session through its mailbox as `UiMsg::Print(job, event)`.
+//! the session through its mailbox as `UiMsg::PrintProgress(job, event)`.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -70,7 +70,7 @@ fn answer(mailbox: &Mailbox, job: i64, event: Event) {
         cancelled: Arc::new(Cancellation::default()),
         deadline: Instant::now() + Duration::from_secs(60),
     };
-    let _ = mailbox.post_guarded(&UiMsg::Print(job, event), &delivery);
+    let _ = mailbox.post_guarded(&UiMsg::PrintProgress(job, event), &delivery);
 }
 
 /// Starts laying out `items` and sending them to `target` in the running

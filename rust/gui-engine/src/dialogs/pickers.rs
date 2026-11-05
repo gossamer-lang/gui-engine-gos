@@ -828,7 +828,7 @@ pub fn click(
     part: &str,
     st: &mut StateStore,
 ) -> (Instance, Option<Outcome>, Vec<Effect>) {
-    message(inst.clone(), &UiMsg::Click(cid(&inst, part)), part, st)
+    message(inst.clone(), &UiMsg::Clicked(cid(&inst, part)), part, st)
 }
 pub fn message(
     inst: Instance,
@@ -836,7 +836,7 @@ pub fn message(
     part: &str,
     st: &mut StateStore,
 ) -> (Instance, Option<Outcome>, Vec<Effect>) {
-    if let UiMsg::Click(_) = m
+    if let UiMsg::Clicked(_) = m
         && matches!(inst.request, DialogRequest::Preferences { .. })
         && value(&inst, "discard-review") == "true"
     {
@@ -860,12 +860,12 @@ pub fn message(
         let mut book = palette(&inst);
         let mut control = m.clone();
         if part == "swatch-name" {
-            if let UiMsg::Text(_, text) = m {
+            if let UiMsg::TextChanged(_, text) = m {
                 n.values.insert(part.to_string(), text.to_string());
             };
             return (n, None, fx);
         };
-        if let UiMsg::Click(_) = m {
+        if let UiMsg::Clicked(_) = m {
             if part == "copy-css" {
                 fx.push(Effect::SetClipboard(p.value.css()));
                 return (n, None, fx);
@@ -907,14 +907,15 @@ pub fn message(
                             .insert("swatch:selected".to_string(), id.to_string());
                         n.values
                             .insert("swatch-name".to_string(), swatch.name.clone());
-                        control = UiMsg::Text(cid(&inst, "color:css"), swatch.css.clone())
+                        control = UiMsg::TextChanged(cid(&inst, "color:css"), swatch.css.clone())
                     }
                 }
             }
             if part.starts_with("recent:") {
                 let i = part.substring(7, part.byte_len()).to_i64().unwrap_or(-1);
                 if i >= 0 && i < book.recent.len() as i64 {
-                    control = UiMsg::Text(cid(&inst, "color:css"), book.recent[i as usize].clone())
+                    control =
+                        UiMsg::TextChanged(cid(&inst, "color:css"), book.recent[i as usize].clone())
                 }
             }
         }
@@ -932,15 +933,15 @@ pub fn message(
         return (n, None, fx);
     }
     match m {
-        UiMsg::Click(_) if part.starts_with("page:") => {
+        UiMsg::Clicked(_) if part.starts_with("page:") => {
             n.page = part.substring(5, part.byte_len()).to_i64().unwrap_or(0);
             n.error = "".to_string()
         }
-        UiMsg::Tab(_, key) if part == "pages" => {
+        UiMsg::TabSelected(_, key) if part == "pages" => {
             n.page = key.to_i64().unwrap_or(0);
             n.error = "".to_string()
         }
-        UiMsg::Click(_) if part.starts_with("reset:") => {
+        UiMsg::Clicked(_) if part.starts_with("reset:") => {
             let key = part.substring(6, part.byte_len());
             if let Some(field) = fields(&n).into_iter().find(|f| f.key == key) {
                 n.values
@@ -948,7 +949,7 @@ pub fn message(
                 n.error = "".to_string()
             }
         }
-        UiMsg::Click(_)
+        UiMsg::Clicked(_)
             if part.starts_with("field:")
                 && fields(&n).iter().any(|f| {
                     matches!(f.kind, PreferenceKind::Action) && part == format!("field:{}", f.key)
@@ -960,15 +961,15 @@ pub fn message(
                 Outcome::Action(key),
             )));
         }
-        UiMsg::Text(_, text) => {
+        UiMsg::TextChanged(_, text) => {
             n.values.insert(part.to_string(), text.to_string());
             n.error = "".to_string()
         }
-        UiMsg::Value(_, v) => {
+        UiMsg::ValueChanged(_, v) => {
             n.values.insert(part.to_string(), format!("{}", v));
             n.error = "".to_string()
         }
-        UiMsg::Choose(_, key) | UiMsg::Select(_, key) => {
+        UiMsg::Chosen(_, key) | UiMsg::Selected(_, key) => {
             n.values.insert(
                 if part == "font:choose" {
                     "font:family"
@@ -980,7 +981,7 @@ pub fn message(
             );
             n.error = "".to_string()
         }
-        UiMsg::Toggle(_, on) => {
+        UiMsg::Toggled(_, on) => {
             n.values.insert(
                 part.to_string(),
                 if *on {
@@ -991,11 +992,11 @@ pub fn message(
             );
             n.error = "".to_string()
         }
-        UiMsg::Date(_, date) => {
+        UiMsg::DateChanged(_, date) => {
             n.values.insert("date".to_string(), date.to_string());
             n.error = "".to_string()
         }
-        UiMsg::Submit(_, _) => return action(n, "ok", &fx),
+        UiMsg::Submitted(_, _) => return action(n, "ok", &fx),
         UiMsg::FontsLoaded(_, records) if part == "catalog" => {
             crate::text::fonts::adopt_installed(records);
             n.values.insert("font:catalog".to_string(), "".to_string());
@@ -1429,7 +1430,7 @@ mod tests {
         assert!(
             message(
                 inst.clone(),
-                &UiMsg::Text(
+                &UiMsg::TextChanged(
                     "dlg:f:font:sample".to_string(),
                     "Another sample".to_string()
                 ),
@@ -1442,7 +1443,7 @@ mod tests {
         assert!(
             message(
                 inst.clone(),
-                &UiMsg::Value("dlg:f:font:size".to_string(), 14.0),
+                &UiMsg::ValueChanged("dlg:f:font:size".to_string(), 14.0),
                 "font:size",
                 &mut st
             )
@@ -1451,7 +1452,7 @@ mod tests {
         );
         let (changed, _, fx) = message(
             inst.clone(),
-            &UiMsg::Value("dlg:f:font:size".to_string(), 20.0),
+            &UiMsg::ValueChanged("dlg:f:font:size".to_string(), 20.0),
             "font:size",
             &mut st,
         );
@@ -1462,7 +1463,7 @@ mod tests {
         );
         let (missing, _, _) = message(
             inst,
-            &UiMsg::Text(
+            &UiMsg::TextChanged(
                 "dlg:f:font:family".to_string(),
                 "gui-gos-absent-font-for-test".to_string(),
             ),
@@ -1490,7 +1491,7 @@ mod tests {
         let mut st = StateStore::new();
         let (edited, _, _) = message(
             inst,
-            &UiMsg::Text("dlg:prefs:field:count".to_string(), "5".to_string()),
+            &UiMsg::TextChanged("dlg:prefs:field:count".to_string(), "5".to_string()),
             "field:count",
             &mut st,
         );
@@ -1559,7 +1560,7 @@ mod tests {
         let mut st = StateStore::new();
         let (_, _, fx) = message(
             inst.clone(),
-            &UiMsg::Value("dlg:v:font:axis:wght".to_string(), 650.0),
+            &UiMsg::ValueChanged("dlg:v:font:axis:wght".to_string(), 650.0),
             "font:axis:wght",
             &mut st,
         );
@@ -1573,7 +1574,7 @@ mod tests {
         // Back at the default, the axis drops out of the answer.
         let (plain, _, _) = message(
             inst,
-            &UiMsg::Value("dlg:v:font:axis:wght".to_string(), 400.0),
+            &UiMsg::ValueChanged("dlg:v:font:axis:wght".to_string(), 400.0),
             "font:axis:wght",
             &mut st,
         );
@@ -1624,7 +1625,7 @@ mod tests {
         let mut st = StateStore::new();
         let (invalid, outcome, effects) = message(
             original,
-            &UiMsg::Text("dlg:c:color:css".to_string(), "#12".to_string()),
+            &UiMsg::TextChanged("dlg:c:color:css".to_string(), "#12".to_string()),
             "color:css",
             &mut st,
         );
@@ -1633,7 +1634,7 @@ mod tests {
         assert_eq!(action(invalid.clone(), "ok", &[]).1, None);
         let (valid, _, effects) = message(
             invalid,
-            &UiMsg::Text("dlg:c:color:css".to_string(), "#0000ff80".to_string()),
+            &UiMsg::TextChanged("dlg:c:color:css".to_string(), "#0000ff80".to_string()),
             "color:css",
             &mut st,
         );
@@ -1649,7 +1650,7 @@ mod tests {
         assert_eq!(
             update(
                 valid,
-                &UiMsg::Click("dlg:c:action:unknown".to_string()),
+                &UiMsg::Clicked("dlg:c:action:unknown".to_string()),
                 &mut st
             )
             .1,
@@ -1671,7 +1672,7 @@ mod tests {
         let mut st = StateStore::new();
         let (bad, _, _) = message(
             inst,
-            &UiMsg::Text("dlg:p:field:count".to_string(), "99".to_string()),
+            &UiMsg::TextChanged("dlg:p:field:count".to_string(), "99".to_string()),
             "field:count",
             &mut st,
         );
@@ -1681,7 +1682,7 @@ mod tests {
         assert!(!failed.error.is_empty());
         let (good, _, _) = message(
             failed,
-            &UiMsg::Text("dlg:p:field:count".to_string(), "7".to_string()),
+            &UiMsg::TextChanged("dlg:p:field:count".to_string(), "7".to_string()),
             "field:count",
             &mut st,
         );
@@ -1726,14 +1727,14 @@ mod tests {
         let mut st = StateStore::new();
         let (second, _, _) = message(
             inst,
-            &UiMsg::Tab("dlg:p:pages".to_string(), "1".to_string()),
+            &UiMsg::TabSelected("dlg:p:pages".to_string(), "1".to_string()),
             "pages",
             &mut st,
         );
         assert_eq!(second.page, 1);
         let (clicked, closed, fx) = message(
             second,
-            &UiMsg::Click("dlg:p:field:open".to_string()),
+            &UiMsg::Clicked("dlg:p:field:open".to_string()),
             "field:open",
             &mut st,
         );
@@ -1744,13 +1745,13 @@ mod tests {
         );
         let (changed, _, _) = message(
             clicked,
-            &UiMsg::Text("dlg:p:field:count".to_string(), "7".to_string()),
+            &UiMsg::TextChanged("dlg:p:field:count".to_string(), "7".to_string()),
             "field:count",
             &mut st,
         );
         let (reset, _, _) = message(
             changed,
-            &UiMsg::Click("dlg:p:reset:count".to_string()),
+            &UiMsg::Clicked("dlg:p:reset:count".to_string()),
             "reset:count",
             &mut st,
         );
@@ -1802,7 +1803,7 @@ mod tests {
         let mut st = StateStore::new();
         let (bad, _, _) = message(
             next.clone(),
-            &UiMsg::Text("dlg:w:field:count".to_string(), "0".to_string()),
+            &UiMsg::TextChanged("dlg:w:field:count".to_string(), "0".to_string()),
             "field:count",
             &mut st,
         );
@@ -1832,14 +1833,14 @@ mod tests {
         let mut st = StateStore::new();
         let (bad, _, _) = message(
             inst,
-            &UiMsg::Text("dlg:d:date".to_string(), "2026-02-29".to_string()),
+            &UiMsg::TextChanged("dlg:d:date".to_string(), "2026-02-29".to_string()),
             "date",
             &mut st,
         );
         assert_eq!(action(bad.clone(), "ok", &[]).1, None);
         let (good, _, _) = message(
             bad,
-            &UiMsg::Date("dlg:d:calendar".to_string(), "2026-03-01".to_string()),
+            &UiMsg::DateChanged("dlg:d:calendar".to_string(), "2026-03-01".to_string()),
             "calendar",
             &mut st,
         );
@@ -1873,7 +1874,7 @@ mod tests {
         let mut st = StateStore::new();
         let (checked, _, _) = message(
             inst,
-            &UiMsg::Toggle("dlg:find:field:regex".to_string(), true),
+            &UiMsg::Toggled("dlg:find:field:regex".to_string(), true),
             "field:regex",
             &mut st,
         );
@@ -1891,7 +1892,7 @@ mod tests {
         for (text, accepted) in [("50", true), ("2.5", false), ("101", false)] {
             let (n, _, _) = message(
                 inst.clone(),
-                &UiMsg::Text("dlg:f:field:rows".to_string(), text.to_string()),
+                &UiMsg::TextChanged("dlg:f:field:rows".to_string(), text.to_string()),
                 "field:rows",
                 &mut st,
             );

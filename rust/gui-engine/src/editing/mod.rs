@@ -103,8 +103,8 @@ pub struct EditState {
     pub preedit: String,
     /// Caret position inside the preedit, in bytes.
     pub preedit_caret: i64,
-    pub undo: Vec<Snapshot>,
-    pub redo: Vec<Snapshot>,
+    pub undo_stack: Vec<Snapshot>,
+    pub redo_stack: Vec<Snapshot>,
     pub last_kind: EditKind,
     pub last_time: i64,
     pub revision: i64,
@@ -133,8 +133,8 @@ impl Default for EditState {
             caret: 0,
             preedit: String::new(),
             preedit_caret: 0,
-            undo: vec![],
-            redo: vec![],
+            undo_stack: vec![],
+            redo_stack: vec![],
             last_kind: EditKind::default(),
             last_time: 0,
             revision: 0,
@@ -161,11 +161,11 @@ impl EditState {
     /// Bytes owned by history, including vector capacities. The live text,
     /// external application value and IME preedit are accounted separately.
     pub fn history_bytes(&self) -> usize {
-        (self.undo.capacity() + self.redo.capacity()) * size_of::<Snapshot>()
+        (self.undo_stack.capacity() + self.redo_stack.capacity()) * size_of::<Snapshot>()
             + self
-                .undo
+                .undo_stack
                 .iter()
-                .chain(&self.redo)
+                .chain(&self.redo_stack)
                 .map(|s| {
                     s.cost
                         .saturating_add(s.deltas.capacity() * size_of::<Delta>())
@@ -174,18 +174,18 @@ impl EditState {
     }
 
     fn trim_history(&mut self) {
-        while self.undo.len() + self.redo.len() > UNDO_LIMIT as usize
+        while self.undo_stack.len() + self.redo_stack.len() > UNDO_LIMIT as usize
             || self.history_bytes() > UNDO_BYTE_LIMIT
         {
-            if !self.undo.is_empty() {
-                self.undo.remove(0);
-            } else if !self.redo.is_empty() {
-                self.redo.remove(0);
+            if !self.undo_stack.is_empty() {
+                self.undo_stack.remove(0);
+            } else if !self.redo_stack.is_empty() {
+                self.redo_stack.remove(0);
             } else {
                 break;
             }
-            self.undo.shrink_to_fit();
-            self.redo.shrink_to_fit();
+            self.undo_stack.shrink_to_fit();
+            self.redo_stack.shrink_to_fit();
         }
     }
 
@@ -248,25 +248,25 @@ impl EditState {
         let continues = kind != EditKind::Other
             && kind == self.last_kind
             && now - self.last_time < GROUP_PAUSE
-            && !self.undo.is_empty();
+            && !self.undo_stack.is_empty();
         if !continues {
             if cost + size_of::<Snapshot>() <= UNDO_BYTE_LIMIT {
                 let mut snapshot = self.snapshot();
                 snapshot.cost = cost;
-                self.undo.push(snapshot);
+                self.undo_stack.push(snapshot);
             } else {
                 // An unrecorded edit is a history boundary: do not let a later
                 // undo jump across it into unrelated older text.
-                self.undo = vec![];
+                self.undo_stack = vec![];
             }
         }
-        if continues && let Some(snapshot) = self.undo.last_mut() {
+        if continues && let Some(snapshot) = self.undo_stack.last_mut() {
             snapshot.cost = snapshot
                 .cost
                 .saturating_add(cost)
                 .min(snapshot.text.owned_charge());
         }
-        self.redo = vec![];
+        self.redo_stack = vec![];
         self.trim_history();
         self.last_kind = kind;
         self.last_time = now;
@@ -306,7 +306,7 @@ impl EditState {
             removed: (b - a) as usize,
             inserted: piece.len(),
         };
-        if let Some(snapshot) = self.undo.last_mut() {
+        if let Some(snapshot) = self.undo_stack.last_mut() {
             snapshot.deltas.push(delta.clone());
         }
         self.changes = vec![delta];
@@ -485,16 +485,16 @@ impl EditState {
 
     /// Restores the text and selection before the last edit; answers whether there was one.
     pub fn undo(&mut self) -> bool {
-        let Some(prev) = self.undo.pop() else {
+        let Some(prev) = self.undo_stack.pop() else {
             return false;
         };
         if prev.cost + size_of::<Snapshot>() <= UNDO_BYTE_LIMIT {
             let mut snapshot = self.snapshot();
             snapshot.cost = prev.cost;
             snapshot.deltas = prev.deltas.clone();
-            self.redo.push(snapshot);
+            self.redo_stack.push(snapshot);
         } else {
-            self.redo = vec![];
+            self.redo_stack = vec![];
         }
         self.trim_history();
         self.changes = prev.deltas.iter().rev().map(Delta::inverse).collect();
@@ -508,16 +508,16 @@ impl EditState {
 
     /// Reapplies the last undone edit; answers whether there was one.
     pub fn redo(&mut self) -> bool {
-        let Some(next) = self.redo.pop() else {
+        let Some(next) = self.redo_stack.pop() else {
             return false;
         };
         if next.cost + size_of::<Snapshot>() <= UNDO_BYTE_LIMIT {
             let mut snapshot = self.snapshot();
             snapshot.cost = next.cost;
             snapshot.deltas = next.deltas.clone();
-            self.undo.push(snapshot);
+            self.undo_stack.push(snapshot);
         } else {
-            self.undo = vec![];
+            self.undo_stack = vec![];
         }
         self.trim_history();
         self.changes = next.deltas;
@@ -910,10 +910,10 @@ mod byte_budget_tests {
         snapshot.deltas =
             Vec::with_capacity(super::UNDO_BYTE_LIMIT / std::mem::size_of::<super::Delta>() + 1);
         assert!(crate::memory::measure(&snapshot) > super::UNDO_BYTE_LIMIT);
-        state.undo.push(snapshot);
+        state.undo_stack.push(snapshot);
         assert!(state.history_bytes() > super::UNDO_BYTE_LIMIT);
         state.trim_history();
-        assert!(state.undo.is_empty());
+        assert!(state.undo_stack.is_empty());
         state.changes = Vec::with_capacity(4096);
         let mut store = crate::widgets::state::StateStore::new();
         store

@@ -188,7 +188,7 @@ pub enum DialogRequest {
         label: String,
         initial: String,
         spec: InputSpec,
-        validate: Option<crate::Callback<dyn Fn(String) -> Validity>>,
+        validator: Option<crate::Callback<dyn Fn(String) -> Validity>>,
     },
     Color {
         id: String,
@@ -479,7 +479,7 @@ pub fn prompt(id: &str, title: &str, label: &str, initial: &str) -> DialogReques
         label: label.to_string(),
         initial: initial.to_string(),
         spec: InputSpec::Text,
-        validate: None,
+        validator: None,
     }
 }
 
@@ -499,7 +499,7 @@ pub fn choose(
         label: label.to_string(),
         initial: "".to_string(),
         spec: InputSpec::Choice(options.to_vec(), multiple),
-        validate: None,
+        validator: None,
     }
 }
 
@@ -540,7 +540,7 @@ pub fn go_to_line(id: &str, lines: i64, initial: &str) -> DialogRequest {
         label,
         initial: initial.to_string(),
         spec: InputSpec::Text,
-        validate: Some(crate::Callback::new(std::rc::Rc::new(move |text| {
+        validator: Some(crate::Callback::new(std::rc::Rc::new(move |text| {
             location_validity(&text, lines)
         }))),
     }
@@ -754,7 +754,7 @@ pub fn wizard(id: &str, title: &str, pages: &[WizardPage]) -> DialogRequest {
 /// `req` (preferences or a wizard) asking the application before a step
 /// takes effect: Apply, OK, Next or Finish sends `UiMsg::DialogCheck(id,
 /// request, step, values)` and waits, showing it is working, until
-/// `Effect::DialogChecked(id, request, error)` answers. "" lets the step
+/// `Effect::AnswerDialogCheck(id, request, error)` answers. "" lets the step
 /// proceed; an error is shown and the drafts stay for another try. Stop (or
 /// Cancel) abandons the wait, reported as `UiMsg::DialogCheckStopped`.
 pub fn checked(req: DialogRequest) -> DialogRequest {

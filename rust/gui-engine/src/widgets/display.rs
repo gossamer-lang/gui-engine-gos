@@ -157,7 +157,7 @@ pub fn paint_label(l: &Label, node: &Node, cx: &mut PaintCx) {
         };
     }
     if l.selectable {
-        let st = cx.states.edit(&l.id);
+        let st = cx.states.edit_state(&l.id);
         if st.initialized && st.has_selection() {
             let (a, b) = st.selection();
             let sel = if cx.active {
@@ -231,7 +231,7 @@ pub fn label_event(l: &Label, node: &Node, ev: &Event, st: &mut StateStore, cx: 
                 if *button == windowing::MouseButton::Left
                     && buttons::press_end(&l.id, area.contains(*x, *y), st, cx) =>
             {
-                cx.emit(&UiMsg::Click(l.id.clone()))
+                cx.emit(&UiMsg::Clicked(l.id.clone()))
             }
             Event::FocusOut | Event::CaptureLost => buttons::press_cancel(&l.id, st, cx),
             Event::PointerMove { x, y, .. } => {
@@ -239,7 +239,7 @@ pub fn label_event(l: &Label, node: &Node, ev: &Event, st: &mut StateStore, cx: 
                 buttons::press_track(&l.id, area.contains(*x, *y), st, cx)
             }
             Event::KeyDown { key, .. } if (*key == Key::Return || *key == Key::Space) => {
-                cx.emit(&UiMsg::Click(l.id.clone()));
+                cx.emit(&UiMsg::Clicked(l.id.clone()));
                 cx.consume()
             }
             _ => (),
@@ -271,7 +271,7 @@ pub fn label_event(l: &Label, node: &Node, ev: &Event, st: &mut StateStore, cx: 
             && *start >= 0
             && *end >= *start
         {
-            let mut selection = st.edit(&l.id);
+            let mut selection = st.edit_state(&l.id);
             selection.sync(&l.text);
             selection.anchor = selection.text.byte_of_scalar(*start as usize) as i64;
             selection.caret = selection.text.byte_of_scalar(*end as usize) as i64;
@@ -284,7 +284,7 @@ pub fn label_event(l: &Label, node: &Node, ev: &Event, st: &mut StateStore, cx: 
     if !l.selectable {
         return;
     }
-    let mut s = st.edit(&l.id);
+    let mut s = st.edit_state(&l.id);
     s.sync(&l.text);
     let tl = shared_label_layout(l, &cx.theme, node.rect.width);
     let ox = cx.origin_x;
@@ -711,7 +711,7 @@ pub fn badge_semantics(b: &Badge) -> Option<AccessNode> {
 /// The text layout cache is shared; this exposes edit state syncing for
 /// tests of selectable labels.
 pub fn selection_of(st: &StateStore, id: &str) -> (i64, i64) {
-    let s: EditState = st.edit(id);
+    let s: EditState = st.edit_state(id);
     s.selection()
 }
 
@@ -728,7 +728,7 @@ pub fn rich_label_semantics(
     }
     semantic.value = l.text.clone();
     semantic.multiline = l.wrap;
-    let state = states.edit(&l.id);
+    let state = states.edit_state(&l.id);
     semantic.text_start = state.anchor;
     semantic.text_end = state.caret;
     semantic.caret = state.caret;
@@ -853,7 +853,7 @@ mod tests {
     }
 
     fn link_update(mut m: Vec<String>, msg: crate::widgets::cx::UiMsg) -> Vec<String> {
-        if let crate::widgets::cx::UiMsg::Click(id) = msg {
+        if let crate::widgets::cx::UiMsg::Clicked(id) = msg {
             m.push(id)
         };
         m

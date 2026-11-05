@@ -195,7 +195,7 @@ impl Job {
             }
             Self::SyntaxLines(request) => {
                 crate::text::document_syntax::failed(request);
-                UiMsg::Worked(
+                UiMsg::WorkFinished(
                     request.owner.clone(),
                     -7,
                     request.revision,
@@ -515,7 +515,7 @@ fn run_worker(shared: &Shared, mail: &Mailbox) {
             if context.active() && last.elapsed() >= Duration::from_millis(50) {
                 let message = match job {
                     Job::Work(work) => work.message(super::work::Outcome::Progress(done, total)),
-                    _ => UiMsg::Worked(
+                    _ => UiMsg::WorkFinished(
                         job.owner().to_owned(),
                         0,
                         0,
@@ -553,7 +553,7 @@ fn run_worker(shared: &Shared, mail: &Mailbox) {
                     &mut progress,
                 );
                 if context.active()
-                    && let UiMsg::Worked(_, _, _, super::work::Outcome::Analysis(document)) =
+                    && let UiMsg::WorkFinished(_, _, _, super::work::Outcome::Analysis(document)) =
                         &result
                 {
                     let bytes = document.owned_bytes();

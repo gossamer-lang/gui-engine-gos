@@ -331,7 +331,7 @@ pub fn call(s: &mut Session, method: &str, a: &str) -> Result<String, String> {
         }
         "edit_state" => {
             let (w, id): (i64, String) = args(a)?;
-            out(window(s, w)?.states.edit(&id))
+            out(window(s, w)?.states.edit_state(&id))
         }
         "part_rect" => {
             let (w, id, part): (i64, String, i64) = args(a)?;
@@ -366,7 +366,7 @@ pub fn call(s: &mut Session, method: &str, a: &str) -> Result<String, String> {
         }
         "choice_state" => {
             let (w, id): (i64, String) = args(a)?;
-            out(window(s, w)?.states.choice(&id))
+            out(window(s, w)?.states.choice_state(&id))
         }
         "dialog_draft" => {
             let id: String = args::<(String,)>(a)?.0;

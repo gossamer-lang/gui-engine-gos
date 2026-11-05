@@ -449,9 +449,9 @@ fn activate(b: &Button, cx: &mut EventCx) {
     if !b.command.is_empty() {
         cx.run_command(&b.command)
     } else if b.toggled >= 0 {
-        cx.emit(&UiMsg::Toggle(b.id.clone(), b.toggled == 0))
+        cx.emit(&UiMsg::Toggled(b.id.clone(), b.toggled == 0))
     } else {
-        cx.emit(&UiMsg::Click(b.id.clone()))
+        cx.emit(&UiMsg::Clicked(b.id.clone()))
     }
 }
 
@@ -589,6 +589,16 @@ pub fn button_semantics(b: &Button, st: &StateStore) -> Option<AccessNode> {
     Some(n)
 }
 
+/// How a check control draws its state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum CheckKind {
+    /// A box holding a mark.
+    #[default]
+    Box,
+    /// A track with a sliding knob.
+    Switch,
+}
+
 /// A checkbox or switch.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Check {
@@ -598,7 +608,7 @@ pub struct Check {
     pub tristate: bool,
     /// Clicking a tri-state box cycles through mixed too.
     pub cycle_mixed: bool,
-    pub switch: bool,
+    pub kind: CheckKind,
 }
 
 impl Check {
@@ -609,23 +619,22 @@ impl Check {
             state,
             tristate: false,
             cycle_mixed: false,
-            switch: false,
+            kind: CheckKind::Box,
         }
     }
 }
 
-fn indicator_size(theme: &Theme, switch: bool) -> Size {
+fn indicator_size(theme: &Theme, kind: CheckKind) -> Size {
     let s = theme.indicator();
-    if switch {
-        Size::new(s * 2, s)
-    } else {
-        Size::new(s, s)
+    match kind {
+        CheckKind::Box => Size::new(s, s),
+        CheckKind::Switch => Size::new(s * 2, s),
     }
 }
 
 pub fn layout_check(k: &Check, c: Constraints, cx: &mut LayoutCx) -> Node {
     let theme = &cx.theme;
-    let ind = indicator_size(theme, k.switch);
+    let ind = indicator_size(theme, k.kind);
     let (tw, th) = layout::measure(&k.label, &theme.font(TextRole::Body));
     let gap = if k.label.is_empty() { 0 } else { theme.px(10) };
     let h = (ind.height.max(th.ceil() as i64)).max(theme.px(32));
@@ -638,7 +647,7 @@ pub fn layout_check(k: &Check, c: Constraints, cx: &mut LayoutCx) -> Node {
 pub fn paint_check(k: &Check, node: &Node, cx: &mut PaintCx) {
     let theme = cx.theme.clone();
     let r = Rect::from_size(node.size());
-    let ind = indicator_size(&theme, k.switch);
+    let ind = indicator_size(&theme, k.kind);
     let iy = (r.height - ind.height) / 2;
     let ix = if theme.rtl { r.width - ind.width } else { 0 };
     let box_r = Rect::new(ix, iy, ind.width, ind.height);
@@ -654,7 +663,7 @@ pub fn paint_check(k: &Check, node: &Node, cx: &mut PaintCx) {
     } else {
         theme.accent
     };
-    if k.switch {
+    if k.kind == CheckKind::Switch {
         let track = if on {
             accent
         } else if pressed {
@@ -744,9 +753,9 @@ fn next_state(k: &Check) -> CheckState {
 fn toggle(k: &Check, cx: &mut EventCx) {
     let next = next_state(k);
     if k.tristate {
-        cx.emit(&UiMsg::Check(k.id.clone(), next))
+        cx.emit(&UiMsg::Checked(k.id.clone(), next))
     } else {
-        cx.emit(&UiMsg::Toggle(k.id.clone(), next == CheckState::Checked))
+        cx.emit(&UiMsg::Toggled(k.id.clone(), next == CheckState::Checked))
     }
 }
 
@@ -780,7 +789,7 @@ pub fn check_event(k: &Check, node: &Node, ev: &Event, st: &mut StateStore, cx: 
 }
 
 pub fn check_semantics(k: &Check) -> Option<AccessNode> {
-    let role = if k.switch {
+    let role = if k.kind == CheckKind::Switch {
         Role::Switch
     } else {
         Role::CheckBox
@@ -1005,7 +1014,7 @@ fn option_release(
         && i < options.len() as i64
         && options[i as usize].0 != selected
     {
-        cx.emit(&UiMsg::Choose(
+        cx.emit(&UiMsg::Chosen(
             id.to_string(),
             options[i as usize].0.clone(),
         ))
@@ -1032,7 +1041,7 @@ fn choose_step(r: &RadioGroup, dir: i64, cx: &mut EventCx) {
         }
     }
     if tries <= n && r.options[i as usize].0 != r.selected {
-        cx.emit(&UiMsg::Choose(
+        cx.emit(&UiMsg::Chosen(
             r.id.clone(),
             r.options[i as usize].0.clone(),
         ))
@@ -1095,7 +1104,7 @@ pub fn radio_group_event(
                 choose_step(r, -1, cx);
                 cx.consume()
             } else if *key == Key::Space && selected_index(r) < 0 && !r.options.is_empty() {
-                cx.emit(&UiMsg::Choose(r.id.clone(), r.options[0].0.clone()));
+                cx.emit(&UiMsg::Chosen(r.id.clone(), r.options[0].0.clone()));
                 cx.consume()
             }
         }
@@ -1334,18 +1343,18 @@ mod session_tests {
     fn update(m: Model, msg: UiMsg) -> Model {
         let mut n = m;
         match msg {
-            UiMsg::Click(id) => n.log.push(format!("click {}", id)),
-            UiMsg::Toggle(id, on) => {
+            UiMsg::Clicked(id) => n.log.push(format!("click {}", id)),
+            UiMsg::Toggled(id, on) => {
                 n.log.push(format!("toggle {} {}", id, on));
                 if id == "agree" {
                     n.agree = on
                 }
             }
-            UiMsg::Check(id, state) => {
+            UiMsg::Checked(id, state) => {
                 n.log.push(format!("check {} {:?}", id, state));
                 n.all = state;
             }
-            UiMsg::Choose(id, key) => {
+            UiMsg::Chosen(id, key) => {
                 n.log.push(format!("choose {} {}", id, key));
                 if id == "size" {
                     n.size = key.to_string()
@@ -1579,7 +1588,7 @@ mod session_tests {
     fn menu_update(m: Model, msg: UiMsg) -> Model {
         let mut n = m;
         match msg {
-            UiMsg::Click(id) => n.log.push(format!("click {}", id)),
+            UiMsg::Clicked(id) => n.log.push(format!("click {}", id)),
             UiMsg::Command(id) => n.log.push(format!("command {}", id)),
             _ => (),
         }

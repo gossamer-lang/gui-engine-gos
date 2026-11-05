@@ -78,7 +78,7 @@ pub enum Outcome {
 
 impl Work {
     pub fn message(&self, outcome: Outcome) -> UiMsg {
-        UiMsg::Worked(self.owner.clone(), self.request, self.revision, outcome)
+        UiMsg::WorkFinished(self.owner.clone(), self.request, self.revision, outcome)
     }
     pub fn kind(&self) -> u64 {
         match self.operation {
@@ -452,7 +452,7 @@ mod tests {
         );
         assert_eq!(
             answer,
-            UiMsg::Worked(
+            UiMsg::WorkFinished(
                 "document".into(),
                 1,
                 7,
@@ -475,7 +475,7 @@ mod tests {
         let context = Context::standalone(Duration::from_secs(5));
         assert!(matches!(
             request.answer(&context, &mut |_, _| {}),
-            UiMsg::Worked(_, _, _, Outcome::Failed(_))
+            UiMsg::WorkFinished(_, _, _, Outcome::Failed(_))
         ));
     }
 
@@ -502,7 +502,7 @@ mod tests {
             let context = Context::standalone(Duration::from_secs(5));
             assert!(matches!(
                 request.answer(&context, &mut |_, _| {}),
-                UiMsg::Worked(_, _, _, Outcome::Cancelled)
+                UiMsg::WorkFinished(_, _, _, Outcome::Cancelled)
             ));
         }
     }
@@ -527,7 +527,7 @@ mod tests {
         assert!(changed);
         assert!(matches!(
             outcome,
-            UiMsg::Worked(_, _, _, Outcome::Cancelled)
+            UiMsg::WorkFinished(_, _, _, Outcome::Cancelled)
         ));
         assert_eq!(crate::editing::documents::info(id).unwrap().revision, 1);
     }
@@ -547,7 +547,10 @@ mod tests {
             "x".repeat(200_000),
         ))
         .answer(&context, &mut |_, _| context.cancel());
-        assert!(matches!(result, UiMsg::Worked(_, 1, 7, Outcome::Cancelled)));
+        assert!(matches!(
+            result,
+            UiMsg::WorkFinished(_, 1, 7, Outcome::Cancelled)
+        ));
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "old contents");
         assert_eq!(std::fs::read_dir(&folder).unwrap().count(), 1);
     }
@@ -561,7 +564,7 @@ mod tests {
         let context = Context::standalone(Duration::from_secs(5));
         let request = work(Operation::ReadText(path.to_string_lossy().into_owned()));
         assert!(
-            matches!(request.answer(&context,&mut |_,_|{}),UiMsg::Worked(_,_,_,Outcome::Text(_,text)) if text == "hello אבג 👩🏽‍💻")
+            matches!(request.answer(&context,&mut |_,_|{}),UiMsg::WorkFinished(_,_,_,Outcome::Text(_,text)) if text == "hello אבג 👩🏽‍💻")
         );
         std::fs::OpenOptions::new()
             .write(true)
@@ -570,7 +573,7 @@ mod tests {
             .set_len(TEXT_LIMIT as u64 + 1)
             .unwrap();
         assert!(
-            matches!(request.answer(&context,&mut |_,_|{}),UiMsg::Worked(_,_,_,Outcome::Failed(error)) if error.contains("byte budget"))
+            matches!(request.answer(&context,&mut |_,_|{}),UiMsg::WorkFinished(_,_,_,Outcome::Failed(error)) if error.contains("byte budget"))
         );
     }
     #[test]
@@ -586,7 +589,10 @@ mod tests {
             context.cancel();
         });
         assert!(progress > 0);
-        assert!(matches!(result, UiMsg::Worked(_, _, _, Outcome::Cancelled)));
+        assert!(matches!(
+            result,
+            UiMsg::WorkFinished(_, _, _, Outcome::Cancelled)
+        ));
         let context = Context::standalone(Duration::from_secs(5));
         let items: std::sync::Arc<[CompletionItem]> = (0..1024)
             .map(|i| CompletionItem::new(&i.to_string(), &format!("item {i}")))
@@ -599,6 +605,9 @@ mod tests {
             20,
         ))
         .answer(&context, &mut |_, _| context.cancel());
-        assert!(matches!(result, UiMsg::Worked(_, _, _, Outcome::Cancelled)));
+        assert!(matches!(
+            result,
+            UiMsg::WorkFinished(_, _, _, Outcome::Cancelled)
+        ));
     }
 }

@@ -129,7 +129,7 @@ pub struct Collection {
     /// Lets the pointer drag rows out: the dragged row keys (the selection,
     /// when a selected row is dragged) to the items offered. Answered by
     /// `UiMsg::DragFinished(id, operation)`.
-    pub drag: Option<crate::Callback<DragOffer>>,
+    pub drag_offer: Option<crate::Callback<DragOffer>>,
     /// Draws a list row's content (after its tree arrow and icon) as the
     /// widget it answers, in place of the label and detail. The widget is
     /// drawn only: the row keeps selection, focus, keyboard and accessibility,
@@ -157,7 +157,7 @@ impl Collection {
             empty_text: String::new(),
             rows: 0,
             tree: false,
-            drag: None,
+            drag_offer: None,
             delegate: None,
         }
     }
@@ -245,7 +245,7 @@ impl Collection {
         items: impl Fn(Vec<String>) -> Vec<windowing::DragItem> + 'static,
     ) -> Collection {
         let mut c = self;
-        c.drag = Some(crate::Callback::new(std::rc::Rc::new(items)));
+        c.drag_offer = Some(crate::Callback::new(std::rc::Rc::new(items)));
         c
     }
 
@@ -309,19 +309,19 @@ pub struct CollectionState {
     /// Pointer drag: 1 header resize, 2 header reorder, 3 a row that may be
     /// dragged out; column key; pointer start.
     pub drag_kind: i64,
-    pub drag_column: String,
+    pub dragged_column: String,
     pub drag_start: i64,
     pub drag_width: i64,
     /// The cell being edited: (row key, column key), or ("", "").
-    pub edit_row: String,
-    pub edit_column: String,
+    pub editing_row: String,
+    pub editing_column: String,
     pub last_click_key: String,
     pub last_click_time: i64,
     /// The row a press armed for dragging out, where it was pressed, and
     /// whether the press deferred selecting it to the release.
-    pub drag_row: String,
-    pub drag_row_index: i64,
-    pub drag_row_y: i64,
+    pub dragged_row: String,
+    pub dragged_row_index: i64,
+    pub dragged_row_y: i64,
     pub select_on_release: bool,
 }
 
@@ -343,16 +343,16 @@ impl Default for CollectionState {
             widths: HashMap::new(),
             order: vec![],
             drag_kind: 0,
-            drag_column: String::new(),
+            dragged_column: String::new(),
             drag_start: 0,
             drag_width: 0,
-            edit_row: String::new(),
-            edit_column: String::new(),
+            editing_row: String::new(),
+            editing_column: String::new(),
             last_click_key: String::new(),
             last_click_time: 0,
-            drag_row: String::new(),
-            drag_row_index: -1,
-            drag_row_y: 0,
+            dragged_row: String::new(),
+            dragged_row_index: -1,
+            dragged_row_y: 0,
             select_on_release: false,
         }
     }
@@ -976,11 +976,11 @@ pub fn paint_collection(c: &Collection, node: &Node, cx: &mut PaintCx) {
                     } else {
                         &String::new()
                     };
-                    let editing = s.edit_row == item.key && s.edit_column == col.key;
+                    let editing = s.editing_row == item.key && s.editing_column == col.key;
                     let cell_clip = Rect::new(cxp, ry, w - 1, h).intersect(body_clip);
                     cx.canvas.push_clip(cell_clip);
                     if editing {
-                        let e = cx.states.edit(&format!("{}#edit", c.id));
+                        let e = cx.states.edit_state(&format!("{}#edit", c.id));
                         cx.canvas.rect(cxp + 1, ry + 1, w - 3, h - 2, theme.field);
                         cx.canvas.round_rect_stroke(
                             cxp + 1,
@@ -1158,7 +1158,7 @@ fn select_index(
             };
             k += 1;
         }
-        cx.emit(&UiMsg::SelectMany(c.id.clone(), keys));
+        cx.emit(&UiMsg::SelectedMany(c.id.clone(), keys));
         return;
     }
     s.anchor = item.key.clone();
@@ -1176,11 +1176,11 @@ fn select_index(
         } else {
             next.push(item.key)
         };
-        cx.emit(&UiMsg::SelectMany(c.id.clone(), next.to_vec()))
+        cx.emit(&UiMsg::SelectedMany(c.id.clone(), next.to_vec()))
     } else if c.multiple {
-        cx.emit(&UiMsg::SelectMany(c.id.clone(), vec![item.key]))
+        cx.emit(&UiMsg::SelectedMany(c.id.clone(), vec![item.key]))
     } else if !c.selected.contains(&item.key) {
-        cx.emit(&UiMsg::Select(c.id.clone(), item.key))
+        cx.emit(&UiMsg::Selected(c.id.clone(), item.key))
     }
     cx.announce(&item.label)
 }
@@ -1205,8 +1205,8 @@ pub fn collection_event(
     let row = &c.row;
     let edit_id = format!("{}#edit", c.id);
     // An open cell editor takes text and editing keys first.
-    if !s.edit_row.is_empty() {
-        let mut e = st.edit(&edit_id);
+    if !s.editing_row.is_empty() {
+        let mut e = st.edit_state(&edit_id);
         let mut done = false;
         match ev {
             Event::Text(t) => {
@@ -1217,10 +1217,10 @@ pub fn collection_event(
             Event::KeyDown { key, mods, .. } => {
                 match key {
                     Key::Return | Key::KpEnter | Key::Tab => {
-                        cx.emit(&UiMsg::CellEdit(
+                        cx.emit(&UiMsg::CellEdited(
                             c.id.clone(),
-                            s.edit_row.clone(),
-                            s.edit_column.clone(),
+                            s.editing_row.clone(),
+                            s.editing_column.clone(),
                             e.text.to_string(),
                         ));
                         done = true;
@@ -1247,10 +1247,10 @@ pub fn collection_event(
             }
             Event::FocusOut | Event::PointerDown { .. } => {
                 // Leaving the editor commits it, before the row could move.
-                cx.emit(&UiMsg::CellEdit(
+                cx.emit(&UiMsg::CellEdited(
                     c.id.clone(),
-                    s.edit_row.clone(),
-                    s.edit_column.clone(),
+                    s.editing_row.clone(),
+                    s.editing_column.clone(),
                     e.text.to_string(),
                 ));
                 done = true;
@@ -1259,8 +1259,8 @@ pub fn collection_event(
         }
         st.set(&edit_id, WState::Edit(e));
         if done {
-            s.edit_row = String::new();
-            s.edit_column = String::new();
+            s.editing_row = String::new();
+            s.editing_column = String::new();
             st.remove(&edit_id);
             st.set(&c.id, WState::Collection(s.clone()));
             if cx.handled {
@@ -1288,7 +1288,7 @@ pub fn collection_event(
                 for (col, w) in columns_in_order(c, &s, &theme) {
                     if (lx - (cxp + w)).abs() <= theme.px(4) {
                         s.drag_kind = 1;
-                        s.drag_column = col.key;
+                        s.dragged_column = col.key;
                         s.drag_start = lx;
                         s.drag_width = w;
                         cx.capture_pointer(&c.id);
@@ -1296,7 +1296,7 @@ pub fn collection_event(
                     }
                     if lx >= cxp && lx < cxp + w {
                         s.drag_kind = 2;
-                        s.drag_column = col.key;
+                        s.dragged_column = col.key;
                         s.drag_start = lx;
                         cx.capture_pointer(&c.id);
                         break;
@@ -1324,7 +1324,7 @@ pub fn collection_event(
                 if c.tree && item.expandable {
                     let ax = theme.px(10) + item.depth * theme.px(20);
                     if lx >= ax && lx < ax + theme.px(theme.shape.small_icon + 6) {
-                        cx.emit(&UiMsg::Expand(c.id.clone(), item.key, !item.expanded));
+                        cx.emit(&UiMsg::Expanded(c.id.clone(), item.key, !item.expanded));
                         st.set(&c.id, WState::Collection(s));
                         cx.consume();
                         return;
@@ -1349,9 +1349,9 @@ pub fn collection_event(
                         }
                     }
                     if !edited {
-                        cx.emit(&UiMsg::Activate(c.id.clone(), item.key))
+                        cx.emit(&UiMsg::Activated(c.id.clone(), item.key))
                     }
-                } else if c.drag.is_some() && !item.disabled {
+                } else if c.drag_offer.is_some() && !item.disabled {
                     // Pressing a selected row keeps the selection, so all of it can be dragged.
                     let keep =
                         c.selected.contains(&item.key) && !mods.shift && !(mods.ctrl || mods.gui);
@@ -1359,10 +1359,10 @@ pub fn collection_event(
                         select_index(c, &mut s, i, mods.shift, false, mods.ctrl || mods.gui, cx)
                     };
                     s.drag_kind = 3;
-                    s.drag_row = item.key;
-                    s.drag_row_index = i;
+                    s.dragged_row = item.key;
+                    s.dragged_row_index = i;
                     s.drag_start = lx;
-                    s.drag_row_y = ly;
+                    s.dragged_row_y = ly;
                     s.select_on_release = keep;
                     cx.capture_pointer(&c.id)
                 } else {
@@ -1375,13 +1375,14 @@ pub fn collection_event(
         Event::PointerMove { x, y, pressed, .. } => {
             if *pressed && s.drag_kind == 3 {
                 let reach = theme.px(4);
-                if (x - ox - s.drag_start).abs() > reach || (y - oy - s.drag_row_y).abs() > reach {
-                    let keys = if c.selected.contains(&s.drag_row) && c.multiple {
+                if (x - ox - s.drag_start).abs() > reach || (y - oy - s.dragged_row_y).abs() > reach
+                {
+                    let keys = if c.selected.contains(&s.dragged_row) && c.multiple {
                         c.selected.clone()
                     } else {
-                        vec![s.drag_row.clone()]
+                        vec![s.dragged_row.clone()]
                     };
-                    if let Some(ref items) = c.drag {
+                    if let Some(ref items) = c.drag_offer {
                         cx.start_drag = Some((
                             c.id.clone(),
                             items(keys.to_vec()),
@@ -1396,7 +1397,7 @@ pub fn collection_event(
                 }
             } else if *pressed && s.drag_kind == 1 {
                 let w = (s.drag_width + x - ox - s.drag_start).max(theme.px(40));
-                s.widths.insert(s.drag_column.to_string(), w);
+                s.widths.insert(s.dragged_column.to_string(), w);
                 cx.redraw = true;
                 st.set(&c.id, WState::Collection(s));
                 cx.consume()
@@ -1407,28 +1408,28 @@ pub fn collection_event(
         Event::PointerUp { x, .. } => {
             if s.drag_kind == 3 && s.select_on_release {
                 // A press on a selected row that did not drag selects just that row.
-                let i = index_of_key(c, &s.drag_row, s.drag_row_index);
+                let i = index_of_key(c, &s.dragged_row, s.dragged_row_index);
                 if i >= 0 {
                     select_index(c, &mut s, i, false, false, false, cx)
                 }
             }
             if s.drag_kind == 1 {
-                let w = match s.widths.get(&s.drag_column) {
+                let w = match s.widths.get(&s.dragged_column) {
                     Some(v) => v,
                     None => &s.drag_width,
                 };
-                cx.emit(&UiMsg::ColumnResize(
+                cx.emit(&UiMsg::ColumnResized(
                     c.id.clone(),
-                    s.drag_column.clone(),
+                    s.dragged_column.clone(),
                     (*w as f64 / theme.scale) as i64,
                 ))
             } else if s.drag_kind == 2 {
                 let moved = x - ox - s.drag_start;
                 if moved.abs() < theme.px(6) {
-                    let col = &c.columns[(col_index(c, &s.drag_column)) as usize];
+                    let col = &c.columns[(col_index(c, &s.dragged_column)) as usize];
                     if col.sortable {
                         let asc = if c.sort.0 == col.key { !c.sort.1 } else { true };
-                        cx.emit(&UiMsg::Sort(c.id.clone(), col.key.clone(), asc))
+                        cx.emit(&UiMsg::SortRequested(c.id.clone(), col.key.clone(), asc))
                     }
                 } else {
                     // Drop the column at the pointer's slot.
@@ -1447,15 +1448,15 @@ pub fn collection_event(
                     }
                     order = order
                         .iter()
-                        .filter(|k| **k != s.drag_column)
+                        .filter(|k| **k != s.dragged_column)
                         .cloned()
                         .collect::<Vec<_>>();
                     let at = target.min(order.len());
-                    order.insert(at, s.drag_column.clone());
+                    order.insert(at, s.dragged_column.clone());
                     s.order = order;
-                    cx.emit(&UiMsg::Reorder(
+                    cx.emit(&UiMsg::Reordered(
                         c.id.clone(),
-                        s.drag_column.clone(),
+                        s.dragged_column.clone(),
                         at as i64,
                     ))
                 }
@@ -1513,10 +1514,10 @@ pub fn collection_event(
                         let editable = c.columns.iter().find(|col| col.editable);
                         if mods.alt || editable.is_none() {
                             if !item.disabled {
-                                cx.emit(&UiMsg::Activate(c.id.clone(), item.key))
+                                cx.emit(&UiMsg::Activated(c.id.clone(), item.key))
                             }
                         } else {
-                            cx.emit(&UiMsg::Activate(c.id.clone(), item.key))
+                            cx.emit(&UiMsg::Activated(c.id.clone(), item.key))
                         }
                     }
                     cx.consume()
@@ -1524,7 +1525,7 @@ pub fn collection_event(
                 Key::F2 => {
                     if cur >= 0 {
                         for col in &c.columns {
-                            if col.editable && s.edit_row.is_empty() {
+                            if col.editable && s.editing_row.is_empty() {
                                 start_edit(c, &mut s, st, &row(cur), &col.key);
                                 cx.redraw = true;
                             }
@@ -1543,12 +1544,12 @@ pub fn collection_event(
                         let item = row(cur);
                         if *key == fwd {
                             if item.expandable && !item.expanded {
-                                cx.emit(&UiMsg::Expand(c.id.clone(), item.key, true))
+                                cx.emit(&UiMsg::Expanded(c.id.clone(), item.key, true))
                             } else if item.expandable && cur + 1 < c.count {
                                 target = cur + 1
                             }
                         } else if item.expandable && item.expanded {
-                            cx.emit(&UiMsg::Expand(c.id.clone(), item.key, false))
+                            cx.emit(&UiMsg::Expanded(c.id.clone(), item.key, false))
                         } else {
                             // To the parent: the nearest earlier row one level up.
                             let mut p = cur - 1;
@@ -1576,7 +1577,7 @@ pub fn collection_event(
                             };
                             k += 1;
                         }
-                        cx.emit(&UiMsg::SelectMany(c.id.clone(), keys));
+                        cx.emit(&UiMsg::SelectedMany(c.id.clone(), keys));
                         cx.consume()
                     }
                 }
@@ -1650,8 +1651,8 @@ fn start_edit(
     } else {
         &item.label
     };
-    s.edit_row = item.key.clone();
-    s.edit_column = column.to_string();
+    s.editing_row = item.key.clone();
+    s.editing_column = column.to_string();
     let mut e = EditState::default();
     e.sync(text);
     e.select_all();
@@ -1749,7 +1750,7 @@ pub fn accessible(
         let column = key.substring(4, key.byte_len());
         for col in &c.columns {
             if col.key == column && col.sortable {
-                cx.emit(&UiMsg::Sort(
+                cx.emit(&UiMsg::SortRequested(
                     c.id.clone(),
                     column.to_string(),
                     if c.sort.0 == column { !c.sort.1 } else { true },
@@ -1769,7 +1770,7 @@ pub fn accessible(
     };
     if action == "toggle-expanded" {
         if item.expandable {
-            cx.emit(&UiMsg::Expand(
+            cx.emit(&UiMsg::Expanded(
                 c.id.clone(),
                 key.to_string(),
                 !item.expanded,
@@ -1782,7 +1783,7 @@ pub fn accessible(
     reveal(c, &mut state, &cx.theme, node.size(), index);
     st.set(&c.id, WState::Collection(state));
     if action == "activate" {
-        cx.emit(&UiMsg::Activate(c.id.clone(), key.to_string()))
+        cx.emit(&UiMsg::Activated(c.id.clone(), key.to_string()))
     };
     cx.redraw = true;
 }
@@ -1878,7 +1879,7 @@ mod tests {
             .filter(|k| !["k0", "k1", "k2", "k3", "k4"].contains(&k.as_str()))
             .cloned()
             .collect::<Vec<_>>();
-        log.removed(3, 5);
+        log.record_removal(3, 5);
         s = super::sync(&of_keys(&items, &log, false), s, &theme);
         assert_eq!(s.scroll_y, 8 * h + 5);
         assert_eq!(s.focus_index, 10);
@@ -1888,7 +1889,7 @@ mod tests {
             .filter(|k| *k != "k12")
             .cloned()
             .collect::<Vec<_>>();
-        log.removed(10, 1);
+        log.record_removal(10, 1);
         s = super::sync(&of_keys(&items, &log, false), s, &theme);
         assert_eq!(s.focus, "k13");
         assert_eq!(s.focus_index, 10)
@@ -1917,7 +1918,7 @@ mod tests {
             rest.push(k)
         }
         items = rest;
-        log.moved(5, 3, 27);
+        log.record_move(5, 3, 27);
         let c = of_keys(&items, &log, true);
         s = super::sync(&c, s, &theme);
         assert_eq!(s.extents_revision, log.revision);
@@ -1954,7 +1955,7 @@ mod tests {
 
     fn feed_update(m: Feed, msg: UiMsg) -> Feed {
         let mut n = m;
-        if let UiMsg::Click(id) = msg
+        if let UiMsg::Clicked(id) = msg
             && id == "arrive"
         {
             let mut grown = vec!["new0".to_string(), "new1".to_string(), "new2".to_string()];
@@ -2039,8 +2040,8 @@ mod tests {
 
     fn delegated_update(m: String, msg: UiMsg) -> String {
         match msg {
-            UiMsg::Select(_, key) => key,
-            UiMsg::Click(id) => id,
+            UiMsg::Selected(_, key) => key,
+            UiMsg::Clicked(id) => id,
             _ => m,
         }
     }
@@ -2082,7 +2083,7 @@ mod tests {
                 "{}",
                 s.semantics(0).dump()
             );
-            s.emit(&UiMsg::Click("plain".to_string()));
+            s.emit(&UiMsg::Clicked("plain".to_string()));
             s.flush().unwrap();
             assert!(
                 s.capture().unwrap().pixels != drawn.pixels,
@@ -2241,10 +2242,10 @@ mod tests {
             press_move_release(&draggable(&["k1".to_string(), "k2".to_string()]), 1, 0);
         assert!(started.is_none());
         assert!(
-            messages.contains(&UiMsg::SelectMany(
+            messages.contains(&UiMsg::SelectedMany(
                 "list".to_string(),
                 vec!["k1".to_string()]
-            )) || messages.contains(&UiMsg::Select("list".to_string(), "k1".to_string()))
+            )) || messages.contains(&UiMsg::Selected("list".to_string(), "k1".to_string()))
         )
     }
 }

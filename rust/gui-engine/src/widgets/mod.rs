@@ -163,7 +163,7 @@ pub struct Modifiers {
     pub key: String,
     pub drop_target: bool,
     /// What dragging the subtree away offers, when it is a drag source.
-    pub drag: Option<containers::DragSource>,
+    pub drag_source: Option<containers::DragSource>,
     /// Width / height ratio to keep, or 0.
     pub aspect: f64,
     /// A theme override for the subtree: a palette, density, direction.
@@ -201,7 +201,7 @@ impl Default for Modifiers {
             role: None,
             key: String::new(),
             drop_target: false,
-            drag: None,
+            drag_source: None,
             aspect: 0.0,
             theme: None,
             decorative: false,
@@ -688,7 +688,7 @@ impl Widget {
             child: Box::new(child),
             horizontal: false,
             vertical: true,
-            fit: false,
+            fits_content: false,
         })
     }
 
@@ -700,7 +700,7 @@ impl Widget {
             child: Box::new(child),
             horizontal: false,
             vertical: true,
-            fit: true,
+            fits_content: true,
         })
     }
 
@@ -711,7 +711,7 @@ impl Widget {
             child: Box::new(child),
             horizontal: true,
             vertical: false,
-            fit: false,
+            fits_content: false,
         })
     }
 
@@ -722,7 +722,7 @@ impl Widget {
             child: Box::new(child),
             horizontal: true,
             vertical: true,
-            fit: false,
+            fits_content: false,
         })
     }
 
@@ -866,7 +866,7 @@ impl Widget {
                 CheckState::Unchecked
             },
         );
-        c.switch = true;
+        c.kind = buttons::CheckKind::Switch;
         Widget::Check(c)
     }
 
@@ -1478,7 +1478,7 @@ impl Widget {
         self.decorate(|m| {
             let mut n = m;
             n.key = id.to_string();
-            n.drag = Some(containers::DragSource {
+            n.drag_source = Some(containers::DragSource {
                 items: items.to_vec(),
                 operation,
             });
@@ -1623,7 +1623,7 @@ impl Widget {
     pub fn fits_content(&self) -> bool {
         match self {
             Widget::Decorated(d) => d.child.fits_content(),
-            Widget::Scroll(s) => s.fit,
+            Widget::Scroll(s) => s.fits_content,
             _ => false,
         }
     }
@@ -2194,27 +2194,27 @@ fn accessibility_event(
                 && date.ordinal() <= c.max.ordinal()
                 && date != c.value
             {
-                cx.emit(&UiMsg::Date(id, date.iso()))
+                cx.emit(&UiMsg::DateChanged(id, date.iso()))
             }
         }
         Widget::Tabs(t) => {
             for item in &t.items {
                 if item.key == key && key != t.active {
-                    cx.emit(&UiMsg::Tab(id.clone(), key.to_string()))
+                    cx.emit(&UiMsg::TabSelected(id.clone(), key.to_string()))
                 }
             }
         }
         Widget::RadioGroup(r) => {
             for (k, _) in &r.options {
                 if k == key && !r.disabled_keys.iter().any(|d| d == key) && key != r.selected {
-                    cx.emit(&UiMsg::Choose(id.clone(), key.to_string()))
+                    cx.emit(&UiMsg::Chosen(id.clone(), key.to_string()))
                 }
             }
         }
         Widget::Segmented(s) => {
             for (k, _) in &s.options {
                 if k == key && key != s.selected {
-                    cx.emit(&UiMsg::Choose(id.clone(), key.to_string()))
+                    cx.emit(&UiMsg::Chosen(id.clone(), key.to_string()))
                 }
             }
         }
@@ -2345,7 +2345,7 @@ mod tests {
 
     fn matrix_update(m: i64, msg: UiMsg) -> i64 {
         match msg {
-            UiMsg::Click(id) => {
+            UiMsg::Clicked(id) => {
                 if id.starts_with("mode:") {
                     id.substring(5, id.byte_len()).to_i64().unwrap_or(m)
                 } else {
@@ -2683,7 +2683,7 @@ mod tests {
                 bad.description
             );
             let invalid = look(&mut s, "bad");
-            s.emit(&UiMsg::Click("mode:2".to_string()));
+            s.emit(&UiMsg::Clicked("mode:2".to_string()));
             s.flush().unwrap();
             assert!(
                 look(&mut s, "bad") != invalid,
@@ -2716,7 +2716,7 @@ mod tests {
                 "activation does not restore the active state"
             );
             // Disabled controls look different, ignore the pointer, and skip focus.
-            s.emit(&UiMsg::Click("mode:1".to_string()));
+            s.emit(&UiMsg::Clicked("mode:1".to_string()));
             s.flush().unwrap();
             for id in CONTROLS {
                 let off = look(&mut s, id);

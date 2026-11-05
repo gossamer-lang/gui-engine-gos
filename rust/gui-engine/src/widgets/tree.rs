@@ -245,7 +245,7 @@ pub fn mark_ids(root: &Widget, st: &mut StateStore) {
         st.mark(&format!("{}#edit", id))
     }
     if let Widget::TextInput(input) = root {
-        let mut edit = st.edit(&input.id);
+        let mut edit = st.edit_state(&input.id);
         if input.document == 0 {
             edit.sync(&input.text);
         } else if let Ok(current) = crate::editing::documents::state(input.document) {

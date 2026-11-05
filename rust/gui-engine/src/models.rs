@@ -79,13 +79,13 @@ impl ModelLog {
     }
 
     /// Records that the `count` items starting at `at` were removed.
-    pub fn removed(&mut self, at: i64, count: i64) {
+    pub fn record_removal(&mut self, at: i64, count: i64) {
         self.record(ModelChange::Removed(at, count))
     }
 
     /// Records that the `count` items starting at `from` now start at `to`
     /// (a position in the list without them).
-    pub fn moved(&mut self, from: i64, count: i64, to: i64) {
+    pub fn record_move(&mut self, from: i64, count: i64, to: i64) {
         self.record(ModelChange::Moved(from, count, to))
     }
 
@@ -264,8 +264,8 @@ mod tests {
     fn a_log_replays_what_came_after_a_revision_and_resets_past_its_limit() {
         let mut log = ModelLog::new();
         log.inserted(0, 2);
-        log.removed(1, 1);
-        log.moved(0, 1, 1);
+        log.record_removal(1, 1);
+        log.record_move(0, 1, 1);
         assert_eq!(log.revision, 3);
         assert_eq!(log.since(3), Some(vec![]));
         assert_eq!(

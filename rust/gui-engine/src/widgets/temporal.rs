@@ -493,7 +493,7 @@ pub fn calendar_event(c: &Calendar, n: &Node, ev: &Event, st: &mut StateStore, c
     st.set_field(&c.id, "external", &c.value.iso());
     st.set_field(&c.id, "cursor", &date.iso());
     if select && date != c.value {
-        cx.emit(&UiMsg::Date(c.id.clone(), date.iso()))
+        cx.emit(&UiMsg::DateChanged(c.id.clone(), date.iso()))
     };
     cx.redraw = true;
     cx.consume()
@@ -624,7 +624,7 @@ mod tests {
         );
         assert_eq!(
             cx.messages,
-            vec![UiMsg::Date(
+            vec![UiMsg::DateChanged(
                 "calendar".to_string(),
                 "2026-03-03".to_string()
             )]
@@ -752,7 +752,7 @@ fn input(t: &TemporalEditor) -> crate::widgets::textinput::TextInput {
     field.label = t.label.clone();
     field.max_length = 32;
     let t = t.clone();
-    field.validate = Some(crate::Callback::new(std::rc::Rc::new(move |text| {
+    field.validator = Some(crate::Callback::new(std::rc::Rc::new(move |text| {
         if t.canonical(&text).is_some() {
             return crate::editing::Validity::Valid;
         };
@@ -793,11 +793,11 @@ pub fn editor_event(
             kept.push(msg.clone())
         } else {
             match msg {
-                UiMsg::Text(id, text) | UiMsg::Submit(id, text) if *id == t.id => {
+                UiMsg::TextChanged(id, text) | UiMsg::Submitted(id, text) if *id == t.id => {
                     if let Some(value) = t.canonical(text)
                         && value != t.value
                     {
-                        kept.push(UiMsg::Date(t.id.clone(), value))
+                        kept.push(UiMsg::DateChanged(t.id.clone(), value))
                     }
                 }
                 _ => kept.push(msg.clone()),

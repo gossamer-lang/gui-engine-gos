@@ -406,7 +406,7 @@ pub fn zones(id: i64) -> Result<Vec<engine::Zone>, String> {
 const HIGHLIGHT_LIMIT: usize = 10_000;
 
 /// Highlights `spans` of terminal `id`'s buffer, replacing any it had.
-pub fn highlight(id: i64, spans: Vec<Span>) -> Result<(), String> {
+pub fn set_highlights(id: i64, spans: Vec<Span>) -> Result<(), String> {
     if spans.len() > HIGHLIGHT_LIMIT {
         return Err(format!(
             "a terminal highlights at most {HIGHLIGHT_LIMIT} stretches"

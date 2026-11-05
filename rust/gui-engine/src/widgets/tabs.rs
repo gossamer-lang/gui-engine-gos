@@ -1,7 +1,7 @@
 // tabs: a window's tab strip and the content of its active tab. The
 // application owns the tab list and which tab is active; the strip reports
 // what the user asked for and the next view shows it. Selecting reports
-// `UiMsg::Tab(id, key)`, a drag reorder reports `UiMsg::Reorder(id, key,
+// `UiMsg::TabSelected(id, key)`, a drag reorder reports `UiMsg::Reordered(id, key,
 // index)`, and every other request (close, close others, close to the
 // right, pin, unpin, move left or right, new, reopen, move to a new window)
 // reports `UiMsg::TabAction(id, key, action)`. The `gui.tab.*` commands
@@ -611,7 +611,10 @@ fn tab_at(t: &Tabs, node: &Node, lx: i64, ly: i64) -> i64 {
 
 fn select(t: &Tabs, i: i64, cx: &mut EventCx) {
     if i >= 0 && i < t.items.len() as i64 && t.items[i as usize].key != t.active {
-        cx.emit(&UiMsg::Tab(t.id.clone(), t.items[i as usize].key.clone()))
+        cx.emit(&UiMsg::TabSelected(
+            t.id.clone(),
+            t.items[i as usize].key.clone(),
+        ))
     }
 }
 
@@ -841,13 +844,13 @@ pub fn tabs_event(t: &Tabs, node: &Node, ev: &Event, st: &mut StateStore, cx: &m
                     ly < -theme.px(40) || ly > h + theme.px(40) || lx < 0 || lx >= node.rect.width;
                 if away {
                     if t.detachable {
-                        cx.emit(&UiMsg::TabDrop(t.id.clone(), key, *x, *y))
+                        cx.emit(&UiMsg::TabDropped(t.id.clone(), key, *x, *y))
                     }
                 } else {
                     let to = drop_index(t, node, lx);
                     let from = index_of(t, &key);
                     if to >= 0 && to != from {
-                        cx.emit(&UiMsg::Reorder(t.id.clone(), key, to))
+                        cx.emit(&UiMsg::Reordered(t.id.clone(), key, to))
                     }
                 }
             }

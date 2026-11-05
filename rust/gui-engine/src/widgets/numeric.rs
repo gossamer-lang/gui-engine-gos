@@ -186,7 +186,7 @@ fn spin_width(s: &SpinBox, theme: &Theme, btn: i64) -> i64 {
 }
 
 fn spin_state(s: &SpinBox, st: &StateStore) -> EditState {
-    let mut e = st.edit(&s.id);
+    let mut e = st.edit_state(&s.id);
     e.sync(&spin_text(s));
     e
 }
@@ -452,11 +452,11 @@ pub fn paint_numeric(n: &Numeric, node: &Node, cx: &mut PaintCx) {
             let hi = start + (fraction(r.high, r.min, r.max) * len as f64) as i64;
             cx.fill_round(Rect::new(start, cross - t / 2, len, t), t / 2, theme.border);
             cx.fill(Rect::new(lo, cross - t / 2, hi - lo, t), accent);
-            let active = cx.states.drag(&r.id).part;
+            let active = cx.states.drag_state(&r.id).part;
             for (i, x) in [(0, lo), (1, hi)] {
                 let a = cx.abs(Rect::new(x, cross, 0, 0));
                 cx.canvas.circle(a.x, a.y, knob, accent);
-                let fill = if cx.states.drag(&r.id).active && active == i {
+                let fill = if cx.states.drag_state(&r.id).active && active == i {
                     theme.pressed
                 } else if cx.is_hover(&r.id) {
                     theme.hover
@@ -473,7 +473,7 @@ pub fn paint_numeric(n: &Numeric, node: &Node, cx: &mut PaintCx) {
             let size = node.size();
             let rad = size.width.min(size.height) / 2 - theme.px(4);
             let c = cx.abs(Rect::new(size.width / 2, size.height / 2, 0, 0));
-            let face = if cx.states.drag(&d.id).active && !cx.disabled {
+            let face = if cx.states.drag_state(&d.id).active && !cx.disabled {
                 theme.pressed
             } else if cx.is_hover(&d.id) {
                 theme.hover
@@ -500,7 +500,7 @@ pub fn paint_numeric(n: &Numeric, node: &Node, cx: &mut PaintCx) {
 
 // The inside of a slider's thumb: pressed while dragged, lit under the pointer.
 fn thumb_fill(id: &str, cx: &PaintCx) -> crate::style::color::Color {
-    if cx.states.drag(id).active && !cx.disabled {
+    if cx.states.drag_state(id).active && !cx.disabled {
         cx.theme.pressed
     } else if cx.is_hover(id) {
         cx.theme.hover
@@ -566,7 +566,7 @@ fn commit_spin(s: &SpinBox, e: &mut EditState, st: &mut StateStore, cx: &mut Eve
             let snapped = snap(v, s.min, s.max, 0.0);
             st.set_field(&s.id, "invalid", "");
             if snapped != s.value {
-                cx.emit(&UiMsg::Value(s.id.clone(), snapped))
+                cx.emit(&UiMsg::ValueChanged(s.id.clone(), snapped))
             };
             let text = if s.suffix.is_empty() {
                 format_number(snapped, s.decimals)
@@ -613,7 +613,7 @@ fn stepped(s: &SpinBox, direction: i64) -> f64 {
 // Reports `next` unless it is the value the control already shows.
 fn report(id: &str, current: f64, next: f64, cx: &mut EventCx) {
     if next != current {
-        cx.emit(&UiMsg::Value(id.to_string(), next))
+        cx.emit(&UiMsg::ValueChanged(id.to_string(), next))
     }
 }
 
@@ -775,7 +775,7 @@ pub fn numeric_event(n: &Numeric, node: &Node, ev: &Event, st: &mut StateStore, 
                 let f2 = if theme.rtl && !s.vertical { 1.0 - f } else { f };
                 snap(s.min + f2 * (s.max - s.min), s.min, s.max, s.step)
             };
-            let mut d = st.drag(&s.id);
+            let mut d = st.drag_state(&s.id);
             match ev {
                 Event::PointerDown { x, y, button, .. } => {
                     if *button != MouseButton::Left {
@@ -786,14 +786,14 @@ pub fn numeric_event(n: &Numeric, node: &Node, ev: &Event, st: &mut StateStore, 
                     cx.capture_pointer(&s.id);
                     let v = value_at(*x, *y);
                     if v != s.value {
-                        cx.emit(&UiMsg::Value(s.id.clone(), v))
+                        cx.emit(&UiMsg::ValueChanged(s.id.clone(), v))
                     };
                     cx.consume()
                 }
                 Event::PointerMove { x, y, pressed, .. } if *pressed && d.active => {
                     let v = value_at(*x, *y);
                     if v != s.value {
-                        cx.emit(&UiMsg::Value(s.id.clone(), v))
+                        cx.emit(&UiMsg::ValueChanged(s.id.clone(), v))
                     };
                     cx.consume()
                 }
@@ -806,7 +806,7 @@ pub fn numeric_event(n: &Numeric, node: &Node, ev: &Event, st: &mut StateStore, 
                         s.value, s.min, s.max, s.step, s.page, *key, theme.rtl, s.vertical,
                     ) {
                         if v != s.value {
-                            cx.emit(&UiMsg::Value(s.id.clone(), v))
+                            cx.emit(&UiMsg::ValueChanged(s.id.clone(), v))
                         };
                         cx.consume()
                     }
@@ -818,7 +818,7 @@ pub fn numeric_event(n: &Numeric, node: &Node, ev: &Event, st: &mut StateStore, 
         Numeric::Range(r) => {
             let size = node.size();
             let (start, len, _) = track(false, size, &theme);
-            let mut d = st.drag(&r.id);
+            let mut d = st.drag_state(&r.id);
             let ox = cx.origin_x;
             let to_value = |x: i64| -> f64 {
                 let f = ((x - ox - start) as f64 / len.max(1) as f64).clamp(0.0, 1.0);
@@ -828,7 +828,7 @@ pub fn numeric_event(n: &Numeric, node: &Node, ev: &Event, st: &mut StateStore, 
                 let a = lo.min(hi);
                 let b = lo.max(hi);
                 if a != r.low || b != r.high {
-                    cx.emit(&UiMsg::Range(r.id.clone(), a, b))
+                    cx.emit(&UiMsg::RangeChanged(r.id.clone(), a, b))
                 }
             };
             match ev {
@@ -901,7 +901,7 @@ pub fn numeric_event(n: &Numeric, node: &Node, ev: &Event, st: &mut StateStore, 
         }
         Numeric::Knob(k) => {
             let size = node.size();
-            let mut d = st.drag(&k.id);
+            let mut d = st.drag_state(&k.id);
             let ox = cx.origin_x;
             let oy = cx.origin_y;
             let value_at = |x: i64, y: i64| -> f64 {
@@ -1092,9 +1092,9 @@ pub fn accessible(n: &Numeric, action: &str, text: &str, cx: &mut EventCx) {
         return;
     };
     if let Numeric::Range(s) = n {
-        cx.emit(&UiMsg::Range(s.id.clone(), next, s.high))
+        cx.emit(&UiMsg::RangeChanged(s.id.clone(), next, s.high))
     } else {
-        cx.emit(&UiMsg::Value(n.id(), next))
+        cx.emit(&UiMsg::ValueChanged(n.id(), next))
     }
 }
 
@@ -1117,7 +1117,7 @@ mod session_tests {
     fn update(m: Model, msg: UiMsg) -> Model {
         let mut n = m;
         match msg {
-            UiMsg::Value(id, v) => {
+            UiMsg::ValueChanged(id, v) => {
                 n.log.push(format!("{}={}", id, v));
                 if id == "count" {
                     n.count = v
@@ -1125,7 +1125,7 @@ mod session_tests {
                     n.angle = v
                 }
             }
-            UiMsg::Range(id, lo, hi) => {
+            UiMsg::RangeChanged(id, lo, hi) => {
                 n.log.push(format!("{}={}..{}", id, lo, hi));
                 n.low = lo;
                 n.high = hi;

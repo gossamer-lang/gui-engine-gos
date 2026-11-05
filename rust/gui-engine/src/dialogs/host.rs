@@ -843,10 +843,10 @@ fn validate_input(inst: &Instance) -> Result<Outcome, String> {
     match inst.request {
         DialogRequest::Input {
             ref spec,
-            ref validate,
+            ref validator,
             ..
         } => {
-            if let Some(v) = validate {
+            if let Some(v) = validator {
                 match v(inst.text.clone()) {
                     Validity::Valid => (),
                     Validity::Intermediate(why) | Validity::Invalid(why) => return Err(why),
@@ -914,7 +914,7 @@ pub fn update(
         return (next, outcome, fx);
     }
     match m {
-        UiMsg::Click(_) => {
+        UiMsg::Clicked(_) => {
             if part == "details" {
                 next.expanded = !next.expanded;
                 return (next, None, fx);
@@ -956,13 +956,13 @@ pub fn update(
             }
             return (n, o, fx);
         }
-        UiMsg::Text(_, text) if part == "field" => {
+        UiMsg::TextChanged(_, text) if part == "field" => {
             next.text = text.to_string();
             next.error = String::new();
             next.selected = String::new();
             return (next, None, fx);
         }
-        UiMsg::Submit(_, text) if part == "field" => {
+        UiMsg::Submitted(_, text) if part == "field" => {
             next.text = text.to_string();
             return finish_action(next, "ok", &fx);
         }
@@ -1161,7 +1161,7 @@ mod tests {
         let mut st = StateStore::new();
         let (_, save, _) = update(
             inst.clone(),
-            &UiMsg::Click("dlg:close:action:save".to_string()),
+            &UiMsg::Clicked("dlg:close:action:save".to_string()),
             &mut st,
         );
         assert_eq!(
@@ -1170,7 +1170,7 @@ mod tests {
         );
         let (_, discard, _) = update(
             inst.clone(),
-            &UiMsg::Click("dlg:close:action:discard".to_string()),
+            &UiMsg::Clicked("dlg:close:action:discard".to_string()),
             &mut st,
         );
         assert_eq!(
@@ -1179,11 +1179,15 @@ mod tests {
         );
         let (_, cancel, _) = update(
             inst.clone(),
-            &UiMsg::Click("dlg:close:action:cancel".to_string()),
+            &UiMsg::Clicked("dlg:close:action:cancel".to_string()),
             &mut st,
         );
         assert_eq!(cancel, Some(crate::dialogs::Outcome::Cancelled));
-        let (_, closed, _) = update(inst, &UiMsg::Click("dlg:close:close".to_string()), &mut st);
+        let (_, closed, _) = update(
+            inst,
+            &UiMsg::Clicked("dlg:close:close".to_string()),
+            &mut st,
+        );
         assert_eq!(closed, Some(crate::dialogs::Outcome::Cancelled))
     }
 
@@ -1248,22 +1252,26 @@ mod tests {
                 label,
                 initial,
                 spec: request::InputSpec::Number(1.0, 10.0, 1.0),
-                validate: None,
+                validator: None,
             };
         }
         let inst = Instance::new(&req, "t");
         let mut st = StateStore::new();
-        let (bad, none, _) = update(inst, &UiMsg::Click("dlg:n:action:ok".to_string()), &mut st);
+        let (bad, none, _) = update(
+            inst,
+            &UiMsg::Clicked("dlg:n:action:ok".to_string()),
+            &mut st,
+        );
         assert_eq!(none, None);
         assert!(!bad.error.is_empty());
         let (fixed, _, _) = update(
             bad,
-            &UiMsg::Text("dlg:n:field".to_string(), "7".to_string()),
+            &UiMsg::TextChanged("dlg:n:field".to_string(), "7".to_string()),
             &mut st,
         );
         let (_, ok, _) = update(
             fixed,
-            &UiMsg::Submit("dlg:n:field".to_string(), "7".to_string()),
+            &UiMsg::Submitted("dlg:n:field".to_string(), "7".to_string()),
             &mut st,
         );
         assert_eq!(ok, Some(crate::dialogs::Outcome::Text("7".to_string())))
@@ -1286,12 +1294,12 @@ mod tests {
         );
         let (typed, _, _) = update(
             one.clone(),
-            &UiMsg::Text("dlg:one:field".to_string(), "co".to_string()),
+            &UiMsg::TextChanged("dlg:one:field".to_string(), "co".to_string()),
             &mut st,
         );
         let (_, picked, _) = update(
             typed,
-            &UiMsg::Click("dlg:one:action:ok".to_string()),
+            &UiMsg::Clicked("dlg:one:action:ok".to_string()),
             &mut st,
         );
         assert_eq!(
@@ -1300,12 +1308,12 @@ mod tests {
         );
         let (nothing, _, _) = update(
             one,
-            &UiMsg::Text("dlg:one:field".to_string(), "zzz".to_string()),
+            &UiMsg::TextChanged("dlg:one:field".to_string(), "zzz".to_string()),
             &mut st,
         );
         let (unmatched, none, _) = update(
             nothing,
-            &UiMsg::Click("dlg:one:action:ok".to_string()),
+            &UiMsg::Clicked("dlg:one:action:ok".to_string()),
             &mut st,
         );
         assert_eq!(none, None);
@@ -1316,17 +1324,17 @@ mod tests {
         );
         let (a, _, _) = update(
             many,
-            &UiMsg::Toggle("dlg:many:pick:paste".to_string(), true),
+            &UiMsg::Toggled("dlg:many:pick:paste".to_string(), true),
             &mut st,
         );
         let (b, _, _) = update(
             a,
-            &UiMsg::Toggle("dlg:many:pick:cut".to_string(), true),
+            &UiMsg::Toggled("dlg:many:pick:cut".to_string(), true),
             &mut st,
         );
         let (_, both, _) = update(
             b.clone(),
-            &UiMsg::Click("dlg:many:action:ok".to_string()),
+            &UiMsg::Clicked("dlg:many:action:ok".to_string()),
             &mut st,
         );
         assert_eq!(
@@ -1338,12 +1346,12 @@ mod tests {
         );
         let (c, _, _) = update(
             b,
-            &UiMsg::Toggle("dlg:many:pick:cut".to_string(), false),
+            &UiMsg::Toggled("dlg:many:pick:cut".to_string(), false),
             &mut st,
         );
         let (_, one_left, _) = update(
             c,
-            &UiMsg::Submit("dlg:many:field".to_string(), "".to_string()),
+            &UiMsg::Submitted("dlg:many:field".to_string(), "".to_string()),
             &mut st,
         );
         assert_eq!(

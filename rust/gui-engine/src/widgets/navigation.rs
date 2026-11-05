@@ -21,7 +21,7 @@ impl Destination {
         }
     }
 }
-/// Sidebar selection reports UiMsg::Select(id, destination key).
+/// Sidebar selection reports UiMsg::Selected(id, destination key).
 pub fn sidebar(id: &str, destinations: &[Destination], selected: &str) -> Widget {
     let count = destinations.len();
     let destinations = destinations.to_vec();
@@ -43,7 +43,7 @@ pub fn sidebar(id: &str, destinations: &[Destination], selected: &str) -> Widget
     .accessible("Navigation")
 }
 /// Each ancestor is a standard keyboard button named `{id}#{key}`. The current
-/// item is readable text. Activation reports UiMsg::Click with that button id.
+/// item is readable text. Activation reports UiMsg::Clicked with that button id.
 pub fn breadcrumb(id: &str, ancestors: &[Destination], current: &str) -> Widget {
     let mut children = vec![];
     for item in ancestors {
@@ -87,7 +87,7 @@ pub fn accordion(id: &str, sections: &[(String, String, Widget)], opened: &[Stri
     Widget::column(&children, 4).key(id).role(Role::Group)
 }
 
-/// The header reports UiMsg::Toggle(id, open); the caller retains expansion.
+/// The header reports UiMsg::Toggled(id, open); the caller retains expansion.
 pub fn disclosure(id: &str, title: &str, content: Widget, opened: bool) -> Widget {
     let mut header = buttons::Button::new(id, title, buttons::ButtonKind::Flat);
     header.toggled = if opened { 1 } else { 0 };
@@ -127,7 +127,7 @@ mod session_tests {
 
     fn update(open: bool, msg: UiMsg) -> bool {
         match msg {
-            UiMsg::Toggle(id, on) => {
+            UiMsg::Toggled(id, on) => {
                 if id == "more" {
                     on
                 } else {

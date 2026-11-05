@@ -74,7 +74,7 @@ impl FindBar {
     }
 
     /// Records a search result: the number of matches and the selected one (-1 for none).
-    pub fn found(&mut self, count: i64, current: i64) {
+    pub fn set_matches(&mut self, count: i64, current: i64) {
         self.count = count.max(0);
         self.current = if current >= 0 && current < self.count {
             current
@@ -116,7 +116,7 @@ impl FindBar {
     pub fn update(&mut self, msg: &UiMsg) -> FindRequest {
         let prefix = format!("{}:", self.id);
         match msg {
-            UiMsg::Text(id, text) => {
+            UiMsg::TextChanged(id, text) => {
                 if *id == format!("{}query", prefix) {
                     if *text == self.query {
                         return FindRequest::Nothing;
@@ -129,7 +129,7 @@ impl FindBar {
                 };
                 FindRequest::Nothing
             }
-            UiMsg::Submit(id, _) => {
+            UiMsg::Submitted(id, _) => {
                 if *id == format!("{}query", prefix) {
                     FindRequest::Next
                 } else if *id == format!("{}replacement", prefix) {
@@ -138,7 +138,7 @@ impl FindBar {
                     FindRequest::Nothing
                 }
             }
-            UiMsg::Toggle(id, on) => {
+            UiMsg::Toggled(id, on) => {
                 if *id == format!("{}case", prefix) {
                     self.options.match_case = *on;
                     FindRequest::Search
@@ -149,7 +149,7 @@ impl FindBar {
                     FindRequest::Nothing
                 }
             }
-            UiMsg::Click(id) => {
+            UiMsg::Clicked(id) => {
                 if !id.starts_with(&prefix) {
                     return FindRequest::Nothing;
                 }
@@ -239,25 +239,31 @@ mod tests {
         let mut bar = FindBar::new("find");
         bar.show(true);
         assert_eq!(
-            bar.update(&UiMsg::Text("find:query".to_string(), "cat".to_string())),
+            bar.update(&UiMsg::TextChanged(
+                "find:query".to_string(),
+                "cat".to_string()
+            )),
             FindRequest::Search
         );
         assert_eq!(
-            bar.update(&UiMsg::Text("find:query".to_string(), "cat".to_string())),
+            bar.update(&UiMsg::TextChanged(
+                "find:query".to_string(),
+                "cat".to_string()
+            )),
             FindRequest::Nothing
         );
         assert_eq!(
-            bar.update(&UiMsg::Toggle("find:case".to_string(), true)),
+            bar.update(&UiMsg::Toggled("find:case".to_string(), true)),
             FindRequest::Search
         );
         assert!(bar.options.match_case);
         assert_eq!(
-            bar.update(&UiMsg::Toggle("find:word".to_string(), true)),
+            bar.update(&UiMsg::Toggled("find:word".to_string(), true)),
             FindRequest::Search
         );
         assert!(bar.options.whole_word);
         assert_eq!(
-            bar.update(&UiMsg::Text(
+            bar.update(&UiMsg::TextChanged(
                 "find:replacement".to_string(),
                 "dog".to_string()
             )),
@@ -271,30 +277,33 @@ mod tests {
         let mut bar = FindBar::new("find");
         bar.show(false);
         assert_eq!(
-            bar.update(&UiMsg::Submit("find:query".to_string(), "cat".to_string())),
+            bar.update(&UiMsg::Submitted(
+                "find:query".to_string(),
+                "cat".to_string()
+            )),
             FindRequest::Next
         );
         assert_eq!(
-            bar.update(&UiMsg::Click("find:previous".to_string())),
+            bar.update(&UiMsg::Clicked("find:previous".to_string())),
             FindRequest::Previous
         );
         assert_eq!(
-            bar.update(&UiMsg::Submit(
+            bar.update(&UiMsg::Submitted(
                 "find:replacement".to_string(),
                 "".to_string()
             )),
             FindRequest::Replace
         );
         assert_eq!(
-            bar.update(&UiMsg::Click("find:replace-all".to_string())),
+            bar.update(&UiMsg::Clicked("find:replace-all".to_string())),
             FindRequest::ReplaceAll
         );
         assert_eq!(
-            bar.update(&UiMsg::Click("other:next".to_string())),
+            bar.update(&UiMsg::Clicked("other:next".to_string())),
             FindRequest::Nothing
         );
         assert_eq!(
-            bar.update(&UiMsg::Click("find:close".to_string())),
+            bar.update(&UiMsg::Clicked("find:close".to_string())),
             FindRequest::Close
         );
         assert!(!bar.open)
@@ -305,14 +314,14 @@ mod tests {
         let mut bar = FindBar::new("find");
         assert_eq!(bar.summary(), "");
         bar.query = "x".to_string();
-        bar.found(0, 0);
+        bar.set_matches(0, 0);
         assert_eq!(bar.summary(), "No matches");
-        bar.found(5, 1);
+        bar.set_matches(5, 1);
         assert_eq!(bar.summary(), "2 of 5");
-        bar.found(5, 7);
+        bar.set_matches(5, 7);
         assert_eq!(bar.current, -1);
         assert_eq!(bar.summary(), "5 matches");
-        bar.found(1, -1);
+        bar.set_matches(1, -1);
         assert_eq!(bar.summary(), "1 match")
     }
 }

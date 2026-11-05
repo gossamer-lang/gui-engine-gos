@@ -140,25 +140,31 @@ fn toolkit_messages_fold_into_the_layout() {
     let mut layout = Layout::new(&names(&["a", "b"]));
     let strip = group_strip("dock", 1);
     assert_eq!(
-        layout.handle("dock", &UiMsg::Tab(strip.clone(), "b".into())),
+        layout.handle("dock", &UiMsg::TabSelected(strip.clone(), "b".into())),
         vec![Change::Layout]
     );
     assert!(matches!(layout.root, Node::Group { ref active, .. } if active == "b"));
-    layout.handle("dock", &UiMsg::Reorder(strip.clone(), "b".into(), 0));
+    layout.handle("dock", &UiMsg::Reordered(strip.clone(), "b".into(), 0));
     assert_eq!(layout.panes(), names(&["b", "a"]));
     let drop = Drop {
         pane: "a".into(),
         group: strip.clone(),
         zone: Zone::Bottom,
     };
-    layout.handle("dock", &UiMsg::Dock("dock".into(), drop));
+    layout.handle("dock", &UiMsg::TabDocked("dock".into(), drop));
     let Node::Split { id, axis, .. } = layout.root.clone() else {
         panic!("{layout:?}")
     };
     assert_eq!(axis, Axis::Vertical);
-    layout.handle("dock", &UiMsg::Split(format!("dock:split:{id}"), 0.999));
+    layout.handle(
+        "dock",
+        &UiMsg::SplitMoved(format!("dock:split:{id}"), 0.999),
+    );
     assert!(matches!(layout.root, Node::Split { ratio, .. } if ratio == 1.0 - MIN_RATIO));
-    let changes = layout.handle("dock", &UiMsg::TabDetach(strip.clone(), "b".into(), 30, 40));
+    let changes = layout.handle(
+        "dock",
+        &UiMsg::TabDetached(strip.clone(), "b".into(), 30, 40),
+    );
     let Some(Change::Opened(window)) = changes.last().cloned() else {
         panic!("{changes:?}")
     };
@@ -175,10 +181,14 @@ fn toolkit_messages_fold_into_the_layout() {
     let before = layout.clone();
     assert!(
         layout
-            .handle("other", &UiMsg::Tab(strip.clone(), "b".into()))
+            .handle("other", &UiMsg::TabSelected(strip.clone(), "b".into()))
             .is_empty()
     );
-    assert!(layout.handle("dock", &UiMsg::Click("x".into())).is_empty());
+    assert!(
+        layout
+            .handle("dock", &UiMsg::Clicked("x".into()))
+            .is_empty()
+    );
     assert_eq!(layout, before);
 }
 
@@ -333,7 +343,7 @@ mod session {
             let (typed, value) = (text.clone(), text.clone());
             s.set_shell(
                 move |m| {
-                    if let UiMsg::Text(id, t) = &m
+                    if let UiMsg::TextChanged(id, t) = &m
                         && id == "editor-input"
                     {
                         *typed.borrow_mut() = t.clone();
@@ -385,7 +395,7 @@ mod session {
             s.press(windowing::Key::End, windowing::Mods::default())
                 .unwrap();
             s.type_text(" kept").unwrap();
-            let caret = s.windows[0].states.edit("editor-input").caret;
+            let caret = s.windows[0].states.edit_state("editor-input").caret;
             assert_eq!(*text.borrow(), "draft kept");
             s.emit(&UiMsg::TabAction(
                 group_strip("dock", 1),
@@ -403,9 +413,13 @@ mod session {
             .unwrap();
             s.step().unwrap();
             assert_eq!(s.windows[w].theme.scale, s.windows[0].theme.scale * 2.0);
-            assert_eq!(s.windows[w].states.edit("editor-input").caret, caret);
+            assert_eq!(s.windows[w].states.edit_state("editor-input").caret, caret);
             assert_eq!(
-                s.windows[w].states.edit("editor-input").text.to_string(),
+                s.windows[w]
+                    .states
+                    .edit_state("editor-input")
+                    .text
+                    .to_string(),
                 "draft kept"
             );
             // Closing the floating window returns the pane, still with its caret.
@@ -413,7 +427,7 @@ mod session {
             s.flush().unwrap();
             assert!(layout.borrow().floating.is_empty());
             assert!(s.windows.iter().all(|w| w.key != floating));
-            assert_eq!(s.windows[0].states.edit("editor-input").caret, caret);
+            assert_eq!(s.windows[0].states.edit_state("editor-input").caret, caret);
             assert_eq!(layout.borrow().panes().len(), 3);
             s.shutdown();
         })

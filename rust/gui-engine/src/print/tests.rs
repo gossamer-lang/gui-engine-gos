@@ -533,7 +533,7 @@ mod session {
             let heard = events.clone();
             s.set_shell(
                 move |m| {
-                    if let crate::widgets::cx::UiMsg::Print(job, event) = m {
+                    if let crate::widgets::cx::UiMsg::PrintProgress(job, event) = m {
                         heard.borrow_mut().push((job, event));
                     }
                 },

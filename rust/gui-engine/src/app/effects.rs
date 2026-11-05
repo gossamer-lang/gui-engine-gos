@@ -28,7 +28,7 @@ pub enum Edge {
 #[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Effect {
     /// Runs revisioned file IO, analysis or completion on the bounded worker.
-    Work(crate::services::work::Work),
+    StartWork(crate::services::work::Work),
     CancelWork(String),
     /// Queues a message for the next update, without reentrant delivery.
     Emit(crate::widgets::cx::UiMsg),
@@ -91,17 +91,17 @@ pub enum Effect {
     /// Moves keyboard focus to the widget `id` in the main window.
     Focus(String),
     /// Moves focus inside a named window.
-    FocusIn(String, String),
+    FocusInWindow(String, String),
     SetTitle(String, String),
     /// Delivers `UiMsg::Timer(tag)` after `delay` ms (repeating when asked).
-    Timer(String, i64, bool),
+    StartTimer(String, i64, bool),
     CancelTimer(String),
     /// Answers a `UiMsg::CompletionRequest`: owner id, request id, items,
     /// and an error text ("" on success).
-    Complete(String, i64, Vec<CompletionItem>, String),
+    AnswerCompletion(String, i64, Vec<CompletionItem>, String),
     /// Answers `UiMsg::DialogCheck(id, request, ..)`: "" lets the step take
     /// effect, anything else is shown as the reason it did not.
-    DialogChecked(String, i64, String),
+    AnswerDialogCheck(String, i64, String),
     /// Reads a folder without holding up the UI; answered by
     /// `UiMsg::Listed(owner, request, listing)`.
     ListDirectory(crate::services::listing::ListRequest),
@@ -118,7 +118,7 @@ pub enum Effect {
     /// Speaks `text` through assistive technology.
     Announce(String),
     /// Shows a toast in the main window, replacing one with the same id.
-    Toast(crate::widgets::feedback::Toast),
+    ShowToast(crate::widgets::feedback::Toast),
     /// Closes the toast `id` without reporting anything.
     DismissToast(String),
     SetClipboard(String),
@@ -146,7 +146,7 @@ pub enum Effect {
     /// Installs a translation catalog and rebuilds all windows with its direction.
     SetLocale(crate::localization::Catalog),
     /// Replaces the extra application commands (beyond `App::commands`).
-    Commands(Vec<Command>),
+    SetCommands(Vec<Command>),
     /// Scrolls every scroll area so the widget `id` shows.
     ScrollTo(String),
     /// Selects UTF-8 bytes `anchor..caret` of the text input `id` in a

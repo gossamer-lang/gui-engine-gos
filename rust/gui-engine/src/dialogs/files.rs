@@ -885,7 +885,7 @@ pub fn message(
     let mut n = inst;
     let mut effects = vec![];
     match msg {
-        UiMsg::Click(_) => match part {
+        UiMsg::Clicked(_) => match part {
             "back" => n = travel(n, "back"),
             "forward" => n = travel(n, "forward"),
             "refresh" => n = load_directory(n.clone(), &value(&n, "directory"), "stay"),
@@ -984,7 +984,7 @@ pub fn message(
                 }
             }
         },
-        UiMsg::Text(_, text) => {
+        UiMsg::TextChanged(_, text) => {
             if part == "filename" {
                 n.text = text.to_string();
                 n.values.insert("overwrite".to_string(), "".to_string());
@@ -1001,7 +1001,7 @@ pub fn message(
                 n.error = "".to_string()
             }
         }
-        UiMsg::Submit(_, _) => {
+        UiMsg::Submitted(_, _) => {
             if part == "filename" {
                 return accept(n, false);
             };
@@ -1015,7 +1015,7 @@ pub fn message(
                 }
             }
         }
-        UiMsg::Toggle(_, on) if part == "hidden" => {
+        UiMsg::Toggled(_, on) if part == "hidden" => {
             n.values.insert(
                 "hidden".to_string(),
                 if *on {
@@ -1027,7 +1027,7 @@ pub fn message(
             n = load_directory(n.clone(), &value(&n, "directory"), "stay");
             n = persist(n)
         }
-        UiMsg::Select(_, key) => {
+        UiMsg::Selected(_, key) => {
             if part == "filter" {
                 n.values.insert("filter".to_string(), key.to_string());
                 return (
@@ -1041,10 +1041,10 @@ pub fn message(
                 .insert("selection".to_string(), encoded(std::slice::from_ref(key)));
             n.text = paths::file_name(key).unwrap_or(key.to_string());
         }
-        UiMsg::SelectMany(_, keys) => {
+        UiMsg::SelectedMany(_, keys) => {
             n.values.insert("selection".to_string(), encoded(keys));
         }
-        UiMsg::Activate(_, key) => {
+        UiMsg::Activated(_, key) => {
             if paths::is_dir(key) {
                 n = navigate(n, key)
             } else {
@@ -1052,11 +1052,11 @@ pub fn message(
                 return accept(n, false);
             }
         }
-        UiMsg::Choose(_, key) if part == "filter" => {
+        UiMsg::Chosen(_, key) if part == "filter" => {
             n.values.insert("filter".to_string(), key.to_string());
             n = load_directory(n.clone(), &value(&n, "directory"), "stay")
         }
-        UiMsg::Sort(_, column, ascending) if part == "entries" => {
+        UiMsg::SortRequested(_, column, ascending) if part == "entries" => {
             n.values.insert("sort".to_string(), column.to_string());
             n.values.insert(
                 "descending".to_string(),
@@ -1073,7 +1073,7 @@ pub fn message(
                 n = listed(n, *request, found)
             };
             if part == "complete" {
-                effects.push(Effect::Complete(
+                effects.push(Effect::AnswerCompletion(
                     cid(&n, "location"),
                     *request,
                     found
@@ -1138,7 +1138,7 @@ mod tests {
         assert!(!empty.error.is_empty());
         let (edited, _, _) = super::message(
             empty,
-            &UiMsg::Text("dlg:save:filename".to_string(), file.clone()),
+            &UiMsg::TextChanged("dlg:save:filename".to_string(), file.clone()),
             "filename",
             &mut st,
         );
@@ -1147,7 +1147,7 @@ mod tests {
         assert_eq!(super::value(&review, "overwrite"), file);
         let (changed, _, _) = super::message(
             review,
-            &UiMsg::Text("dlg:save:filename".to_string(), format!("{}.new", file)),
+            &UiMsg::TextChanged("dlg:save:filename".to_string(), format!("{}.new", file)),
             "filename",
             &mut st,
         );
@@ -1180,7 +1180,7 @@ mod tests {
         let mut st = StateStore::new();
         let (updated, _, _) = super::message(
             inst,
-            &UiMsg::Select("dlg:filter:filter".to_string(), "1".to_string()),
+            &UiMsg::Selected("dlg:filter:filter".to_string(), "1".to_string()),
             "filter",
             &mut st,
         );
@@ -1233,7 +1233,7 @@ mod tests {
         let mut st = StateStore::new();
         let (shown, _, _) = super::message(
             inst,
-            &UiMsg::Toggle("dlg:nav:hidden".to_string(), true),
+            &UiMsg::Toggled("dlg:nav:hidden".to_string(), true),
             "hidden",
             &mut st,
         );
@@ -1326,7 +1326,7 @@ mod tests {
         let mut st = StateStore::new();
         let (sorted, _, _) = super::message(
             inst,
-            &UiMsg::Sort("dlg:sort:entries".to_string(), "size".to_string(), true),
+            &UiMsg::SortRequested("dlg:sort:entries".to_string(), "size".to_string(), true),
             "entries",
             &mut st,
         );
@@ -1390,7 +1390,7 @@ mod tests {
                 answers = out;
             }
         }
-        let Some(Effect::Complete(owner, request, items, error)) = answers.first() else {
+        let Some(Effect::AnswerCompletion(owner, request, items, error)) = answers.first() else {
             panic!("no completion answer");
         };
         assert_eq!(owner, "dlg:pick:location");
@@ -1423,7 +1423,7 @@ mod tests {
         let mut st = StateStore::new();
         let (updated, _, _) = super::message(
             inst,
-            &UiMsg::SelectMany("dlg:many:entries".to_string(), paths.clone()),
+            &UiMsg::SelectedMany("dlg:many:entries".to_string(), paths.clone()),
             "entries",
             &mut st,
         );

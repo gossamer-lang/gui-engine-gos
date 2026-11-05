@@ -304,7 +304,7 @@ mod tests {
                 "dev.gossamer.gui-inspector-test",
                 || 0,
                 |m: i64, msg: UiMsg| {
-                    if msg == UiMsg::Click("go".to_string()) {
+                    if msg == UiMsg::Clicked("go".to_string()) {
                         m + 1
                     } else {
                         m

@@ -26,8 +26,8 @@ pub(crate) fn state(document: i64, block: i64, mut cached: EditState) -> Result<
         cached.anchor = cached.text.snap(cached.anchor.max(0) as usize) as i64;
         cached.caret = cached.text.snap(cached.caret.max(0) as usize) as i64;
     }
-    cached.undo.clear();
-    cached.redo.clear();
+    cached.undo_stack.clear();
+    cached.redo_stack.clear();
     cached.document = 0;
     cached.initialized = true;
     cached.revision = info.revision;

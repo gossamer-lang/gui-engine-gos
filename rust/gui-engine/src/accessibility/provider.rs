@@ -557,7 +557,7 @@ mod tests {
         );
         assert_eq!(
             cx.messages,
-            vec![UiMsg::Choose("r".to_string(), "b".to_string())]
+            vec![UiMsg::Chosen("r".to_string(), "b".to_string())]
         );
         cx.messages = vec![];
         let slider = Widget::slider("s", 5.0, 0.0, 10.0, 1.0);
@@ -586,7 +586,7 @@ mod tests {
             &mut st,
             &mut cx,
         );
-        assert_eq!(cx.messages, vec![UiMsg::Value("s".to_string(), 7.0)]);
+        assert_eq!(cx.messages, vec![UiMsg::ValueChanged("s".to_string(), 7.0)]);
         assert_eq!(
             super::text_segment("aé🙂 word", 5, 1),
             Some(("word".to_string(), 4, 8))

@@ -93,7 +93,7 @@ fn present(items: &[CompletionItem], key: &str) -> bool {
 /// Reconciles an open choice with its source while preserving selection and query.
 pub fn sync_model(ch: &Choice, st: &mut StateStore) {
     let id = ch.id();
-    let mut cs = st.choice(&id);
+    let mut cs = st.choice_state(&id);
     if !cs.open {
         return;
     };
@@ -117,7 +117,7 @@ pub fn sync_model(ch: &Choice, st: &mut StateStore) {
     cs.set_shared_items(ready);
     cs.loading = loading;
     cs.error = error;
-    let at = cs.highlight_index();
+    let at = cs.highlighted_index();
     let rows = cs.visible_rows();
     cs.first = cs.first.min((cs.items.len() as i64 - rows).max(0));
     if at >= 0 {
@@ -263,7 +263,7 @@ pub fn paint_choice(ch: &Choice, node: &Node, cx: &mut PaintCx) {
     let body = theme.font(TextRole::Body);
     match ch {
         Choice::One(s) => {
-            let st = cx.states.choice(&s.id);
+            let st = cx.states.choice_state(&s.id);
             field_frame(cx, &s.id, r, st.open);
             let label = label_of(&s.items, &s.selected);
             let shown = if label.is_empty() {
@@ -303,7 +303,7 @@ pub fn paint_choice(ch: &Choice, node: &Node, cx: &mut PaintCx) {
             }
         }
         Choice::Pick(p) => {
-            let st = cx.states.choice(&p.id);
+            let st = cx.states.choice_state(&p.id);
             field_frame(cx, &p.id, r, st.open);
             let small = theme.font(TextRole::Small);
             let focus_token = cx.states.field(&p.id, "token", "-1").to_i64().unwrap_or(-1);
@@ -403,7 +403,7 @@ pub fn paint_choice(ch: &Choice, node: &Node, cx: &mut PaintCx) {
             }
         }
         Choice::Commands(p) => {
-            let st = cx.states.choice(&p.id);
+            let st = cx.states.choice_state(&p.id);
             let h = theme.control_height();
             let field = Rect::new(0, 0, r.width, h);
             cx.fill_round(field, theme.radius(), theme.field);
@@ -465,8 +465,8 @@ pub fn paint_choice(ch: &Choice, node: &Node, cx: &mut PaintCx) {
             let items = palette_items(&cx.registry, &st.filter);
             let mut shown_state = st;
             shown_state.items = items.clone().into();
-            if shown_state.highlight_index() < 0 && !items.is_empty() {
-                shown_state.highlight = items[0].key.clone()
+            if shown_state.highlighted_index() < 0 && !items.is_empty() {
+                shown_state.highlighted = items[0].key.clone()
             };
             completion::paint_list(
                 &shown_state,
@@ -509,20 +509,20 @@ fn open_list(
     cx: &mut EventCx,
     filterable: bool,
 ) {
-    let mut s = st.choice(id);
+    let mut s = st.choice_state(id);
     s.open = true;
     s.rollback = highlight.to_string();
     s.filter = "".to_string();
     s.set_items(items);
     if present(items, highlight) {
-        s.highlight = highlight.to_string()
+        s.highlighted = highlight.to_string()
     };
     let anchor = cx.to_window(Rect::new(0, 0, node.rect.width, node.rect.height));
     let mut size = completion::list_size(&s, &cx.theme, node.rect.width);
     if filterable {
         size.height += cx.theme.control_height()
     };
-    let idx = s.highlight_index().max(0);
+    let idx = s.highlighted_index().max(0);
     s.first = (idx - VISIBLE_ROWS / 2)
         .max(0)
         .min((items.len() as i64 - VISIBLE_ROWS).max(0));
@@ -538,7 +538,7 @@ fn open_list(
 }
 
 fn close_list(id: &str, st: &mut StateStore, cx: &mut EventCx) {
-    let mut s = st.choice(id);
+    let mut s = st.choice_state(id);
     if !s.open {
         return;
     };
@@ -550,7 +550,7 @@ fn close_list(id: &str, st: &mut StateStore, cx: &mut EventCx) {
 }
 
 fn select_event(s: &Select, node: &Node, ev: &Event, st: &mut StateStore, cx: &mut EventCx) {
-    let mut cs = st.choice(&s.id);
+    let mut cs = st.choice_state(&s.id);
     match ev {
         Event::PointerDown { button, .. } => {
             if *button != MouseButton::Left {
@@ -570,7 +570,7 @@ fn select_event(s: &Select, node: &Node, ev: &Event, st: &mut StateStore, cx: &m
                     Key::Return | Key::Space | Key::KpEnter => {
                         if let Some(it) = cs.current() {
                             if it.key != s.selected {
-                                cx.emit(&UiMsg::Select(s.id.clone(), it.key))
+                                cx.emit(&UiMsg::Selected(s.id.clone(), it.key))
                             };
                             cx.announce(&crate::localization::message(
                                 "choices",
@@ -621,7 +621,7 @@ fn select_event(s: &Select, node: &Node, ev: &Event, st: &mut StateStore, cx: &m
                 let mut temp = cs;
                 temp.set_items(&s.items);
                 if present(&s.items, &s.selected) {
-                    temp.highlight = s.selected.clone();
+                    temp.highlighted = s.selected.clone();
                     if *key == Key::Home || *key == Key::End {
                         temp.highlight_edge(*key == Key::End, VISIBLE_ROWS)
                     } else {
@@ -639,7 +639,7 @@ fn select_event(s: &Select, node: &Node, ev: &Event, st: &mut StateStore, cx: &m
                 if let Some(it) = temp.current()
                     && it.key != s.selected
                 {
-                    cx.emit(&UiMsg::Select(s.id.clone(), it.key))
+                    cx.emit(&UiMsg::Selected(s.id.clone(), it.key))
                 }
                 cx.consume()
             }
@@ -650,10 +650,10 @@ fn select_event(s: &Select, node: &Node, ev: &Event, st: &mut StateStore, cx: &m
             if !cs.open {
                 temp.set_items(&s.items);
                 if present(&s.items, &s.selected) {
-                    temp.highlight = s.selected.clone()
+                    temp.highlighted = s.selected.clone()
                 }
             }
-            if let Some(key) = temp.typeahead_key(t, cx.now, 900) {
+            if let Some(key) = temp.type_ahead(t, cx.now, 900) {
                 if cs.open {
                     st.set(&s.id, WState::Choice(temp));
                     cx.redraw = true;
@@ -663,7 +663,7 @@ fn select_event(s: &Select, node: &Node, ev: &Event, st: &mut StateStore, cx: &m
                     kept.typeahead_time = temp.typeahead_time;
                     st.set(&s.id, WState::Choice(kept));
                     if key != s.selected {
-                        cx.emit(&UiMsg::Select(s.id.clone(), key))
+                        cx.emit(&UiMsg::Selected(s.id.clone(), key))
                     }
                 }
             } else {
@@ -683,7 +683,7 @@ fn select_event(s: &Select, node: &Node, ev: &Event, st: &mut StateStore, cx: &m
 /// Records the rows the open list of `ch` shows where the session placed it.
 pub fn list_placed(ch: &Choice, rect: Rect, st: &mut StateStore, theme: &Theme) {
     let id = ch.id();
-    let mut cs = st.choice(&id);
+    let mut cs = st.choice_state(&id);
     let list = match ch {
         Choice::Pick(_) => picker_list_rect(rect, theme),
         _ => rect,
@@ -721,14 +721,14 @@ fn toggle_key(p: &Picker, key: &str, cx: &mut EventCx) {
                 &crate::hmap! { "item" => label_of(&p.items, key) },
             ))
         }
-        cx.emit(&UiMsg::SelectMany(p.id.clone(), next.to_vec()))
+        cx.emit(&UiMsg::SelectedMany(p.id.clone(), next.to_vec()))
     } else if p.selected.is_empty() || p.selected[0] != key {
-        cx.emit(&UiMsg::Select(p.id.clone(), key.to_string()))
+        cx.emit(&UiMsg::Selected(p.id.clone(), key.to_string()))
     }
 }
 
 fn picker_event(p: &Picker, node: &Node, ev: &Event, st: &mut StateStore, cx: &mut EventCx) {
-    let mut cs = st.choice(&p.id);
+    let mut cs = st.choice_state(&p.id);
     let token = st.field(&p.id, "token", "-1").to_i64().unwrap_or(-1);
     match ev {
         Event::PointerDown { x, y, button, .. } => {
@@ -772,7 +772,7 @@ fn picker_event(p: &Picker, node: &Node, ev: &Event, st: &mut StateStore, cx: &m
                     p.selected[0].clone()
                 };
                 open_list(&p.id, node, &picker_items(p, ""), &hl, st, cx, true);
-                cs = st.choice(&p.id);
+                cs = st.choice_state(&p.id);
             }
             cs.filter += t;
             cs.set_items(&picker_items(p, &cs.filter));
@@ -905,11 +905,11 @@ fn picker_event(p: &Picker, node: &Node, ev: &Event, st: &mut StateStore, cx: &m
 }
 
 fn palette_event(p: &Palette, node: &Node, ev: &Event, st: &mut StateStore, cx: &mut EventCx) {
-    let mut cs = st.choice(&p.id);
+    let mut cs = st.choice_state(&p.id);
     let items = palette_items(&cx.registry, &cs.filter);
     cs.items = items.clone().into();
-    if cs.highlight_index() < 0 && !items.is_empty() {
-        cs.highlight = items[0].key.clone()
+    if cs.highlighted_index() < 0 && !items.is_empty() {
+        cs.highlighted = items[0].key.clone()
     };
     let h = cx.theme.control_height();
     let list = cx.to_window(Rect::new(
@@ -926,7 +926,7 @@ fn palette_event(p: &Palette, node: &Node, ev: &Event, st: &mut StateStore, cx: 
             cx.focus_on(&p.id);
             let key = completion::list_hit(&cs, list, &cx.theme, *x, *y);
             if !key.is_empty() {
-                cs.highlight = key;
+                cs.highlighted = key;
                 if let Some(it) = cs.current() {
                     cx.run_command(&it.key)
                 }
@@ -944,7 +944,7 @@ fn palette_event(p: &Palette, node: &Node, ev: &Event, st: &mut StateStore, cx: 
                 if let Some(it) = cs.current() {
                     cx.run_command(&it.key);
                     cs.filter = "".to_string();
-                } else if let Some(it) = cs.items.iter().find(|i| i.key == cs.highlight) {
+                } else if let Some(it) = cs.items.iter().find(|i| i.key == cs.highlighted) {
                     cx.announce(&crate::localization::message(
                         "choices",
                         "{item} is unavailable",
@@ -1004,7 +1004,7 @@ pub fn choice_popup_paint(ch: &Choice, rect: Rect, cx: &mut PaintCx) {
     let theme = cx.theme.clone();
     match ch {
         Choice::One(s) => {
-            let mut cs = cx.states.choice(&s.id);
+            let mut cs = cx.states.choice_state(&s.id);
             cs.loading = s.loading;
             cs.error = s.error.clone();
             completion::paint_list(
@@ -1016,7 +1016,7 @@ pub fn choice_popup_paint(ch: &Choice, rect: Rect, cx: &mut PaintCx) {
             )
         }
         Choice::Pick(p) => {
-            let cs = cx.states.choice(&p.id);
+            let cs = cx.states.choice_state(&p.id);
             let h = theme.control_height();
             cx.canvas
                 .round_rect(rect.x, rect.y, rect.width, h, theme.radius(), theme.field);
@@ -1083,7 +1083,7 @@ pub fn choice_popup_paint(ch: &Choice, rect: Rect, cx: &mut PaintCx) {
                             list.x + theme.px(12),
                             y + (row - theme.px(theme.shape.field_icon)) / 2,
                             theme.px(theme.shape.field_icon),
-                            if marked.items[i as usize].key == marked.highlight {
+                            if marked.items[i as usize].key == marked.highlighted {
                                 theme.selection_text
                             } else {
                                 theme.text
@@ -1107,7 +1107,7 @@ pub fn choice_popup_event(
 ) {
     sync_model(ch, st);
     let id = ch.id();
-    let mut cs = st.choice(&id);
+    let mut cs = st.choice_state(&id);
     let list = match ch {
         Choice::Pick(_) => picker_list_rect(rect, &cx.theme),
         _ => rect,
@@ -1115,8 +1115,8 @@ pub fn choice_popup_event(
     match ev {
         Event::PointerMove { x, y, .. } => {
             let key = completion::list_hit(&cs, list, &cx.theme, *x, *y);
-            if !key.is_empty() && key != cs.highlight {
-                cs.highlight = key;
+            if !key.is_empty() && key != cs.highlighted {
+                cs.highlighted = key;
                 st.set(&id, WState::Choice(cs));
                 cx.redraw = true;
             }
@@ -1124,13 +1124,13 @@ pub fn choice_popup_event(
         Event::PointerUp { x, y, .. } => {
             let key = completion::list_hit(&cs, list, &cx.theme, *x, *y);
             if !key.is_empty() {
-                cs.highlight = key;
+                cs.highlighted = key;
                 st.set(&id, WState::Choice(cs.clone()));
                 if let Some(it) = cs.current() {
                     match ch {
                         Choice::One(s) => {
                             if it.key != s.selected {
-                                cx.emit(&UiMsg::Select(s.id.clone(), it.key))
+                                cx.emit(&UiMsg::Selected(s.id.clone(), it.key))
                             };
                             close_list(&s.id, st, cx)
                         }
@@ -1170,7 +1170,7 @@ pub fn accessible(ch: &Choice, key: &str, action: &str, cx: &mut EventCx) {
                 && s.items.iter().any(|it| it.key == key && !it.disabled)
                 && key != s.selected
             {
-                cx.emit(&UiMsg::Select(s.id.clone(), key.to_string()))
+                cx.emit(&UiMsg::Selected(s.id.clone(), key.to_string()))
             }
         }
         Choice::Pick(p) => {
@@ -1190,7 +1190,7 @@ pub fn choice_semantics(ch: &Choice, node: &Node, st: &StateStore) -> Option<Acc
         Choice::One(s) => {
             let mut n = AccessNode::control(Role::ComboBox, &s.id, &s.label, "open");
             n.value = label_of(&s.items, &s.selected);
-            let cs = st.choice(&s.id);
+            let cs = st.choice_state(&s.id);
             n.expanded = if cs.open { 1 } else { 0 };
             if cs.open {
                 n.children.push(completion::list_semantics(
@@ -1217,7 +1217,7 @@ pub fn choice_semantics(ch: &Choice, node: &Node, st: &StateStore) -> Option<Acc
                 .map(|k| label_of(&p.items, k))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let cs = st.choice(&p.id);
+            let cs = st.choice_state(&p.id);
             n.expanded = if cs.open { 1 } else { 0 };
             for (i, key) in p.selected.iter().enumerate() {
                 let label = label_of(&p.items, key);
@@ -1246,7 +1246,7 @@ pub fn choice_semantics(ch: &Choice, node: &Node, st: &StateStore) -> Option<Acc
                 &crate::localization::tr("Command search"),
                 "focus",
             );
-            let cs = st.choice(&p.id);
+            let cs = st.choice_state(&p.id);
             n.value = cs.filter;
             n.description = crate::localization::message(
                 "choices",
@@ -1305,30 +1305,30 @@ mod tests {
             error: "".to_string(),
         };
         super::sync_model(&super::Choice::Pick(p.clone()), &mut store);
-        assert_eq!(store.choice("p").highlight, "a");
+        assert_eq!(store.choice_state("p").highlighted, "a");
         p.items = vec![p.items[1].clone()].into();
         super::sync_model(&super::Choice::Pick(p.clone()), &mut store);
-        assert_eq!(store.choice("p").highlight, "b");
-        assert_eq!(store.choice("p").filter, "dup");
+        assert_eq!(store.choice_state("p").highlighted, "b");
+        assert_eq!(store.choice_state("p").filter, "dup");
         let mut changed = p.items.to_vec();
         changed[0].disabled = true;
         p.items = changed.into();
         super::sync_model(&super::Choice::Pick(p.clone()), &mut store);
-        assert!(store.choice("p").current().is_none());
+        assert!(store.choice_state("p").current().is_none());
         let mut changed = p.items.to_vec();
         changed[0].disabled = false;
         p.items = changed.into();
         p.loading = true;
         super::sync_model(&super::Choice::Pick(p.clone()), &mut store);
-        assert!(store.choice("p").items.is_empty());
-        assert!(store.choice("p").loading);
+        assert!(store.choice_state("p").items.is_empty());
+        assert!(store.choice_state("p").loading);
         p.loading = false;
         p.error = "Unavailable".to_string();
         super::sync_model(&super::Choice::Pick(p.clone()), &mut store);
-        assert!(store.choice("p").current().is_none());
+        assert!(store.choice_state("p").current().is_none());
         p.error = "".to_string();
         super::sync_model(&super::Choice::Pick(p.clone()), &mut store);
-        assert_eq!(store.choice("p").highlight, "b");
+        assert_eq!(store.choice_state("p").highlighted, "b");
         assert_eq!(p.selected, vec!["missing"])
     }
 
@@ -1410,7 +1410,7 @@ mod session_tests {
                 )
             };
             let update = |revision: i64, msg: UiMsg| match msg {
-                UiMsg::Click(id) if id == "change" => revision + 1,
+                UiMsg::Clicked(id) if id == "change" => revision + 1,
                 _ => revision,
             };
             let mut s = crate::application(
@@ -1423,14 +1423,14 @@ mod session_tests {
             .size(420, 280)
             .start()
             .unwrap();
-            s.emit(&UiMsg::Click("change".to_string()));
-            s.emit(&UiMsg::Click("change".to_string()));
+            s.emit(&UiMsg::Clicked("change".to_string()));
+            s.emit(&UiMsg::Clicked("change".to_string()));
             s.flush().unwrap();
             assert!(s.focus("many").unwrap());
             s.type_text("Dup").unwrap();
-            s.emit(&UiMsg::Click("change".to_string()));
+            s.emit(&UiMsg::Clicked("change".to_string()));
             s.flush().unwrap();
-            let empty = s.windows[0].states.choice("many");
+            let empty = s.windows[0].states.choice_state("many");
             assert_eq!(empty.filter, "Dup");
             assert!(empty.items.is_empty());
             s.press(Key::Down, Mods::default()).unwrap();
@@ -1450,17 +1450,17 @@ mod session_tests {
     fn update(m: Picks, msg: UiMsg) -> Picks {
         let mut n = m;
         match msg {
-            UiMsg::Select(id, key) => {
+            UiMsg::Selected(id, key) => {
                 n.log.push(format!("{}={}", id, key));
                 if id == "fruit" {
                     n.fruit = key.to_string()
                 }
             }
-            UiMsg::SelectMany(id, keys) => {
+            UiMsg::SelectedMany(id, keys) => {
                 n.log.push(format!("{}={}", id, keys.join(",")));
                 n.tags = keys.to_vec();
             }
-            UiMsg::Text(id, text) if id == "city" => n.city = text.to_string(),
+            UiMsg::TextChanged(id, text) if id == "city" => n.city = text.to_string(),
             _ => (),
         }
         n
@@ -1681,7 +1681,7 @@ mod session_tests {
             UiMsg::CompletionRequest(_, request, query, _) => {
                 n.requests.push((request, query.to_string()))
             }
-            UiMsg::Text(id, text) if id == "q" => n.text = text.to_string(),
+            UiMsg::TextChanged(id, text) if id == "q" => n.text = text.to_string(),
             _ => (),
         }
         n
@@ -1729,13 +1729,13 @@ mod session_tests {
                 s.semantics(0).dump()
             );
             // The answer to the newer query arrives first; the older one is late.
-            crate::perform(crate::app::effects::Effect::Complete(
+            crate::perform(crate::app::effects::Effect::AnswerCompletion(
                 "q".to_string(),
                 2,
                 Widget::items(&[("paris".to_string(), "Paris".to_string())]),
                 "".to_string(),
             ));
-            crate::perform(crate::app::effects::Effect::Complete(
+            crate::perform(crate::app::effects::Effect::AnswerCompletion(
                 "q".to_string(),
                 1,
                 Widget::items(&[("prague".to_string(), "Prague".to_string())]),
@@ -1753,7 +1753,7 @@ mod session_tests {
             primary_select_all(&mut s);
             s.type_text("r").unwrap();
             s.advance(10).unwrap();
-            crate::perform(crate::app::effects::Effect::Complete(
+            crate::perform(crate::app::effects::Effect::AnswerCompletion(
                 "q".to_string(),
                 4,
                 vec![],
@@ -1890,9 +1890,9 @@ mod session_tests {
     fn owner_update(m: Owner, msg: UiMsg) -> Owner {
         let mut n = m;
         match msg {
-            UiMsg::Click(id) if id == "toggle" => n.hidden = !n.hidden,
-            UiMsg::Select(id, key) => n.log.push(format!("{}={}", id, key)),
-            UiMsg::Text(id, text) if id == "q" => n.text = text.to_string(),
+            UiMsg::Clicked(id) if id == "toggle" => n.hidden = !n.hidden,
+            UiMsg::Selected(id, key) => n.log.push(format!("{}={}", id, key)),
+            UiMsg::TextChanged(id, text) if id == "q" => n.text = text.to_string(),
             UiMsg::CompletionRequest(_, request, query, _) => {
                 n.log.push(format!("asked {} {}", request, query))
             }
@@ -1946,7 +1946,7 @@ mod session_tests {
             );
             // The select goes away while its list is open: the popup closes with
             // it, focus leaves it, and keys reach nothing that was there.
-            s.emit(&UiMsg::Click("toggle".to_string()));
+            s.emit(&UiMsg::Clicked("toggle".to_string()));
             s.flush().unwrap();
             assert!(s.popup_owners().is_empty(), "{:?}", s.popup_owners());
             assert!(s.focused() != "fruit", "{}", s.focused());
@@ -1954,7 +1954,7 @@ mod session_tests {
             press(&mut s, Key::Down);
             assert_eq!(log(&s), "");
             // Shown again, it starts closed with nothing browsed.
-            s.emit(&UiMsg::Click("toggle".to_string()));
+            s.emit(&UiMsg::Clicked("toggle".to_string()));
             s.flush().unwrap();
             assert!(s.focus("fruit").unwrap());
             press(&mut s, Key::Return);
@@ -1966,9 +1966,9 @@ mod session_tests {
             s.type_text("p").unwrap();
             s.advance(10).unwrap();
             assert!(log(&s).ends_with("asked 1 p"), "{}", log(&s));
-            s.emit(&UiMsg::Click("toggle".to_string()));
+            s.emit(&UiMsg::Clicked("toggle".to_string()));
             s.flush().unwrap();
-            crate::perform(crate::app::effects::Effect::Complete(
+            crate::perform(crate::app::effects::Effect::AnswerCompletion(
                 "q".to_string(),
                 1,
                 Widget::items(&[("paris".to_string(), "Paris".to_string())]),
@@ -1976,7 +1976,7 @@ mod session_tests {
             ));
             s.flush().unwrap();
             assert!(s.popup_owners().is_empty(), "{:?}", s.popup_owners());
-            s.emit(&UiMsg::Click("toggle".to_string()));
+            s.emit(&UiMsg::Clicked("toggle".to_string()));
             s.flush().unwrap();
             assert!(s.focus("q").unwrap());
             press(&mut s, Key::Down);

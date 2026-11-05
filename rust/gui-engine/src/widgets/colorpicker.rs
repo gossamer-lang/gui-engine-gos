@@ -47,7 +47,7 @@ impl ColorPicker {
         let part = id.substring(prefix.byte_len(), id.byte_len());
         let mut color = self.value;
         match msg {
-            UiMsg::Text(_, text) if part == "css" => {
+            UiMsg::TextChanged(_, text) if part == "css" => {
                 self.draft = text.to_string();
                 match crate::style::color::parse(text) {
                     CssColor::Valid(c) => color = c,
@@ -61,7 +61,7 @@ impl ColorPicker {
                     }
                 }
             }
-            UiMsg::Value(_, v) => {
+            UiMsg::ValueChanged(_, v) => {
                 let (_, s, val) = color.hsv_parts();
                 let (_, hs, l) = color.hsl_parts();
                 match part {
@@ -91,7 +91,7 @@ impl ColorPicker {
                 self.hue = h;
                 color = Color::hsv(h, s, v).with_alpha(color.a as i64);
             }
-            UiMsg::Click(_) if part == "original" => color = self.original,
+            UiMsg::Clicked(_) if part == "original" => color = self.original,
             _ => return None,
         }
         if !self.alpha {
@@ -374,7 +374,7 @@ pub fn wheel_event(w: ColorWheel, n: &Node, ev: &Event, st: &mut StateStore, cx:
     let side = n.size().width.min(n.size().height).max(1) as f64;
     let mut h = w.hue;
     let (_, mut s, mut v) = w.value.hsv_parts();
-    let mut active = st.drag(&w.id);
+    let mut active = st.drag_state(&w.id);
     match ev {
         Event::CaptureLost | Event::FocusOut => {
             active.active = false;
@@ -557,28 +557,34 @@ mod tests {
     fn css_drafts_alpha_hue_and_no_duplicate_preview() {
         let mut picker = ColorPicker::new("c", Color::red());
         assert_eq!(
-            picker.update(&UiMsg::Text("c:css".to_string(), "#12".to_string())),
+            picker.update(&UiMsg::TextChanged("c:css".to_string(), "#12".to_string())),
             None
         );
         assert_eq!(picker.value, Color::red());
         assert!(!picker.error.is_empty());
         assert_eq!(
-            picker.update(&UiMsg::Text(
+            picker.update(&UiMsg::TextChanged(
                 "c:css".to_string(),
                 "rgba(0, 0, 255, 0.5)".to_string()
             )),
             Some(Color::rgba(0, 0, 255, 128))
         );
         assert_eq!(
-            picker.update(&UiMsg::Text("c:css".to_string(), "#0000ff80".to_string())),
+            picker.update(&UiMsg::TextChanged(
+                "c:css".to_string(),
+                "#0000ff80".to_string()
+            )),
             None
         );
-        picker.update(&UiMsg::Value("c:v".to_string(), 0.0));
-        picker.update(&UiMsg::Value("c:h".to_string(), 120.0));
-        picker.update(&UiMsg::Value("c:v".to_string(), 100.0));
+        picker.update(&UiMsg::ValueChanged("c:v".to_string(), 0.0));
+        picker.update(&UiMsg::ValueChanged("c:h".to_string(), 120.0));
+        picker.update(&UiMsg::ValueChanged("c:v".to_string(), 100.0));
         assert_eq!(picker.hue, 120.0);
         picker.alpha = false;
-        picker.update(&UiMsg::Text("c:css".to_string(), "transparent".to_string()));
+        picker.update(&UiMsg::TextChanged(
+            "c:css".to_string(),
+            "transparent".to_string(),
+        ));
         assert_eq!(picker.value.a, 255);
         assert_eq!(picker.original, Color::red())
     }

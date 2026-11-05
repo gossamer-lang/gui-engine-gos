@@ -145,7 +145,7 @@ pub fn toast(id: &str, text: &str, action: (String, String)) -> Widget {
 }
 
 /// A short message over the window's bottom edge, opened with
-/// `Effect::Toast`. It closes after `duration` ms (the time pauses while the
+/// `Effect::ShowToast`. It closes after `duration` ms (the time pauses while the
 /// pointer or focus is on it), reporting `Click(id:timeout)`, or through its
 /// action (`Click(id:action)`) or Dismiss (`Click(id:dismiss)`).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -585,7 +585,7 @@ pub fn feedback_event(
                 cx.release_pointer();
                 let i = button_at(node, n as i64, x - cx.origin_x, y - cx.origin_y);
                 if i >= 0 && held == format!("{}", i) {
-                    cx.emit(&UiMsg::Click(buttons[i as usize].clone()))
+                    cx.emit(&UiMsg::Clicked(buttons[i as usize].clone()))
                 };
                 cx.consume()
             }
@@ -630,10 +630,10 @@ pub fn feedback_event(
                 cx.redraw = true;
                 cx.consume()
             } else if *key == Key::Return || *key == Key::KpEnter || *key == Key::Space {
-                cx.emit(&UiMsg::Click(buttons[current as usize].clone()));
+                cx.emit(&UiMsg::Clicked(buttons[current as usize].clone()));
                 cx.consume()
             } else if (*key == Key::Escape || *key == Key::Delete) && *dismissible {
-                cx.emit(&UiMsg::Click(format!("{}:dismiss", id)));
+                cx.emit(&UiMsg::Clicked(format!("{}:dismiss", id)));
                 cx.consume()
             }
         }
@@ -740,7 +740,7 @@ pub fn accessible(f: &Feedback, target: &str, action: &str, cx: &mut EventCx) {
             .iter()
             .any(|t| t == target)
     {
-        cx.emit(&UiMsg::Click(target.to_string()))
+        cx.emit(&UiMsg::Clicked(target.to_string()))
     }
 }
 
@@ -859,7 +859,7 @@ mod tests {
 
     fn log_update(m: Log, msg: UiMsg) -> Log {
         let mut n = m;
-        if let UiMsg::Click(id) = msg {
+        if let UiMsg::Clicked(id) = msg {
             n.clicks.push(id.to_string())
         };
         n
@@ -1005,7 +1005,7 @@ mod tests {
     }
 
     fn show(t: &super::Toast) {
-        crate::perform(crate::app::effects::Effect::Toast(t.clone()))
+        crate::perform(crate::app::effects::Effect::ShowToast(t.clone()))
     }
 
     #[test]

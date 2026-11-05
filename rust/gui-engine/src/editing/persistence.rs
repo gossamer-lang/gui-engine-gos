@@ -202,10 +202,10 @@ pub fn save(
         out.number(u64::from(state.follow_caret))?;
         let mut undo = Vec::new();
         let mut bytes = 0usize;
-        for position in (0..state.undo.len()).rev() {
-            let old = &state.undo[position];
+        for position in (0..state.undo_stack.len()).rev() {
+            let old = &state.undo_stack[position];
             let next = state
-                .undo
+                .undo_stack
                 .get(position + 1)
                 .map_or(&state.text, |snapshot| &snapshot.text);
             let patch = patch(&old.text, next, old.anchor, old.caret, context)?;
@@ -222,7 +222,7 @@ pub fn save(
         }
         let mut redo = Vec::new();
         let mut previous = &state.text;
-        for next in state.redo.iter().rev() {
+        for next in state.redo_stack.iter().rev() {
             let patch = patch(previous, &next.text, next.anchor, next.caret, context)?;
             bytes = bytes.saturating_add(patch.removed.len() + patch.inserted.len() + 128 * 1024);
             if bytes > UNDO_BYTE_LIMIT {
@@ -345,7 +345,7 @@ pub fn restore(
                 .saturating_mul(4)
                 .saturating_add(128 * 1024)
                 .min(before.owned_charge());
-            state.undo.push(Snapshot {
+            state.undo_stack.push(Snapshot {
                 text: before.snapshot(),
                 anchor: patch.anchor,
                 caret: patch.caret,
@@ -357,7 +357,7 @@ pub fn restore(
                 }],
             });
         }
-        state.undo.reverse();
+        state.undo_stack.reverse();
         let redo = input.number()?;
         if undo + redo > UNDO_LIMIT as u64 {
             return Err("checkpoint history count exceeds budget".into());
@@ -371,7 +371,7 @@ pub fn restore(
                 .saturating_mul(4)
                 .saturating_add(128 * 1024)
                 .min(after.owned_charge());
-            state.redo.push(Snapshot {
+            state.redo_stack.push(Snapshot {
                 text: after.snapshot(),
                 anchor: patch.anchor,
                 caret: patch.caret,
@@ -383,12 +383,12 @@ pub fn restore(
                 }],
             });
         }
-        state.redo.reverse();
+        state.redo_stack.reverse();
         state.trim_history();
         let saved = state
-            .undo
+            .undo_stack
             .iter()
-            .chain(&state.redo)
+            .chain(&state.redo_stack)
             .map(|snapshot| &snapshot.text)
             .chain(std::iter::once(&state.text))
             .find(|text| *text == &saved)

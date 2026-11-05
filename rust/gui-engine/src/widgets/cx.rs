@@ -200,7 +200,8 @@ pub enum CheckState {
     Mixed,
 }
 
-/// The result of background work started with `Effect::Task`.
+/// How a task an effect started ended, delivered as `UiMsg::Task` (`Effect::LaunchApp`,
+/// `Effect::RegisterHotkey`, `Effect::Notify`, and others).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum TaskOutcome {
     Done(String),
@@ -217,7 +218,7 @@ pub enum UiMsg {
     RichLink(String, String),
     RichChanged(String, i64, i64),
     /// A tab was dropped on a group of dock `id`, beside an edge or among its tabs.
-    Dock(String, crate::dock::Drop),
+    TabDocked(String, crate::dock::Drop),
     /// Media player `id` changed state or moved on while playing.
     Media(i64, crate::media::Status),
     /// Image viewer `id` finished, failed or cancelled a load.
@@ -227,66 +228,66 @@ pub enum UiMsg {
     /// A point of chart widget `id` was clicked.
     ChartPoint(String, crate::chart::Hit),
     /// Print or export job `id` progressed, finished, failed or was cancelled.
-    Print(i64, crate::print::job::Event),
+    PrintProgress(i64, crate::print::job::Event),
     /// Terminal `id`'s program set a title, rang the bell, or ended.
     Terminal(i64, crate::terminal::Event),
     /// A button, link, or menu item was activated.
-    Click(String),
+    Clicked(String),
     /// A checkbox, switch, or toggle button changed.
-    Toggle(String, bool),
+    Toggled(String, bool),
     /// A tri-state checkbox changed.
-    Check(String, CheckState),
+    Checked(String, CheckState),
     /// A radio group (or segmented control) chose the item `key`.
-    Choose(String, String),
+    Chosen(String, String),
     /// A text input's text changed.
-    Text(String, String),
+    TextChanged(String, String),
     /// A text input's selection moved: id, anchor and caret as UTF-8 byte
     /// offsets on grapheme boundaries (equal when nothing is selected).
-    Caret(String, i64, i64),
+    CaretMoved(String, i64, i64),
     /// Enter was pressed in a single-line text input.
-    Submit(String, String),
+    Submitted(String, String),
     /// A single-selection control selected `key` ("" for none).
-    Select(String, String),
+    Selected(String, String),
     /// A multi-selection control's selected keys, in selection order.
-    SelectMany(String, Vec<String>),
+    SelectedMany(String, Vec<String>),
     /// A numeric control's value.
-    Value(String, f64),
+    ValueChanged(String, f64),
     /// A range control's low and high values.
-    Range(String, f64, f64),
+    RangeChanged(String, f64, f64),
     /// A color control's color.
-    Color(String, Color),
+    ColorChanged(String, Color),
     /// A date control's ISO-8601 date (`YYYY-MM-DD`), time (`HH:MM:SS`),
     /// or duration in seconds as text.
-    Date(String, String),
+    DateChanged(String, String),
     /// A tab container switched to the tab `key`.
-    Tab(String, String),
+    TabSelected(String, String),
     /// A tab strip asked for an action on the tab `key` ("" for none):
     /// "new", "reopen", "close", "close-others", "close-right", "pin",
     /// "unpin", "move-left", "move-right", or "detach".
     TabAction(String, String, String),
     /// A captured pointer drop in source-window pixels, resolved by the session.
-    TabDrop(String, String, i64, i64),
+    TabDropped(String, String, i64, i64),
     /// A page dropped into another compatible strip at an insertion index.
-    TabMove(String, String, String, i64),
+    TabMoved(String, String, String, i64),
     /// A detached page and its requested logical desktop placement.
-    TabDetach(String, String, i64, i64),
+    TabDetached(String, String, i64, i64),
     /// A page dropped onto another window of the session away from any strip
     /// it could join: the strip, the page, and the window under the drop.
-    TabToWindow(String, String, String),
+    TabMovedToWindow(String, String, String),
     /// A tree item or expander opened (`true`) or closed.
-    Expand(String, String, bool),
+    Expanded(String, String, bool),
     /// A collection item was activated (double-click or Enter).
-    Activate(String, String),
+    Activated(String, String),
     /// A table cell edit was committed: id, row key, column key, text.
-    CellEdit(String, String, String, String),
+    CellEdited(String, String, String, String),
     /// A table header asked to sort by `column`, ascending when true.
-    Sort(String, String, bool),
+    SortRequested(String, String, bool),
     /// A table's column widths changed: id, column key, new width units.
-    ColumnResize(String, String, i64),
+    ColumnResized(String, String, i64),
     /// Items were reordered by dragging: id, moved key, new index.
-    Reorder(String, String, i64),
+    Reordered(String, String, i64),
     /// A split pane's divider moved to `ratio`.
-    Split(String, f64),
+    SplitMoved(String, f64),
     /// A command fired from a menu, toolbar, palette, or shortcut.
     Command(String),
     /// A drag started by `Effect::StartDrag` ended: its id and the operation
@@ -295,8 +296,8 @@ pub enum UiMsg {
     DragFinished(String, Option<windowing::DragOperation>),
     /// The desktop asked the application to open `path`: a file opened with
     /// it, or the files of a later launch of a single-instance application.
-    Open(String),
-    OpenUri(String),
+    OpenRequested(String),
+    OpenUriRequested(String),
     /// A later launch of a single-instance application that forwards its
     /// command line: the folder it ran in and its arguments.
     CommandLine(String, Vec<String>),
@@ -311,14 +312,14 @@ pub enum UiMsg {
     DialogApplied(String, Outcome),
     /// A checked dialog asks before a step ("apply", "ok", "next" or
     /// "finish") takes effect: dialog id, request, step, and the values;
-    /// answer with `Effect::DialogChecked`.
+    /// answer with `Effect::AnswerDialogCheck`.
     DialogCheck(String, i64, String, Outcome),
     /// The user stopped waiting for a check: dialog id and request.
     DialogCheckStopped(String, i64),
     /// Background work finished.
     Task(String, TaskOutcome),
     /// A revisioned file, analysis or completion job result.
-    Worked(String, i64, i64, crate::services::work::Outcome),
+    WorkFinished(String, i64, i64, crate::services::work::Outcome),
     /// Answers `Effect::ListDirectory`: owner, request, and what was found.
     Listed(String, i64, crate::services::listing::Listing),
     /// Answers `Effect::LoadFonts`: the installed-font catalog, for
@@ -333,14 +334,14 @@ pub enum UiMsg {
     /// The user asked to close the window; the application decides.
     CloseRequested(String),
     /// The window gained (true) or lost keyboard focus.
-    WindowFocus(String, bool),
+    WindowFocusChanged(String, bool),
     /// The user resized a window docked with `Effect::DockTop`: its width
     /// and height as fractions of its display's usable area.
     DockResized(String, f64, f64),
     /// Files were dropped on the widget `id`.
     Dropped(String, Vec<String>),
     /// A completion provider of `id` needs results for `query`
-    /// (request id, query, revision); answer with `Effect::Complete`.
+    /// (request id, query, revision); answer with `Effect::AnswerCompletion`.
     CompletionRequest(String, i64, String, i64),
     /// A custom widget's message.
     Custom(String, String),

@@ -569,7 +569,7 @@ pub struct Scroll {
     pub horizontal: bool,
     pub vertical: bool,
     /// As tall as the content, up to the height offered, instead of filling it.
-    pub fit: bool,
+    pub fits_content: bool,
 }
 
 /// Scrollbar thickness, pixels.
@@ -598,7 +598,7 @@ pub fn layout_scroll(s: &Scroll, c: Constraints, cx: &mut LayoutCx) -> Node {
     };
     let height = if s.vertical {
         if c.has_bounded_height() {
-            if s.fit {
+            if s.fits_content {
                 content.height.min(c.max_height)
             } else {
                 c.max_height
@@ -677,7 +677,7 @@ pub fn paint_scroll(s: &Scroll, node: &Node, cx: &mut PaintCx) {
     cx.canvas.pop_clip(saved);
     let st = clamp_scroll(cx.states.scroll(&s.id), node.content, node.size());
     let b = bar(&cx.theme);
-    let color = if st.drag >= 0 {
+    let color = if st.drag_offset >= 0 {
         cx.theme.text_muted
     } else {
         cx.theme.border_strong.with_alpha(160)
@@ -736,7 +736,7 @@ pub fn scroll_event(s: &Scroll, node: &Node, ev: &Event, st: &mut StateStore, cx
             let ht = h_thumb(node, state, b);
             if !vt.is_empty() && lx >= node.rect.width - b {
                 if vt.contains(lx, ly) {
-                    state.drag = ly - vt.y;
+                    state.drag_offset = ly - vt.y;
                 } else {
                     // Clicking the track pages toward the pointer.
                     state.y += if ly < vt.y {
@@ -744,43 +744,43 @@ pub fn scroll_event(s: &Scroll, node: &Node, ev: &Event, st: &mut StateStore, cx
                     } else {
                         node.rect.height
                     };
-                    state.drag = -1;
+                    state.drag_offset = -1;
                 }
                 state.drag_horizontal = false;
                 cx.capture_pointer(&s.id);
                 cx.consume()
             } else if !ht.is_empty() && ly >= node.rect.height - b {
                 if ht.contains(lx, ly) {
-                    state.drag = lx - ht.x;
+                    state.drag_offset = lx - ht.x;
                 } else {
                     state.x += if lx < ht.x {
                         -node.rect.width
                     } else {
                         node.rect.width
                     };
-                    state.drag = -1;
+                    state.drag_offset = -1;
                 }
                 state.drag_horizontal = true;
                 cx.capture_pointer(&s.id);
                 cx.consume()
             }
         }
-        Event::PointerMove { x, y, pressed, .. } if *pressed && state.drag >= 0 => {
+        Event::PointerMove { x, y, pressed, .. } if *pressed && state.drag_offset >= 0 => {
             if state.drag_horizontal {
                 let ht = h_thumb(node, state, b);
                 let track = node.rect.width - ht.width;
-                let pos = local_x(*x) - state.drag;
+                let pos = local_x(*x) - state.drag_offset;
                 state.x = pos * (node.content.width - node.rect.width) / track.max(1);
             } else {
                 let vt = v_thumb(node, state, b);
                 let track = node.rect.height - vt.height;
-                let pos = local_y(*y) - state.drag;
+                let pos = local_y(*y) - state.drag_offset;
                 state.y = pos * (node.content.height - node.rect.height) / track.max(1);
             }
             cx.consume()
         }
-        Event::PointerUp { .. } if (state.drag >= 0 || cx.capture.is_some()) => {
-            state.drag = -1;
+        Event::PointerUp { .. } if (state.drag_offset >= 0 || cx.capture.is_some()) => {
+            state.drag_offset = -1;
             cx.release_pointer()
         }
         Event::KeyDown { key, mods, .. } => {
@@ -864,7 +864,7 @@ pub struct Split {
 }
 
 fn split_ratio(s: &Split, st: &StateStore) -> f64 {
-    let d = st.drag(&s.id);
+    let d = st.drag_state(&s.id);
     if d.active { d.start_value } else { s.ratio }
 }
 
@@ -933,7 +933,7 @@ pub fn paint_split(s: &Split, node: &Node, cx: &mut PaintCx) {
         return;
     }
     let h = node.parts[0];
-    let lit = cx.is_hover(&s.id) || cx.states.drag(&s.id).active;
+    let lit = cx.is_hover(&s.id) || cx.states.drag_state(&s.id).active;
     let color = if lit {
         cx.theme.accent
     } else {
@@ -956,7 +956,7 @@ pub fn split_event(s: &Split, node: &Node, ev: &Event, st: &mut StateStore, cx: 
     }
     let handle = node.parts[0];
     let horizontal = s.axis == Axis::Horizontal;
-    let mut d = st.drag(&s.id);
+    let mut d = st.drag_state(&s.id);
     let total = if horizontal {
         node.rect.width
     } else {
@@ -988,14 +988,14 @@ pub fn split_event(s: &Split, node: &Node, ev: &Event, st: &mut StateStore, cx: 
             if *pressed && d.active {
                 let pos = if horizontal { lx } else { ly };
                 d.start_value = (pos as f64 / avail as f64).clamp(0.0, 1.0);
-                cx.emit(&UiMsg::Split(s.id.clone(), d.start_value));
+                cx.emit(&UiMsg::SplitMoved(s.id.clone(), d.start_value));
                 cx.consume()
             }
         }
         Event::PointerUp { .. } if d.active => {
             d.active = false;
             cx.release_pointer();
-            cx.emit(&UiMsg::Split(s.id.clone(), d.start_value))
+            cx.emit(&UiMsg::SplitMoved(s.id.clone(), d.start_value))
         }
         Event::KeyDown { key, .. } if cx.is_focused(&s.id) => {
             let step = if (horizontal && *key == Key::Left) || (!horizontal && *key == Key::Up) {
@@ -1006,7 +1006,7 @@ pub fn split_event(s: &Split, node: &Node, ev: &Event, st: &mut StateStore, cx: 
                 0.0
             };
             if step != 0.0 {
-                cx.emit(&UiMsg::Split(
+                cx.emit(&UiMsg::SplitMoved(
                     s.id.clone(),
                     (s.ratio + step).clamp(0.0, 1.0),
                 ));
@@ -1228,7 +1228,7 @@ pub fn decorated_event(
     if m.key.is_empty() {
         return;
     }
-    if let Some(ref source) = m.drag {
+    if let Some(ref source) = m.drag_source {
         drag_source_event(&m.key, source, ev, st, cx)
     }
     match ev {

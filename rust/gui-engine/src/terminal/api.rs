@@ -93,7 +93,7 @@ pub fn call(method: &str, id: i64, text: &str) -> Result<String, String> {
         "zones" => Answer::Zones(super::zones(id)?),
         "highlight" => {
             let spans: Vec<Span> = args(text)?;
-            super::highlight(id, spans)?;
+            super::set_highlights(id, spans)?;
             Answer::Done
         }
         "copy" => Answer::Text(super::copy(id)?),

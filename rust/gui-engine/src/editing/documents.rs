@@ -546,7 +546,7 @@ pub fn replace_many(
             inserted: replacement.len(),
         });
     }
-    if let Some(snapshot) = state.undo.last_mut() {
+    if let Some(snapshot) = state.undo_stack.last_mut() {
         snapshot.deltas = state.changes.clone();
     }
     state.trim_history();
@@ -690,7 +690,7 @@ mod tests {
             assert_eq!(resolve(id, anchor).unwrap().byte, expected);
         }
         let state = state(id).unwrap();
-        assert!(!state.undo.is_empty());
+        assert!(!state.undo_stack.is_empty());
         assert!(state.history_bytes() >= 100_000 * std::mem::size_of::<super::super::Delta>());
         assert!(state.history_bytes() <= super::super::UNDO_BYTE_LIMIT);
         assert!(

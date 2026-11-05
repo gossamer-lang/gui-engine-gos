@@ -1796,7 +1796,7 @@ impl Session {
                 }
             }
             windowing::Event::OpenRequested { path } => {
-                self.pending.push(UiMsg::Open(path.to_string()))
+                self.pending.push(UiMsg::OpenRequested(path.to_string()))
             }
             windowing::Event::LowMemory => {
                 crate::text::layout::purge_caches();
@@ -1966,7 +1966,7 @@ impl Session {
                 let w = self.find_native(*window);
                 if w >= 0 {
                     let key = self.windows[w as usize].key.clone();
-                    self.pending.push(UiMsg::WindowFocus(key, true));
+                    self.pending.push(UiMsg::WindowFocusChanged(key, true));
                     self.windows[w as usize].active = true;
                     self.windows[w as usize].focused_once = true;
                     self.windows[w as usize].caret_on = true;
@@ -1978,7 +1978,7 @@ impl Session {
                 let w = self.find_native(*window);
                 if w >= 0 {
                     let key = self.windows[w as usize].key.clone();
-                    self.pending.push(UiMsg::WindowFocus(key, false));
+                    self.pending.push(UiMsg::WindowFocusChanged(key, false));
                     // Interrupted input clears press, capture, and pending chords.
                     self.windows[w as usize].active = false;
                     self.windows[w as usize].pressed = String::new();
@@ -2682,7 +2682,7 @@ impl Session {
                 let target =
                     host::accelerated(&self.windows[w as usize].dialogs[dialog as usize], &letter);
                 if !target.is_empty() {
-                    self.pending.push(UiMsg::Click(target));
+                    self.pending.push(UiMsg::Clicked(target));
                     return Ok(());
                 }
             }
@@ -3061,7 +3061,7 @@ impl Session {
             return;
         };
         for m in &cx.messages {
-            if let UiMsg::TabDrop(strip, key, x, y) = m {
+            if let UiMsg::TabDropped(strip, key, x, y) = m {
                 self.tab_drop(w, strip, key, *x, *y);
                 continue;
             };
@@ -3159,7 +3159,7 @@ impl Session {
         if win.grow_base > 0
             && win
                 .states
-                .choice(&format!("{}#completion", req.owner))
+                .choice_state(&format!("{}#completion", req.owner))
                 .loading
             && let Some(previous) = win
                 .popups
@@ -3454,7 +3454,7 @@ impl Session {
                     again.deadline = now + TOAST_RECHECK_MS;
                     self.timers.push(again)
                 } else if self.close_toast(w, id) {
-                    self.pending.push(UiMsg::Click(format!("{}:timeout", id)));
+                    self.pending.push(UiMsg::Clicked(format!("{}:timeout", id)));
                     self.rebuild(w)
                 }
                 continue;
@@ -3560,7 +3560,7 @@ impl Session {
             }
             if matches!(
                 &m,
-                UiMsg::Worked(_, _, _, crate::services::work::Outcome::RichImageLoaded(..))
+                UiMsg::WorkFinished(_, _, _, crate::services::work::Outcome::RichImageLoaded(..))
             ) {
                 for window in &mut self.windows {
                     window.dirty = true;
@@ -3590,7 +3590,7 @@ impl Session {
                 crate::text::fonts::catalog_failed();
             }
 
-            if let UiMsg::Worked(owner, request, revision, outcome) = &m {
+            if let UiMsg::WorkFinished(owner, request, revision, outcome) = &m {
                 if let crate::services::work::Outcome::RichImported(record) = outcome {
                     record.adopt();
                 }
@@ -3609,7 +3609,7 @@ impl Session {
                 if let Some((items, error)) = items {
                     for w in 0..self.windows.len() {
                         let mut state = self.take_states(w as i64);
-                        if state.edit(owner).revision == *revision
+                        if state.edit_state(owner).revision == *revision
                             && textinput::deliver(&mut state, owner, *request, items, error)
                         {
                             self.windows[w].dirty = true;
@@ -3622,7 +3622,7 @@ impl Session {
                 continue;
             }
             // A toast's action or Dismiss closes it before the application hears it.
-            if let UiMsg::Click(ref id) = m {
+            if let UiMsg::Clicked(ref id) = m {
                 let mut w = 0;
                 while w < self.windows.len() {
                     let toasts: Vec<String> = self.windows[w]
@@ -3863,7 +3863,7 @@ impl Session {
     }
 
     /// Serves `listener`'s single-instance requests: opened files arrive as
-    /// `UiMsg::Open`, activation raises the main window. A request wakes the
+    /// `UiMsg::OpenRequested`, activation raises the main window. A request wakes the
     /// session's loop, and `shutdown` gives up the claim.
     pub fn serve_instance(&mut self, listener: windowing::instance::Listener) {
         listener.wake_with(self.waker());
@@ -3901,9 +3901,9 @@ impl Session {
             windowing::instance::Request::Open { uris } => {
                 for uri in uris {
                     if let Some(path) = windowing::instance::uri_path(&uri) {
-                        self.pending.push(UiMsg::Open(path))
+                        self.pending.push(UiMsg::OpenRequested(path))
                     } else {
-                        self.pending.push(UiMsg::OpenUri(uri))
+                        self.pending.push(UiMsg::OpenUriRequested(uri))
                     }
                 }
                 if !self.windows.is_empty() {
@@ -4101,7 +4101,7 @@ impl Session {
                         self.log_line(&format!("fullscreen unavailable: {}", e))
                     }
                 }
-                Effect::FocusIn(window, id) => {
+                Effect::FocusInWindow(window, id) => {
                     let w = self.find(&window);
                     if w >= 0 {
                         self.layout(w);
@@ -4121,7 +4121,7 @@ impl Session {
                         self.windows[w as usize].title = title;
                     }
                 }
-                Effect::Timer(tag, delay, repeat) => {
+                Effect::StartTimer(tag, delay, repeat) => {
                     self.timers = self
                         .timers
                         .iter()
@@ -4144,7 +4144,7 @@ impl Session {
                         .cloned()
                         .collect::<Vec<_>>()
                 }
-                Effect::Complete(owner, request, items, error) => {
+                Effect::AnswerCompletion(owner, request, items, error) => {
                     let mut w = 0;
                     while w < self.windows.len() {
                         let mut st = self.take_states(w as i64);
@@ -4158,7 +4158,7 @@ impl Session {
                     }
                 }
                 Effect::Announce(text) => self.speak(&text),
-                Effect::Toast(toast) => {
+                Effect::ShowToast(toast) => {
                     if !self.windows.is_empty() {
                         self.close_toast(0, &toast.id);
                         self.windows[0].toasts.push(toast.clone());
@@ -4183,10 +4183,10 @@ impl Session {
                         w += 1;
                     }
                 }
-                Effect::DialogChecked(id, request, error) => {
+                Effect::AnswerDialogCheck(id, request, error) => {
                     self.dialog_checked(&id, request, &error)
                 }
-                Effect::Work(work) => self.run_job(&crate::services::jobs::Job::Work(work)),
+                Effect::StartWork(work) => self.run_job(&crate::services::jobs::Job::Work(work)),
                 Effect::CancelWork(owner) => {
                     if let Some(worker) = &self.jobs {
                         worker.cancel_owner(&owner);
@@ -4270,7 +4270,7 @@ impl Session {
                     self.base_theme.rtl = r;
                     self.retheme()
                 }
-                Effect::Commands(cmds) => {
+                Effect::SetCommands(cmds) => {
                     self.extra_commands = cmds;
                     let mut w = 0;
                     while w < self.windows.len() {
@@ -4386,7 +4386,7 @@ impl Session {
         if let Some(dock) = crate::dock::dock_of_strip(strip)
             && let Some(drop) = self.dock_drop(source, dock, key, (x, y), (gx, gy))
         {
-            self.pending.push(UiMsg::Dock(dock.to_string(), drop));
+            self.pending.push(UiMsg::TabDocked(dock.to_string(), drop));
             return;
         }
         if windowing::video_driver() != "wayland" {
@@ -4424,7 +4424,7 @@ impl Session {
                                 };
                                 at += 1;
                             }
-                            self.pending.push(UiMsg::TabMove(
+                            self.pending.push(UiMsg::TabMoved(
                                 strip.to_string(),
                                 key.to_string(),
                                 to.id,
@@ -4451,7 +4451,7 @@ impl Session {
                         && inside(self.windows[t].native)
                 })
             {
-                self.pending.push(UiMsg::TabToWindow(
+                self.pending.push(UiMsg::TabMovedToWindow(
                     strip.to_string(),
                     key.to_string(),
                     self.windows[target].key.clone(),
@@ -4459,8 +4459,12 @@ impl Session {
                 return;
             }
         }
-        self.pending
-            .push(UiMsg::TabDetach(strip.to_string(), key.to_string(), gx, gy))
+        self.pending.push(UiMsg::TabDetached(
+            strip.to_string(),
+            key.to_string(),
+            gx,
+            gy,
+        ))
     }
 
     /// The dock group and zone under a tab dropped at window pixel `local`
@@ -4536,7 +4540,7 @@ impl Session {
     fn resize_completion(&mut self, w: i64, owner: &str) {
         let cs = self.windows[w as usize]
             .states
-            .choice(&format!("{}#completion", owner));
+            .choice_state(&format!("{}#completion", owner));
         let mut i = 0;
         while i < self.windows[w as usize].popups.len() {
             let p = self.windows[w as usize].popups[i].clone();
@@ -5078,7 +5082,7 @@ impl Session {
         self.windows[w as usize].dialogs[k as usize] = next.clone();
         for e in effects_out {
             match e {
-                Effect::Focus(target) => effects::perform(Effect::FocusIn(
+                Effect::Focus(target) => effects::perform(Effect::FocusInWindow(
                     self.windows[w as usize].key.clone(),
                     target.to_string(),
                 )),
@@ -5186,7 +5190,7 @@ impl Session {
         let inst = &self.windows[w as usize].dialogs[k as usize];
         let target = host::default_action(inst);
         if !target.is_empty() {
-            self.pending.push(UiMsg::Click(target))
+            self.pending.push(UiMsg::Clicked(target))
         }
     }
 
@@ -5982,38 +5986,38 @@ fn is_motion(e: &windowing::Event) -> bool {
 /// The widget id a message names.
 pub fn msg_id(m: &UiMsg) -> String {
     match m {
-        UiMsg::Click(id)
-        | UiMsg::Toggle(id, _)
-        | UiMsg::Check(id, _)
-        | UiMsg::Choose(id, _)
-        | UiMsg::Text(id, _)
-        | UiMsg::Caret(id, _, _)
+        UiMsg::Clicked(id)
+        | UiMsg::Toggled(id, _)
+        | UiMsg::Checked(id, _)
+        | UiMsg::Chosen(id, _)
+        | UiMsg::TextChanged(id, _)
+        | UiMsg::CaretMoved(id, _, _)
         | UiMsg::DocumentChanged(id, _, _)
-        | UiMsg::Submit(id, _)
-        | UiMsg::Select(id, _)
-        | UiMsg::SelectMany(id, _)
-        | UiMsg::Value(id, _)
-        | UiMsg::Range(id, _, _)
-        | UiMsg::Color(id, _)
-        | UiMsg::Date(id, _)
-        | UiMsg::Tab(id, _)
+        | UiMsg::Submitted(id, _)
+        | UiMsg::Selected(id, _)
+        | UiMsg::SelectedMany(id, _)
+        | UiMsg::ValueChanged(id, _)
+        | UiMsg::RangeChanged(id, _, _)
+        | UiMsg::ColorChanged(id, _)
+        | UiMsg::DateChanged(id, _)
+        | UiMsg::TabSelected(id, _)
         | UiMsg::TabAction(id, _, _)
-        | UiMsg::TabDrop(id, _, _, _)
-        | UiMsg::TabMove(id, _, _, _)
-        | UiMsg::TabDetach(id, _, _, _)
-        | UiMsg::TabToWindow(id, _, _)
-        | UiMsg::Expand(id, _, _)
-        | UiMsg::Activate(id, _)
-        | UiMsg::CellEdit(id, _, _, _)
-        | UiMsg::Sort(id, _, _)
-        | UiMsg::ColumnResize(id, _, _)
-        | UiMsg::Reorder(id, _, _)
-        | UiMsg::Split(id, _)
+        | UiMsg::TabDropped(id, _, _, _)
+        | UiMsg::TabMoved(id, _, _, _)
+        | UiMsg::TabDetached(id, _, _, _)
+        | UiMsg::TabMovedToWindow(id, _, _)
+        | UiMsg::Expanded(id, _, _)
+        | UiMsg::Activated(id, _)
+        | UiMsg::CellEdited(id, _, _, _)
+        | UiMsg::SortRequested(id, _, _)
+        | UiMsg::ColumnResized(id, _, _)
+        | UiMsg::Reordered(id, _, _)
+        | UiMsg::SplitMoved(id, _)
         | UiMsg::DragFinished(id, _)
         | UiMsg::Dropped(id, _)
         | UiMsg::CompletionRequest(id, _, _, _)
         | UiMsg::Custom(id, _)
-        | UiMsg::Worked(id, _, _, _)
+        | UiMsg::WorkFinished(id, _, _, _)
         | UiMsg::Listed(id, _, _)
         | UiMsg::FontsLoaded(id, _)
         | UiMsg::AppsLoaded(id, _) => id.to_string(),
@@ -6389,7 +6393,7 @@ mod dialog_scope_tests {
     fn log_update(m: Log, msg: UiMsg) -> Log {
         let mut n = m;
         match msg {
-            UiMsg::Click(id) => n.events.push(id.to_string()),
+            UiMsg::Clicked(id) => n.events.push(id.to_string()),
             // Without quotes, which end the log `events` reads.
             UiMsg::Dialog(id, crate::dialogs::Outcome::Action(a)) => {
                 n.events.push(format!("{}=Action {}", id, a))
@@ -7221,7 +7225,7 @@ mod dialog_scope_tests {
                 dump
             );
             // A failure is shown and the page stays for another try.
-            crate::perform(Effect::DialogChecked(
+            crate::perform(Effect::AnswerDialogCheck(
                 "setup".to_string(),
                 1,
                 "That name is taken".to_string(),
@@ -7240,7 +7244,7 @@ mod dialog_scope_tests {
                 events(&s)
             );
             // An answer to the stopped check changes nothing.
-            crate::perform(Effect::DialogChecked(
+            crate::perform(Effect::AnswerDialogCheck(
                 "setup".to_string(),
                 2,
                 "".to_string(),
@@ -7252,7 +7256,7 @@ mod dialog_scope_tests {
                 s.semantics(1).dump()
             );
             assert!(s.click("dlg:setup:action:next").unwrap());
-            crate::perform(Effect::DialogChecked(
+            crate::perform(Effect::AnswerDialogCheck(
                 "setup".to_string(),
                 3,
                 "".to_string(),
@@ -7269,7 +7273,7 @@ mod dialog_scope_tests {
                 "{}",
                 events(&s)
             );
-            crate::perform(Effect::DialogChecked(
+            crate::perform(Effect::AnswerDialogCheck(
                 "setup".to_string(),
                 4,
                 "".to_string(),
@@ -7534,7 +7538,7 @@ mod growth_tests {
 
     fn update(m: String, msg: UiMsg) -> String {
         match msg {
-            UiMsg::Text(_, text) => text,
+            UiMsg::TextChanged(_, text) => text,
             _ => m,
         }
     }
@@ -7606,7 +7610,7 @@ mod growth_tests {
             .size(400, 52)
             .frameless()
             .dismissible()
-            .focus("run")
+            .initial_focus("run")
             .start()
             .unwrap();
             s.type_text("a").unwrap();
@@ -7624,7 +7628,7 @@ mod growth_tests {
             )
             .size(400, 52)
             .dismissible()
-            .focus("run")
+            .initial_focus("run")
             .start()
             .unwrap();
             // Losing focus it never had keeps it; losing it after having it closes it.
@@ -7657,7 +7661,7 @@ mod growth_tests {
             )
             .size(400, 52)
             .grows_for_popups()
-            .focus("run")
+            .initial_focus("run")
             .start()
             .unwrap();
             assert_eq!(
@@ -7667,14 +7671,14 @@ mod growth_tests {
             );
             s.type_text("a").unwrap();
             s.advance(1).unwrap();
-            let request = s.windows[0].states.choice("run#completion").request;
+            let request = s.windows[0].states.choice_state("run#completion").request;
             let items = Widget::items(&[
                 ("a".to_string(), "Alpha".to_string()),
                 ("b".to_string(), "Beta".to_string()),
                 ("c".to_string(), "Gamma".to_string()),
                 ("d".to_string(), "Delta".to_string()),
             ]);
-            crate::perform(crate::app::effects::Effect::Complete(
+            crate::perform(crate::app::effects::Effect::AnswerCompletion(
                 "run".to_string(),
                 request,
                 items.clone(),
@@ -7688,7 +7692,7 @@ mod growth_tests {
             let popup_height = s.windows[0].popups[0].request.size.height;
             s.type_text("b").unwrap();
             s.advance(1).unwrap();
-            let loading = s.windows[0].states.choice("run#completion");
+            let loading = s.windows[0].states.choice_state("run#completion");
             assert!(loading.loading);
             assert!(
                 loading.items.is_empty(),
@@ -7700,7 +7704,7 @@ mod growth_tests {
                 expanded,
                 "loading must not shrink and re-expand the window"
             );
-            crate::perform(crate::app::effects::Effect::Complete(
+            crate::perform(crate::app::effects::Effect::AnswerCompletion(
                 "run".to_string(),
                 loading.request,
                 items[..1].to_vec(),
@@ -7712,7 +7716,7 @@ mod growth_tests {
                 contracted < expanded,
                 "finished results may contract to their real height"
             );
-            crate::perform(crate::app::effects::Effect::Complete(
+            crate::perform(crate::app::effects::Effect::AnswerCompletion(
                 "run".to_string(),
                 request,
                 items,
@@ -7744,7 +7748,7 @@ mod growth_tests {
             )
             .size(400, 52)
             .grows_for_popups()
-            .focus("run")
+            .initial_focus("run")
             .start()
             .unwrap();
             let closed = height(&s);
@@ -7858,7 +7862,7 @@ mod warning_tests {
             .start()
             .unwrap();
             s.flush().unwrap();
-            s.emit(&UiMsg::Text("name".to_string(), "a".to_string()));
+            s.emit(&UiMsg::TextChanged("name".to_string(), "a".to_string()));
             s.flush().unwrap();
             let warnings = s
                 .log
@@ -7975,7 +7979,7 @@ mod advance_tests {
             .size(200, 100)
             .start()
             .unwrap();
-            effects::perform(effects::Effect::Timer("tick".into(), 100, true));
+            effects::perform(effects::Effect::StartTimer("tick".into(), 100, true));
             s.flush().unwrap();
             s.advance(1_000).unwrap();
             assert!(s.semantics(0).dump().contains("ticks 10"));
@@ -8226,10 +8230,10 @@ mod window_command_tests {
             assert!(
                 messages
                     .iter()
-                    .any(|m| matches!(m, UiMsg::TabDetach(strip, key, _, _) if strip == "tabs" && key == "two")),
+                    .any(|m| matches!(m, UiMsg::TabDetached(strip, key, _, _) if strip == "tabs" && key == "two")),
                 "{messages:?}"
             );
-            assert!(!messages.iter().any(|m| matches!(m, UiMsg::Reorder(..))));
+            assert!(!messages.iter().any(|m| matches!(m, UiMsg::Reordered(..))));
             drop(messages);
             s.shutdown()
         })
@@ -8283,7 +8287,7 @@ mod window_command_tests {
             assert!(
                 messages
                     .iter()
-                    .any(|m| matches!(m, UiMsg::TabToWindow(strip, key, window)
+                    .any(|m| matches!(m, UiMsg::TabMovedToWindow(strip, key, window)
                     if strip == "tabs" && key == "two" && window == "other")),
                 "{messages:?}"
             );

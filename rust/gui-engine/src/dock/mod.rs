@@ -36,7 +36,7 @@ pub enum Zone {
 }
 
 /// A tab dropped on a dock group, which the session reports as
-/// `UiMsg::Dock(dock, drop)`.
+/// `UiMsg::TabDocked(dock, drop)`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Drop {
     pub pane: String,
@@ -740,22 +740,22 @@ impl Layout {
     pub fn handle(&mut self, dock: &str, msg: &UiMsg) -> Vec<Change> {
         let group = |strip: &str| group_id(dock, strip);
         let result: Result<Vec<Change>, String> = match msg {
-            UiMsg::Tab(strip, pane) if group(strip).is_some() => {
+            UiMsg::TabSelected(strip, pane) if group(strip).is_some() => {
                 self.activate(pane).map(|_| vec![Change::Layout])
             }
-            UiMsg::Reorder(strip, pane, index) => match group(strip) {
+            UiMsg::Reordered(strip, pane, index) => match group(strip) {
                 Some(g) => self
                     .reorder(g, pane, (*index).max(0) as usize)
                     .map(|_| vec![Change::Layout]),
                 None => Ok(Vec::new()),
             },
-            UiMsg::TabMove(from, pane, to, index) if group(from).is_some() => match group(to) {
+            UiMsg::TabMoved(from, pane, to, index) if group(from).is_some() => match group(to) {
                 Some(g) => self
                     .place(pane, g, Zone::Center, Some((*index).max(0) as usize))
                     .map(changed),
                 None => Ok(Vec::new()),
             },
-            UiMsg::TabDetach(strip, pane, x, y) if group(strip).is_some() => self
+            UiMsg::TabDetached(strip, pane, x, y) if group(strip).is_some() => self
                 .detach(pane, (*x, *y, 640, 480))
                 .map(|(opened, closed)| {
                     let mut changes = changed(closed);
@@ -765,11 +765,11 @@ impl Layout {
             UiMsg::TabAction(strip, pane, action) if group(strip).is_some() => {
                 self.tab_action(pane, action)
             }
-            UiMsg::Split(split, ratio) => match split_id(dock, split) {
+            UiMsg::SplitMoved(split, ratio) => match split_id(dock, split) {
                 Some(s) => self.set_ratio(s, *ratio).map(|_| vec![Change::Layout]),
                 None => Ok(Vec::new()),
             },
-            UiMsg::Dock(target, drop) if target == dock => match group(&drop.group) {
+            UiMsg::TabDocked(target, drop) if target == dock => match group(&drop.group) {
                 Some(g) => self.place(&drop.pane, g, drop.zone, None).map(changed),
                 None => Ok(Vec::new()),
             },

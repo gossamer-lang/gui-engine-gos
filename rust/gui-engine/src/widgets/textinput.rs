@@ -33,7 +33,7 @@ pub enum InputKind {
 }
 
 /// A text input. The application owns `text`; edits are reported as
-/// `UiMsg::Text(id, text)`.
+/// `UiMsg::TextChanged(id, text)`.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct TextInput {
     pub id: String,
@@ -57,7 +57,7 @@ pub struct TextInput {
     /// inserted literally.
     pub mask: String,
     /// Judges the draft; invalid drafts stay editable and are marked.
-    pub validate: Option<crate::Callback<dyn Fn(String) -> Validity>>,
+    pub validator: Option<crate::Callback<dyn Fn(String) -> Validity>>,
     /// An error to show under the field (from the application).
     pub error: String,
     pub help: String,
@@ -132,7 +132,7 @@ impl TextInput {
             read_only: false,
             max_length: 0,
             mask: String::new(),
-            validate: None,
+            validator: None,
             error: String::new(),
             help: String::new(),
             label: String::new(),
@@ -499,12 +499,12 @@ fn from_shown(t: &TextInput, st: &EditState, offset: i64) -> i64 {
 
 fn state_of(t: &TextInput, states: &StateStore) -> EditState {
     let mut state = if t.rich_document > 0 {
-        crate::rich::editor::state(t.rich_document, t.rich_block, states.edit(&t.id))
-            .unwrap_or_else(|_| states.edit(&t.id))
+        crate::rich::editor::state(t.rich_document, t.rich_block, states.edit_state(&t.id))
+            .unwrap_or_else(|_| states.edit_state(&t.id))
     } else if t.document > 0 {
-        editing::documents::state(t.document).unwrap_or_else(|_| states.edit(&t.id))
+        editing::documents::state(t.document).unwrap_or_else(|_| states.edit_state(&t.id))
     } else {
-        let mut state = states.edit(&t.id);
+        let mut state = states.edit_state(&t.id);
         state.sync(&t.text);
         state
     };
@@ -532,7 +532,7 @@ fn leading_content(
     t: &TextInput,
     states: &StateStore,
 ) -> (Option<crate::services::apps::AppIcon>, Option<Icon>) {
-    let choice = states.choice(&format!("{}#completion", t.id));
+    let choice = states.choice_state(&format!("{}#completion", t.id));
     if t.completion.is_some()
         && choice.open
         && let Some(item) = choice.current()
@@ -711,7 +711,7 @@ pub fn paint_input(t: &TextInput, node: &Node, cx: &mut PaintCx) {
         }
     }
     // Ghost completion text after the caret.
-    let cs = cx.states.choice(&format!("{}#completion", t.id));
+    let cs = cx.states.choice_state(&format!("{}#completion", t.id));
     if let Some(ref comp) = t.completion
         && comp.ghost
         && focused
@@ -860,7 +860,7 @@ fn changed(t: &TextInput, s: &mut EditState, st: &mut StateStore, cx: &mut Event
         }
     }
     let mut validity = String::new();
-    if let Some(ref v) = t.validate {
+    if let Some(ref v) = t.validator {
         validity = match v(s.text.to_string()) {
             Validity::Valid | Validity::Intermediate(_) => "".to_string(),
             Validity::Invalid(why) => why,
@@ -901,7 +901,7 @@ fn changed(t: &TextInput, s: &mut EditState, st: &mut StateStore, cx: &mut Event
             }
         }
     } else {
-        cx.emit(&UiMsg::Text(t.id.clone(), s.text.to_string()));
+        cx.emit(&UiMsg::TextChanged(t.id.clone(), s.text.to_string()));
     }
     s.history_index = -1;
 }
@@ -1087,8 +1087,8 @@ pub fn input_event(t: &TextInput, node: &Node, ev: &Event, st: &mut StateStore, 
             if btn.width > 0 && btn.contains(*x, *y) {
                 if t.dropdown {
                     let cs_id = format!("{}#completion", t.id);
-                    if st.choice(&cs_id).open {
-                        let mut cs = st.choice(&cs_id);
+                    if st.choice_state(&cs_id).open {
+                        let mut cs = st.choice_state(&cs_id);
                         cs.open = false;
                         st.set(&cs_id, WState::Choice(cs));
                         cx.close_popup(&t.id, 0)
@@ -1275,7 +1275,7 @@ pub fn input_event(t: &TextInput, node: &Node, ev: &Event, st: &mut StateStore, 
                 mods.ctrl
             };
             let cs_id = format!("{}#completion", t.id);
-            let mut cs = st.choice(&cs_id);
+            let mut cs = st.choice_state(&cs_id);
             // An open completion list takes navigation and acceptance keys.
             if cs.open {
                 if *key == Key::Escape {
@@ -1433,7 +1433,7 @@ pub fn input_event(t: &TextInput, node: &Node, ev: &Event, st: &mut StateStore, 
                         };
                         cx.consume()
                     } else {
-                        cx.emit(&UiMsg::Submit(t.id.clone(), s.text.to_string()));
+                        cx.emit(&UiMsg::Submitted(t.id.clone(), s.text.to_string()));
                         cx.consume()
                     }
                 }
@@ -1526,7 +1526,7 @@ pub fn input_event(t: &TextInput, node: &Node, ev: &Event, st: &mut StateStore, 
             }
             s.selecting = false;
             let cs_id = format!("{}#completion", t.id);
-            let mut cs = st.choice(&cs_id);
+            let mut cs = st.choice_state(&cs_id);
             if cs.open {
                 cs.open = false;
                 st.set(&cs_id, WState::Choice(cs));
@@ -1549,7 +1549,7 @@ pub fn input_event(t: &TextInput, node: &Node, ev: &Event, st: &mut StateStore, 
         cx.redraw = true;
     }
     if (s.anchor, s.caret) != selection_before {
-        cx.emit(&UiMsg::Caret(t.id.clone(), s.anchor, s.caret))
+        cx.emit(&UiMsg::CaretMoved(t.id.clone(), s.anchor, s.caret))
     }
     // Keep the input method's candidate window at the caret.
     if cx.is_focused(&t.id) || cx.request_focus == Some(t.id.clone()) {
@@ -1574,8 +1574,8 @@ pub fn input_event(t: &TextInput, node: &Node, ev: &Event, st: &mut StateStore, 
         if !s.rich_committed {
             crate::rich::editor::remember_selection(t.rich_document, t.rich_block, &s);
         }
-        s.undo.clear();
-        s.redo.clear();
+        s.undo_stack.clear();
+        s.redo_stack.clear();
     }
     st.set(&t.id, WState::Edit(s))
 }
@@ -1704,7 +1704,7 @@ fn schedule_completion(
     let (a, b) = completion_range(t, s);
     let query = s.text.slice(a as usize, b as usize);
     let cs_id = format!("{}#completion", t.id);
-    let mut cs = st.choice(&cs_id);
+    let mut cs = st.choice_state(&cs_id);
     if unicode::grapheme_count(&query) < comp.min_chars {
         if cs.open {
             cs.open = false;
@@ -1747,7 +1747,9 @@ fn background_completion(
             limit,
         ),
     };
-    if let Err(error) = crate::app::effects::try_perform(crate::app::effects::Effect::Work(work)) {
+    if let Err(error) =
+        crate::app::effects::try_perform(crate::app::effects::Effect::StartWork(work))
+    {
         cs.loading = false;
         cs.error = error;
     }
@@ -1766,11 +1768,11 @@ fn request(
     let (a, b) = completion_range(t, s);
     let query = s.text.slice(a as usize, b as usize);
     let cs_id = format!("{}#completion", t.id);
-    let mut cs = st.choice(&cs_id);
+    let mut cs = st.choice_state(&cs_id);
     // New text is a new question whose best answer leads; the same text asked
     // again keeps the row the user moved to.
     if cs.query != query {
-        cs.highlight.clear();
+        cs.highlighted.clear();
         cs.first = 0;
     }
     cs.query = query.to_string();
@@ -1835,7 +1837,7 @@ fn open_list(t: &TextInput, cs: &ChoiceState, cx: &mut EventCx, field: Rect) {
 /// placed it.
 pub fn list_placed(t: &TextInput, rect: Rect, st: &mut StateStore, theme: &Theme) {
     let cs_id = format!("{}#completion", t.id);
-    let mut cs = st.choice(&cs_id);
+    let mut cs = st.choice_state(&cs_id);
     cs.placed(rect.height, theme);
     st.set(&cs_id, WState::Choice(cs))
 }
@@ -1850,11 +1852,11 @@ pub fn deliver(
     error: &str,
 ) -> bool {
     let cs_id = format!("{}#completion", id);
-    let mut cs = st.choice(&cs_id);
+    let mut cs = st.choice_state(&cs_id);
     if request != cs.request || !cs.open {
         return false;
     }
-    if st.edit(id).revision != cs.revision {
+    if st.edit_state(id).revision != cs.revision {
         return false;
     }
     if error.is_empty() {
@@ -1897,7 +1899,7 @@ fn request_all(
 ) {
     let Some(ref comp) = t.completion else { return };
     let cs_id = format!("{}#completion", t.id);
-    let mut cs = st.choice(&cs_id);
+    let mut cs = st.choice_state(&cs_id);
     cs.request += 1;
     cs.revision = s.revision;
     match comp.source {
@@ -1925,7 +1927,7 @@ fn request_all(
     // The current item stays highlighted.
     for it in &cs.items {
         if completion::fold(&it.label) == completion::fold(&s.text) {
-            cs.highlight = it.key.clone()
+            cs.highlighted = it.key.clone()
         }
     }
     cs.open = true;
@@ -1946,13 +1948,13 @@ fn accept(
     s.caret = b;
     s.replace_selection(&item.inserted(), EditKind::Other, cx.now, t.max_length);
     let cs_id = format!("{}#completion", t.id);
-    let mut cs = st.choice(&cs_id);
+    let mut cs = st.choice_state(&cs_id);
     cs.open = false;
     cs.request += 1;
     st.set(&cs_id, WState::Choice(cs));
     cx.close_popup(&t.id, 0);
     changed(t, s, st, cx);
-    cx.emit(&UiMsg::Select(t.id.clone(), item.key.clone()));
+    cx.emit(&UiMsg::Selected(t.id.clone(), item.key.clone()));
     st.set_field(&t.id, "accepted", &s.text);
     cx.announce(&crate::localization::message(
         "completion",
@@ -1963,25 +1965,25 @@ fn accept(
 }
 
 pub fn popup_paint(t: &TextInput, rect: Rect, cx: &mut PaintCx) {
-    let cs = cx.states.choice(&format!("{}#completion", t.id));
+    let cs = cx.states.choice_state(&format!("{}#completion", t.id));
     completion::paint_list(&cs, rect, "", &crate::localization::tr("No matches"), cx)
 }
 
 pub fn popup_event(t: &TextInput, rect: Rect, ev: &Event, st: &mut StateStore, cx: &mut EventCx) {
     let cs_id = format!("{}#completion", t.id);
-    let mut cs = st.choice(&cs_id);
+    let mut cs = st.choice_state(&cs_id);
     match ev {
         Event::PointerMove { x, y, .. } => {
             let key = completion::list_hit(&cs, rect, &cx.theme, *x, *y);
-            if !key.is_empty() && key != cs.highlight {
-                cs.highlight = key;
+            if !key.is_empty() && key != cs.highlighted {
+                cs.highlighted = key;
                 cx.redraw = true;
             }
         }
         Event::PointerUp { x, y, .. } => {
             let key = completion::list_hit(&cs, rect, &cx.theme, *x, *y);
             if !key.is_empty() {
-                cs.highlight = key;
+                cs.highlighted = key;
                 st.set(&cs_id, WState::Choice(cs.clone()));
                 if let Some(item) = cs.current() {
                     let mut s = state_of(t, st);
@@ -2036,7 +2038,7 @@ pub fn input_semantics(t: &TextInput, st: &StateStore) -> Option<AccessNode> {
     n.invalid = !t.error.is_empty() || !validity.is_empty();
     n.description = caption(t, &validity);
     if t.completion.is_some() {
-        let cs = st.choice(&format!("{}#completion", t.id));
+        let cs = st.choice_state(&format!("{}#completion", t.id));
         n.expanded = if cs.open { 1 } else { 0 };
         n.controls = format!("{}#completion", t.id);
         if cs.open {
@@ -2054,7 +2056,7 @@ pub fn input_semantics(t: &TextInput, st: &StateStore) -> Option<AccessNode> {
 
 /// The state's selection for tests: (anchor, caret).
 pub fn selection(st: &StateStore, id: &str) -> (i64, i64) {
-    let s = st.edit(id);
+    let s = st.edit_state(id);
     (s.anchor, s.caret)
 }
 
@@ -2191,7 +2193,7 @@ mod tests {
                 &mut event,
             );
             assert_eq!(
-                states.edit("run").text,
+                states.edit_state("run").text,
                 "a",
                 "preview must not accept the result"
             );
@@ -2276,7 +2278,7 @@ mod tests {
         let mut st = StateStore::new();
         let mut cx = EventCx::new(&theme, &t.id, 0, Rect::new(0, 0, 320, 80));
         input_event(t, &node, ev, &mut st, &mut cx);
-        (st.edit(&t.id), cx.messages)
+        (st.edit_state(&t.id), cx.messages)
     }
 
     // Selects "hello" in a focused field, presses inside it, moves `by`
@@ -2345,7 +2347,7 @@ mod tests {
             &mut st,
             &mut cx,
         );
-        (cx.start_drag, st.edit("f"))
+        (cx.start_drag, st.edit_state("f"))
     }
 
     #[test]
@@ -2379,7 +2381,7 @@ mod tests {
             },
         );
         assert_eq!((s.anchor, s.caret), (0, 4));
-        assert_eq!(messages, vec![UiMsg::Caret("f".to_string(), 0, 4)]);
+        assert_eq!(messages, vec![UiMsg::CaretMoved("f".to_string(), 0, 4)]);
         let (s, _) = deliver(
             &t,
             &Event::SetSelection {
@@ -2405,7 +2407,7 @@ mod tests {
         assert_eq!(s.caret, 5);
         assert_eq!(
             messages,
-            vec![UiMsg::Text("f".to_string(), "a dog".to_string())]
+            vec![UiMsg::TextChanged("f".to_string(), "a dog".to_string())]
         );
         let mut undone = s;
         assert!(undone.undo());
@@ -2589,7 +2591,7 @@ mod document_tests {
             input_event(&input, &node, &ev, st, &mut cx);
         };
         send(Event::Text("a".into()), &mut st);
-        assert_eq!(st.choice("run#completion").highlight, "start");
+        assert_eq!(st.choice_state("run#completion").highlighted, "start");
         send(
             Event::KeyDown {
                 key: windowing::Key::Down,
@@ -2598,9 +2600,9 @@ mod document_tests {
             },
             &mut st,
         );
-        assert_eq!(st.choice("run#completion").highlight, "inner");
+        assert_eq!(st.choice_state("run#completion").highlighted, "inner");
         send(Event::Text("b".into()), &mut st);
-        let cs = st.choice("run#completion");
+        let cs = st.choice_state("run#completion");
         assert_eq!(
             cs.items
                 .iter()
@@ -2608,6 +2610,6 @@ mod document_tests {
                 .collect::<Vec<_>>(),
             ["start", "inner"]
         );
-        assert_eq!(cs.highlight, "start");
+        assert_eq!(cs.highlighted, "start");
     }
 }

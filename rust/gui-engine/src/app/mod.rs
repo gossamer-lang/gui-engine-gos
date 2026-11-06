@@ -2109,8 +2109,9 @@ impl Session {
             }
             windowing::Event::Minimized { window } | windowing::Event::Occluded { window } => {
                 let w = self.find_native(*window);
+                // Keyboard focus is the platform's to report, through
+                // FocusGained and FocusLost; a window it covers or hides keeps it.
                 if w >= 0 {
-                    self.windows[w as usize].active = false;
                     self.windows[w as usize].occluded = true;
                     if matches!(e, windowing::Event::Minimized { .. }) {
                         self.release_pixels(w)
@@ -2645,6 +2646,7 @@ impl Session {
         path.last().is_some_and(|step| match step.widget {
             Widget::TextInput(ref t) => !t.read_only,
             Widget::TemporalEditor(_) => true,
+            Widget::Terminal(ref t) => t.options.blink,
             _ => false,
         })
     }
@@ -3779,6 +3781,15 @@ impl Session {
         };
         self.windows[w as usize].root = self.windows[w as usize].view.clone();
         self.refresh_commands(w);
+        // A rebuilt view may give or take away the focused widget's caret;
+        // an unchanged one keeps blinking in its phase.
+        let blinking = self
+            .timers
+            .iter()
+            .any(|t| t.window == key && t.owner.is_empty() && t.tag == "gui:caret");
+        if blinking != (self.focus_has_caret(w) && self.windows[w as usize].active) {
+            self.update_caret_timer(w)
+        }
         self.invalidate(w, "view rebuilt")
     }
 

@@ -793,6 +793,129 @@ mod session {
         })
     }
 
+    // The pixels where frames `a` and `b` differ, as (left, top, right, bottom).
+    fn changed(
+        a: &crate::render::Canvas,
+        b: &crate::render::Canvas,
+    ) -> Option<(i64, i64, i64, i64)> {
+        let mut bounds: Option<(i64, i64, i64, i64)> = None;
+        for (i, (p, q)) in a.pixels.chunks(4).zip(b.pixels.chunks(4)).enumerate() {
+            if p != q {
+                let (x, y) = (i as i64 % a.width, i as i64 / a.width);
+                bounds = Some(match bounds {
+                    None => (x, y, x, y),
+                    Some((l, t, r, b)) => (l.min(x), t.min(y), r.max(x), b.max(y)),
+                });
+            }
+        }
+        bounds
+    }
+
+    fn pixel(c: &crate::render::Canvas, x: i64, y: i64) -> &[u8] {
+        let at = ((y * c.width + x) * 4) as usize;
+        &c.pixels[at..at + 4]
+    }
+
+    #[test]
+    fn hiding_and_showing_a_focused_window_keeps_its_cursor_and_losing_focus_hollows_it() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| crate::services::remove_test_config(&config));
+            let steady = widget::ViewOptions {
+                blink: false,
+                ..widget::ViewOptions::default()
+            };
+            let (mut s, id, _) = shown_with("cursor-focus", "printf ready; read x", steady);
+            let window = s.windows[0].native.id();
+            s.inject(&windowing::Event::FocusGained { window }).unwrap();
+            let focused = s.capture().unwrap();
+            // macOS reports a hidden window occluded and a shown one exposed,
+            // while its keyboard focus stays with it.
+            s.inject(&windowing::Event::Occluded { window }).unwrap();
+            s.inject(&windowing::Event::RedrawRequested { window })
+                .unwrap();
+            let shown = s.capture().unwrap();
+            assert_eq!(changed(&focused, &shown), None, "the cursor changed");
+            s.inject(&windowing::Event::FocusLost { window }).unwrap();
+            let unfocused = s.capture().unwrap();
+            let (left, top, right, bottom) =
+                changed(&focused, &unfocused).expect("losing focus left the cursor as it was");
+            let middle = pixel(&unfocused, (left + right) / 2, (top + bottom) / 2);
+            assert_ne!(pixel(&unfocused, left, top), middle, "no hollow cursor");
+            s.inject(&windowing::Event::FocusGained { window }).unwrap();
+            assert_eq!(changed(&focused, &s.capture().unwrap()), None);
+            close(id);
+            s.shutdown();
+        })
+    }
+
+    #[test]
+    fn a_blinking_cursor_blinks_while_its_window_has_focus() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| crate::services::remove_test_config(&config));
+            let (mut s, id, _) = shown_program("cursor-blink", "printf ready; read x");
+            let window = s.windows[0].native.id();
+            s.inject(&windowing::Event::FocusGained { window }).unwrap();
+            let blink = s.windows[0].theme.motion.caret_blink;
+            let on = s.capture().unwrap();
+            s.advance(blink).unwrap();
+            let off = s.capture().unwrap();
+            assert!(changed(&on, &off).is_some(), "the cursor did not blink");
+            s.advance(blink).unwrap();
+            assert_eq!(changed(&on, &s.capture().unwrap()), None);
+            close(id);
+            s.shutdown();
+        })
+    }
+
+    #[test]
+    fn turning_blinking_on_in_a_focused_terminal_starts_the_blink() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| crate::services::remove_test_config(&config));
+            let mut s =
+                crate::app::start("Blink", "dev.gossamer.gui-terminal-blink-toggle").unwrap();
+            let id = create(&options(8, 40, 100), crate::app::effects::current_budget()).unwrap();
+            let blinking = Rc::new(std::cell::Cell::new(false));
+            let asked = blinking.clone();
+            s.set_shell(
+                |_| {},
+                move |_| {
+                    let mut view = widget::View::new("term", id, "Shell");
+                    view.options.blink = asked.get();
+                    Widget::Terminal(view)
+                },
+                |_| Vec::new(),
+            );
+            s.open_window("main", "Terminal", 420, 240).unwrap();
+            spawn(
+                id,
+                &Command {
+                    program: "/bin/sh".into(),
+                    args: vec!["-c".into(), "printf ready; read x".into()],
+                    ..Command::default()
+                },
+            )
+            .unwrap();
+            assert!(s.focus("term").unwrap());
+            step_until(&mut s, || snapshot(id).unwrap().text.contains("ready"));
+            let window = s.windows[0].native.id();
+            s.inject(&windowing::Event::FocusGained { window }).unwrap();
+            let blink = s.windows[0].theme.motion.caret_blink;
+            blinking.set(true);
+            s.rebuild(0);
+            let on = s.capture().unwrap();
+            s.advance(blink).unwrap();
+            assert!(
+                changed(&on, &s.capture().unwrap()).is_some(),
+                "the cursor did not blink"
+            );
+            close(id);
+            s.shutdown();
+        })
+    }
+
     #[test]
     fn escape_stops_a_paste_and_still_ends_it() {
         crate::testing::on_ui_thread(|| {

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.4 - Terminal cursor focus and blinking
+
+- Builds on windowing-gos 0.1.9, whose macOS windows keep only the buffer they show in memory.
+- A window that is hidden or covered keeps its keyboard focus when it comes back: on macOS a hidden and shown window lost it in the engine's view until it was clicked, so a focused terminal drew no cursor.
+- A terminal whose window lacks keyboard focus draws its cursor hollow; it drew none.
+- A terminal's cursor blinks when its options ask for that, as soon as they do; it stayed solid.
+
 ## 0.2.3 - Faster terminal output
 
 - Terminal output that keeps arriving while it takes longer to parse than to read, such as colored or non-Latin text, is parsed on a thread of its own while the next output is read, so it streams faster; plain text and a program's reply to typing are still parsed as they are read.

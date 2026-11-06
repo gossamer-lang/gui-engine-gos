@@ -692,7 +692,8 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
     let r = Rect::from_size(node.size());
     let (rows, cols) = grid(v, &theme, node.size());
     let wanted = palette(v, &theme);
-    let focused = cx.focus == v.id;
+    // Only a window with keyboard focus gives it to the terminal it focuses.
+    let focused = cx.focus == v.id && cx.active;
     let (cw, lh, style) = metrics(v, &theme);
     // Programs place images in whole pixels per cell.
     let cell = (pixels_of(cw), pixels_of(lh));
@@ -701,7 +702,7 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
         super::follow_view(entry, rows as u16, cols as u16, cell);
         // A paint follows every change of focus, so the program hears of
         // each one here.
-        super::focus(entry, focused && cx.active);
+        super::focus(entry, focused);
         entry.scroll_on_output = v.options.scroll_on_output;
         entry.scroll_on_keystroke = v.options.scroll_on_keystroke;
         // A bell rung since the last paint flashes the screen briefly.

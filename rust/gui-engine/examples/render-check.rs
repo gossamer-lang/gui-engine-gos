@@ -8,7 +8,7 @@ use gui_engine::text::layout::{self, LayoutOptions, TextStyle};
 use std::time::Instant;
 
 fn scene(
-    retained: &gui_engine::render::retained::Retained,
+    retained: &mut gui_engine::render::retained::Retained,
     width: i64,
     height: i64,
     caret: bool,
@@ -113,7 +113,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         resize(&app, window, width, height)?;
         let mut renderer = WindowRenderer::default();
-        let first = scene(&renderer.retained, width, height, true, 0, 0);
+        let first = scene(&mut renderer.retained, width, height, true, 0, 0);
         let expected = reference(&first, width, height);
         renderer.present(window, width, height, Painted::Scene(first))?;
         if require_software {
@@ -156,7 +156,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if window.pixel_size() != (width, height) {
                 resize(&app, window, width, height)?;
             }
-            let warm = scene(&renderer.retained, width, height, true, 0, 0);
+            let warm = scene(&mut renderer.retained, width, height, true, 0, 0);
             renderer.present(window, width, height, Painted::Scene(warm))?;
             let mut times = Vec::new();
             for n in 0..30 {
@@ -172,7 +172,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let revision = if operation == "typing" { n } else { 0 };
                 let caret = operation != "caret" || n % 2 == 0;
                 let frame = scene(
-                    &renderer.retained,
+                    &mut renderer.retained,
                     w,
                     h,
                     caret,
@@ -257,7 +257,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if window.pixel_size() != (width, height) {
             resize(&app, window, width, height)?;
         }
-        let lost = scene(&renderer.retained, width, height, true, 0, 0);
+        let lost = scene(&mut renderer.retained, width, height, true, 0, 0);
         renderer.present(window, width, height, Painted::Scene(lost))?;
         assert!(
             renderer.gpu_name().is_none(),
@@ -266,7 +266,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _software_frame = window.capture()?;
         // Drop/recreate target and layers, as on renderer-reset notification.
         renderer.invalidate();
-        let recovered = scene(&renderer.retained, width, height, true, 0, 0);
+        let recovered = scene(&mut renderer.retained, width, height, true, 0, 0);
         if window.pixel_size() != (width, height) {
             resize(&app, window, width, height)?;
         }

@@ -102,6 +102,10 @@ pub struct Canvas {
     pub(crate) recorded_bytes: usize,
     pub(crate) recording_limit: usize,
     pub(crate) recording_overflow: bool,
+    /// The retained recording this one follows, which spans are copied from.
+    pub(crate) previous: Option<(u64, Arc<retained::Scene>)>,
+    /// What the window retains this recording as, or 0 when it does not.
+    pub(crate) recording_id: u64,
 }
 
 impl Canvas {
@@ -120,6 +124,8 @@ impl Canvas {
             recorded_bytes: 0,
             recording_limit: 0,
             recording_overflow: false,
+            previous: None,
+            recording_id: 0,
         })
     }
 
@@ -146,6 +152,8 @@ impl Canvas {
             recorded_bytes: 0,
             recording_limit: 0,
             recording_overflow: false,
+            previous: None,
+            recording_id: 0,
         })
     }
 
@@ -167,6 +175,8 @@ impl Canvas {
             recorded_bytes: 0,
             recording_limit: 0,
             recording_overflow: false,
+            previous: None,
+            recording_id: 0,
         }
     }
 
@@ -187,11 +197,23 @@ impl Canvas {
     }
 
     fn record(&mut self, payload: usize, make: impl FnOnce() -> retained::Primitive) -> bool {
+        if self.recording.is_none() {
+            return false;
+        }
+        if self.admit(payload) {
+            let command = retained::Command::new(make(), self.clip, self.opacity);
+            self.push_admitted(command, payload);
+        }
+        true
+    }
+
+    // Makes room for one command carrying `payload` bytes; false, marking the
+    // recording overflowed, when its budget has none.
+    fn admit(&mut self, payload: usize) -> bool {
         let Some(scene) = &mut self.recording else {
             return false;
         };
         let unit = std::mem::size_of::<retained::Command>();
-        let bytes = unit.saturating_add(payload);
         let payload_bytes = self
             .recorded_bytes
             .saturating_sub(scene.commands.len() * unit)
@@ -202,7 +224,7 @@ impl Canvas {
             || scene.commands.len() + 1 > max_capacity
         {
             self.recording_overflow = true;
-            return true;
+            return false;
         }
         if scene.commands.capacity() < scene.commands.len() + 1 {
             let capacity = (scene.commands.capacity().max(2) * 2)
@@ -212,12 +234,59 @@ impl Canvas {
                 .commands
                 .reserve_exact(capacity - scene.commands.len());
         }
-        let command = retained::Command::new(make(), self.clip, self.opacity);
+        true
+    }
+
+    // Records an admitted command, unless it paints nothing.
+    fn push_admitted(&mut self, command: retained::Command, payload: usize) {
+        let Some(scene) = &mut self.recording else {
+            return;
+        };
         if command.bounds.width > 0 && command.bounds.height > 0 {
-            self.recorded_bytes += bytes;
+            self.recorded_bytes += std::mem::size_of::<retained::Command>() + payload;
             scene.commands.push(command);
         }
-        true
+    }
+
+    /// Where the next recorded command goes, the start of a span
+    /// [`Canvas::recorded_span`] answers.
+    pub fn recorded_mark(&self) -> usize {
+        self.recording
+            .as_ref()
+            .map_or(0, |scene| scene.commands.len())
+    }
+
+    /// The commands recorded since `mark`, which the recording of the next
+    /// frame can copy; None unless this canvas records a frame its window
+    /// retains and has stayed within its budget.
+    pub fn recorded_span(&self, mark: usize) -> Option<retained::RecordedSpan> {
+        let scene = self.recording.as_ref()?;
+        (self.recording_id != 0 && !self.recording_overflow && mark <= scene.commands.len())
+            .then_some(retained::RecordedSpan {
+                scene: self.recording_id,
+                start: mark,
+                end: scene.commands.len(),
+            })
+    }
+
+    /// Records again the commands of `span`, made by the recording this one
+    /// follows, and answers where they now lie; None when `span` belongs to
+    /// another recording, which records nothing, or the budget runs out.
+    pub fn replay_span(&mut self, span: retained::RecordedSpan) -> Option<retained::RecordedSpan> {
+        let (id, previous) = self.previous.as_ref()?;
+        if *id != span.scene || span.start > span.end || span.end > previous.commands.len() {
+            return None;
+        }
+        let previous = Arc::clone(previous);
+        let mark = self.recorded_mark();
+        for command in &previous.commands[span.start..span.end] {
+            let payload = command.bytes() - std::mem::size_of::<retained::Command>();
+            if !self.admit(payload) {
+                return None;
+            }
+            self.push_admitted(command.clone(), payload);
+        }
+        self.recorded_span(mark)
     }
 
     /// Fill every pixel with `color`, ignoring clip and opacity.

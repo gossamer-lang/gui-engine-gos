@@ -689,6 +689,12 @@ impl Engine {
             (target > 0).then(|| self.term.screen().visible_row_to_stable_row(0) - target as isize);
     }
     /// Calls `f` with the lines the view shows, top first.
+    /// The stable row of the first line `with_visible_lines` passes.
+    pub(crate) fn visible_stable_top(&self) -> isize {
+        let screen = self.term.screen();
+        let end = screen.scrollback_rows() - self.scrollback();
+        screen.phys_to_stable_row_index(end - screen.physical_rows)
+    }
     pub(crate) fn with_visible_lines(&self, f: impl FnMut(&[&Line])) {
         let screen = self.term.screen();
         let end = screen.scrollback_rows() - self.scrollback();

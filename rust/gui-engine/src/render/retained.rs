@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::Canvas;
 use crate::geometry::Rect;
@@ -193,6 +194,19 @@ impl Default for Transform {
         }
     }
 }
+
+/// Commands a recording made, where a later recording of the frame that
+/// follows can copy them from with [`Canvas::replay_span`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordedSpan {
+    pub(crate) scene: u64,
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+}
+
+// Names each recording a window retains, across every window, so a span is
+// copied only from the scene it was recorded into.
+static NEXT_SCENE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Scene {
@@ -518,7 +532,11 @@ pub struct Retained {
     /// The size of the frame the retained scene was last shown at.
     pub width: i64,
     pub height: i64,
-    scene: Scene,
+    scene: Arc<Scene>,
+    /// The recording `scene` holds, or 0 when it holds none.
+    scene_id: u64,
+    /// The recording the next commit retains.
+    pending_id: u64,
     tiles: Vec<Tile>,
     /// The latest content revisions each tile position showed, newest last.
     /// A raster is cached only for content that comes back after other
@@ -550,7 +568,9 @@ impl Retained {
         Self {
             width: 0,
             height: 0,
-            scene: Scene::default(),
+            scene: Arc::default(),
+            scene_id: 0,
+            pending_id: 0,
             tiles: vec![],
             seen: HashMap::new(),
             subtrees: SubtreeCache::default(),
@@ -566,17 +586,25 @@ impl Retained {
         self.subtrees.clear();
         self.tiles = Vec::new();
         self.seen = HashMap::new();
-        self.scene = Scene::default();
+        self.scene = Arc::default();
+        self.scene_id = 0;
+        self.pending_id = 0;
         self.valid = false;
         self.stats = Stats::default();
     }
     /// Recording inherits the window's bounded subtree cache. At most half
     /// the layer budget can be occupied by isolated subtrees; raster tiles
-    /// use the remainder, including unused subtree space.
-    pub fn recording(&self, width: i64, height: i64) -> Canvas {
+    /// use the remainder, including unused subtree space. The recording may
+    /// copy spans of the scene retained now, which the next commit replaces.
+    pub fn recording(&mut self, width: i64, height: i64) -> Canvas {
         self.subtrees.set_limit(self.budgets.layers / 2);
         let mut canvas = Canvas::recording(width, height, self.budgets.scene);
         canvas.subtrees = Some(self.subtrees.clone());
+        self.pending_id = NEXT_SCENE.fetch_add(1, Ordering::Relaxed);
+        canvas.recording_id = self.pending_id;
+        if self.scene_id != 0 {
+            canvas.previous = Some((self.scene_id, Arc::clone(&self.scene)));
+        }
         canvas
     }
     pub fn scene(&self) -> &Scene {
@@ -808,7 +836,12 @@ impl Retained {
         // A target of another size than the frame holds only part of it,
         // so the next frame repaints in full.
         self.valid = fits && !std::mem::take(&mut self.partial);
-        self.scene = if fits { scene } else { Scene::default() };
+        let recorded = std::mem::take(&mut self.pending_id);
+        (self.scene, self.scene_id) = if fits {
+            (Arc::new(scene), recorded)
+        } else {
+            (Arc::default(), 0)
+        };
         if !fits {
             self.stats.scene_bytes = 0;
         }

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.2 - Faster terminal repaints
+
+- A terminal repaint copies each row that looks as it did in the frame before instead of drawing it again, so a keystroke, or a program redrawing a few lines of a full screen, costs about a tenth of a whole repaint.
+- Terminal output paints once per refresh of the display a window is on, 8 ms apart at 120 Hz, instead of at most 60 times a second; a display that reports no refresh rate keeps 60.
+- Screens of colored text paint faster: the legibility check reads the sRGB curve from a table.
+- `Retained::recording` takes `&mut self`, and a recording can copy commands the recording before it made: `Canvas::recorded_mark`, `recorded_span` and `replay_span`.
+
 ## 0.2.1 - Typing after full screen TUI apps
 
 - The first character typed after a full screen TUI app that used kitty's keyboard protocol exits on Ctrl+C or Ctrl+D reaches the shell; it used to be dropped.

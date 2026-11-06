@@ -63,6 +63,15 @@ pub struct Cell {
     pub inverse: bool,
     pub dim: bool,
 }
+/// Which version of a buffer row a screen row shows: the same version holds
+/// the same cells. Every change to a row, and every move of a row to another
+/// stable row, gives it a later sequence number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowVersion {
+    stable: isize,
+    seqno: usize,
+    alternate: bool,
+}
 /// The part of an image one cell shows: the stretch between two corners,
 /// each a fraction of the image's width and height.
 #[derive(Clone, Debug)]
@@ -86,6 +95,7 @@ pub struct Frame {
     alternate: bool,
     cells: Vec<Vec<Cell>>,
     wrapped: Vec<bool>,
+    versions: Vec<Option<RowVersion>>,
     links: Vec<Link>,
     images: Vec<Piece>,
     text: String,
@@ -103,6 +113,9 @@ impl Frame {
         let mut cells = Vec::with_capacity(rows.into());
         let mut offsets = Vec::with_capacity(rows.into());
         let mut wrapped = Vec::with_capacity(rows.into());
+        let mut versions = Vec::with_capacity(rows.into());
+        let top = engine.visible_stable_top();
+        let alternate = engine.alternate_screen();
         let mut marked = Vec::new();
         let mut images = Vec::new();
         let mut text = String::new();
@@ -169,6 +182,14 @@ impl Frame {
                     text.push('\n');
                 }
                 wrapped.push(line.last_cell_was_wrapped());
+                // A line never stamped with a change reads as changed since
+                // every sequence number, its own included, and has no version.
+                let seqno = line.current_seqno();
+                versions.push((!line.changed_since(seqno)).then_some(RowVersion {
+                    stable: top + row as isize,
+                    seqno,
+                    alternate,
+                }));
                 cells.push(cells_of_row);
                 offsets.push(positions);
             }
@@ -181,9 +202,10 @@ impl Frame {
             cols,
             cursor: (cursor_row.min(rows - 1), cursor_col),
             hide_cursor: engine.hide_cursor(),
-            alternate: engine.alternate_screen(),
+            alternate,
             cells,
             wrapped,
+            versions,
             links: marked,
             images,
             text,
@@ -211,6 +233,10 @@ impl Frame {
     }
     pub fn wrapped(&self) -> &[bool] {
         &self.wrapped
+    }
+    /// The version of buffer row screen row `row` shows, if it has one.
+    pub fn version(&self, row: u16) -> Option<RowVersion> {
+        self.versions.get(usize::from(row)).copied().flatten()
     }
     pub fn text(&self) -> &str {
         &self.text

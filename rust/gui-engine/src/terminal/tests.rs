@@ -1432,3 +1432,113 @@ fn saved_text_joins_wrapped_rows_back_into_their_lines() {
     let _ = std::fs::remove_file(path);
     close(id);
 }
+
+// A view painted as a window paints it, following its last retained frame.
+fn paint_retained(
+    view: &widget::View,
+    size: crate::geometry::Size,
+    retained: &mut crate::render::retained::Retained,
+) -> crate::render::retained::Scene {
+    let theme = crate::style::Theme::default();
+    let states = crate::widgets::state::StateStore::new();
+    let recording = retained.recording(size.width, size.height);
+    let mut cx = crate::widgets::cx::PaintCx::new(&recording, &theme, &states);
+    widget::paint_terminal(view, &crate::widgets::cx::Node::leaf(size), &mut cx);
+    let scene = cx.canvas.take_scene().unwrap();
+    retained.commit(scene.clone());
+    scene
+}
+
+// A view painted into a recording that follows no earlier frame.
+fn paint_fresh(view: &widget::View, size: crate::geometry::Size) -> crate::render::retained::Scene {
+    let theme = crate::style::Theme::default();
+    let states = crate::widgets::state::StateStore::new();
+    let budget = crate::render::retained::Budgets::default().scene;
+    let recording = crate::render::Canvas::recording(size.width, size.height, budget);
+    let mut cx = crate::widgets::cx::PaintCx::new(&recording, &theme, &states);
+    widget::paint_terminal(view, &crate::widgets::cx::Node::leaf(size), &mut cx);
+    cx.canvas.take_scene().unwrap()
+}
+
+#[test]
+fn a_screen_painted_after_its_last_frame_records_what_a_first_paint_would() {
+    let budget = Budget::new(64 * 1024 * 1024);
+    let kept = create(&options(12, 40, 100), budget.clone()).unwrap();
+    let fresh = create(&options(12, 40, 100), budget).unwrap();
+    let kept_view = widget::View::new("kept", kept, "Kept");
+    let fresh_view = widget::View::new("fresh", fresh, "Fresh");
+    let mut retained = crate::render::retained::Retained::new();
+    let small = crate::geometry::Size::new(480, 320);
+    let large = crate::geometry::Size::new(560, 360);
+    let mut step = |name: &str, size: crate::geometry::Size, change: &dyn Fn(i64)| {
+        change(kept);
+        change(fresh);
+        // Twice: the second paint follows a frame that already shows it all.
+        for _ in 0..2 {
+            assert_eq!(
+                paint_retained(&kept_view, size, &mut retained),
+                paint_fresh(&fresh_view, size),
+                "{name}"
+            );
+        }
+    };
+    let output = |bytes: &'static str| move |id: i64| feed(id, bytes.as_bytes()).unwrap();
+    step("text", small, &output("hello\r\nworld\r\n"));
+    step(
+        "colors",
+        small,
+        &output("\x1b[31mred \x1b[42mgreen\x1b[0m \x1b[1;4mbold\x1b[0m\r\n"),
+    );
+    step("overwrite", small, &output("\x1b[2;3HX\x1b[12;1H"));
+    step("erase line", small, &output("\x1b[1;3H\x1b[K\x1b[12;1H"));
+    step(
+        "insert and delete",
+        small,
+        &output("\x1b[2;1H\x1b[2@ab\x1b[3P\x1b[12;1H"),
+    );
+    step(
+        "scroll region",
+        small,
+        &output("\x1b[2;5r\x1b[5;1Hone\ntwo\nthree\n\x1b[r\x1b[12;1H"),
+    );
+    step(
+        "reverse index",
+        small,
+        &output("\x1b[2;5r\x1b[2;1H\x1bM\x1bM\x1b[r\x1b[12;1H"),
+    );
+    step("lines", small, &output("\x1b[3;1H\x1b[2L\x1b[1M\x1b[12;1H"));
+    step("history", small, &|id| {
+        for i in 0..40 {
+            feed(id, format!("line {i}\r\n").as_bytes()).unwrap();
+        }
+    });
+    step("scrolled back", small, &|id| {
+        scroll(id, 5).unwrap();
+    });
+    step("scrolled home", small, &|id| {
+        scroll(id, -5).unwrap();
+    });
+    step("selected", small, &|id| {
+        select(id, Some((Cell { row: 2, col: 3 }, Cell { row: 4, col: 7 }))).unwrap();
+    });
+    step("selection moved", small, &|id| {
+        select(id, Some((Cell { row: 3, col: 1 }, Cell { row: 3, col: 9 }))).unwrap();
+    });
+    step("unselected", small, &|id| select(id, None).unwrap());
+    step("highlighted", small, &|id| {
+        let span = Span {
+            start: Cell { row: 45, col: 0 },
+            end: Cell { row: 45, col: 4 },
+        };
+        set_highlights(id, vec![span]).unwrap();
+    });
+    step(
+        "alternate",
+        small,
+        &output("\x1b[?1049h\x1b[Hfull screen\x1b[5;5Hprogram"),
+    );
+    step("primary", small, &output("\x1b[?1049l"));
+    step("wide", small, &output("日本語 😀 e\u{301}\r\n"));
+    step("cleared", small, &output("\x1b[2J\x1b[Hafter"));
+    step("resized", large, &output("wider\r\n"));
+}

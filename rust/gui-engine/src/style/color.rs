@@ -104,15 +104,10 @@ impl Color {
 
     /// WCAG relative luminance, 0..=1.
     pub fn luminance(&self) -> f64 {
-        let ch = |v: u8| -> f64 {
-            let c = v as f64 / 255.0;
-            if c <= 0.03928 {
-                c / 12.92
-            } else {
-                ((c + 0.055) / 1.055).powf(2.4)
-            }
-        };
-        0.2126 * ch(self.r) + 0.7152 * ch(self.g) + 0.0722 * ch(self.b)
+        let linear = linear_channels();
+        0.2126 * linear[usize::from(self.r)]
+            + 0.7152 * linear[usize::from(self.g)]
+            + 0.0722 * linear[usize::from(self.b)]
     }
 
     /// WCAG contrast ratio between this color and `other` (1..=21).
@@ -689,6 +684,22 @@ fn is_name_prefix(t: &str) -> bool {
         }
     }
     false
+}
+
+// Each 8-bit sRGB channel's linear light, as WCAG defines it. Contrast checks
+// run per cell on every paint, so the curve is evaluated once per level.
+fn linear_channels() -> &'static [f64; 256] {
+    static LINEAR: std::sync::OnceLock<[f64; 256]> = std::sync::OnceLock::new();
+    LINEAR.get_or_init(|| {
+        std::array::from_fn(|v| {
+            let c = v as f64 / 255.0;
+            if c <= 0.03928 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        })
+    })
 }
 
 #[cfg(test)]

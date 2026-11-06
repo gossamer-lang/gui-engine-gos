@@ -9,7 +9,7 @@ use windowing::{Key, MouseButton};
 
 use std::sync::Arc;
 
-use super::frame::{Color as CellColor, Frame};
+use super::frame::{Color as CellColor, Frame, RowVersion};
 use super::images;
 use super::keyboard;
 use super::links::{Link, Place, place};
@@ -18,6 +18,7 @@ use super::{Cell, Event as TerminalEvent, Span, with_entry};
 use crate::accessibility::{AccessNode, Role};
 use crate::geometry::{Constraints, Rect, Size};
 use crate::memory::ByteCache;
+use crate::render::retained::RecordedSpan;
 use crate::style::color::Color;
 use crate::style::{TextRole, Theme};
 use crate::text::layout::{self, LayoutOptions, TextStyle};
@@ -587,6 +588,93 @@ fn in_highlight(ranges: &[(i64, i64)], col: i64) -> bool {
     ranges.iter().any(|(from, to)| (*from..*to).contains(&col))
 }
 
+// The columns `0..cols` of screen row `row` that `in_selection` holds, as
+// `start..end`.
+fn selected_columns(selection: Option<(Cell, Cell)>, row: i64, cols: i64) -> Option<(i64, i64)> {
+    let (a, b) = selection?;
+    let (start, end) = if (a.row, a.col) <= (b.row, b.col) {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    if row < start.row || row > end.row {
+        return None;
+    }
+    let from = if row == start.row {
+        start.col.max(0)
+    } else {
+        0
+    };
+    let to = if row == end.row {
+        end.col.min(cols)
+    } else {
+        cols
+    };
+    (from < to).then_some((from, to))
+}
+
+/// What every row of a paint draws with besides its own cells and marks. A
+/// row recorded with another context would not draw as this paint does.
+#[derive(Debug, PartialEq)]
+struct RowContext {
+    palette: ColorPalette,
+    style: TextStyle,
+    /// Cell width, line height and text rise, by their bits.
+    metrics: [u64; 3],
+    origin: Rect,
+    /// Left and top padding.
+    inset: (i64, i64),
+    /// One and two pixels at the theme's scale, for underlines.
+    rule: (i64, i64),
+    clip: Rect,
+    opacity: i64,
+    bold_bright: bool,
+    legible: bool,
+    fonts: u64,
+    cols: usize,
+}
+
+/// What one row draws: the version of its cells, and the columns the
+/// selection, highlights and hovered links cover in it.
+#[derive(Debug, PartialEq)]
+struct RowKey {
+    version: RowVersion,
+    selected: Option<(i64, i64)>,
+    marks: Vec<(i64, i64)>,
+    lit: Vec<(u16, u16)>,
+}
+
+/// Each screen row's recording in the paint before, which a row drawn the
+/// same way again copies rather than drawing anew.
+#[derive(Debug, Default)]
+pub(super) struct RowCache {
+    context: Option<RowContext>,
+    rows: Vec<Option<(RowKey, RecordedSpan)>>,
+}
+
+impl RowCache {
+    fn begin(&mut self, context: RowContext, rows: usize) {
+        if self.context.as_ref() != Some(&context) {
+            self.rows.clear();
+            self.context = Some(context);
+        }
+        self.rows.resize_with(rows, || None);
+    }
+
+    fn recorded(&self, row: usize, key: &RowKey) -> Option<RecordedSpan> {
+        match self.rows.get(row)? {
+            Some((recorded, span)) if recorded == key => Some(*span),
+            _ => None,
+        }
+    }
+
+    fn store(&mut self, row: usize, recorded: Option<(RowKey, RecordedSpan)>) {
+        if let Some(slot) = self.rows.get_mut(row) {
+            *slot = recorded;
+        }
+    }
+}
+
 fn in_selection(selection: Option<(Cell, Cell)>, row: i64, col: i64) -> bool {
     let Some((a, b)) = selection else {
         return false;
@@ -713,9 +801,47 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
     layouts
         .set_limit(usize::from(frame.rows()) * usize::from(frame.cols()) * LAYOUT_BYTES_PER_CELL);
     let painted_from = layouts.mark();
-    for (row, cells) in frame.cells().iter().enumerate() {
-        let screen_row = row as u16;
-        let row = row as i64;
+    let mut recorded =
+        with_entry(v.terminal, |entry| std::mem::take(&mut entry.rows)).unwrap_or_default();
+    recorded.begin(
+        RowContext {
+            palette: colors.clone(),
+            style: style.clone(),
+            metrics: [cw.to_bits(), lh.to_bits(), rise.to_bits()],
+            origin,
+            inset: (left, pad),
+            rule: (theme.px(1), theme.px(2)),
+            clip: cx.canvas.clip,
+            opacity: cx.canvas.opacity,
+            bold_bright: v.options.bold_bright,
+            legible: v.options.legible,
+            fonts: generation,
+            cols: usize::from(frame.cols()),
+        },
+        frame.cells().len(),
+    );
+    for (index, cells) in frame.cells().iter().enumerate() {
+        let screen_row = index as u16;
+        let row = index as i64;
+        let key = frame.version(screen_row).map(|version| RowKey {
+            version,
+            selected: selected_columns(selection, row, cells.len() as i64),
+            marks: highlighted[index].clone(),
+            lit: hovered
+                .iter()
+                .filter(|l| l.row == screen_row)
+                .map(|l| (l.start, l.end))
+                .collect(),
+        });
+        if let Some(span) = key
+            .as_ref()
+            .and_then(|key| recorded.recorded(index, key))
+            .and_then(|span| cx.canvas.replay_span(span))
+        {
+            recorded.store(index, key.map(|key| (key, span)));
+            continue;
+        }
+        let mark = cx.canvas.recorded_mark();
         // Cells take whole-pixel edges from the fractional grid, so each
         // meets its neighbors with neither a gap nor an overlap.
         let y = pad + (row as f64 * lh) as i64;
@@ -843,6 +969,7 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
             }
             col = end.max(col + 1);
         }
+        recorded.store(index, key.zip(cx.canvas.recorded_span(mark)));
     }
     // A row the screen no longer shows only comes back by scrolling back,
     // which lays it out again, so the cache keeps the runs this paint drew.
@@ -859,6 +986,7 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
     pictures.keep(&used);
     with_entry(v.terminal, |entry| {
         entry.layouts = layouts;
+        entry.rows = recorded;
         entry.pictures = pictures;
         entry.animation_due = match (below, above) {
             (Some(a), Some(b)) => Some(a.min(b)),

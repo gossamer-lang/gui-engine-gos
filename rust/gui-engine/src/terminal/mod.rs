@@ -203,6 +203,8 @@ struct Entry {
     layouts: ByteCache<String, TextLayout>,
     /// The font registry generation `layouts` were made in.
     layouts_generation: u64,
+    /// The rows the widget recorded when it last painted the screen.
+    rows: widget::RowCache,
     /// The links the screen showed when the widget last painted it.
     links: Vec<links::Link>,
     /// The link under the pointer, which the screen underlines.
@@ -366,6 +368,7 @@ pub fn create(options: &Options, budget: Budget) -> Result<i64, String> {
             charset: None,
             layouts: ByteCache::new(0),
             layouts_generation: 0,
+            rows: widget::RowCache::default(),
             links: Vec::new(),
             hovered: None,
             pointed: None,

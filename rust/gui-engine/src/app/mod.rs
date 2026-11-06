@@ -122,8 +122,11 @@ pub struct WindowState {
     pub commands: CommandTable,
     pub dirty: bool,
     /// Terminal output arrived that the window has not painted yet; the event
-    /// loop paints it at most once per `OUTPUT_FRAME_MS`.
+    /// loop paints it at most once per `output_frame_ms`.
     pub output_dirty: bool,
+    /// The shortest time between two paints of new terminal output, in
+    /// milliseconds: one refresh of the display the window is on.
+    pub output_frame_ms: i64,
     /// Session time of the window's last paint that showed new terminal
     /// output, in milliseconds.
     pub output_presented: Option<i64>,
@@ -357,10 +360,30 @@ pub struct ResourceUsage {
 const LOG_LIMIT: i64 = 400;
 
 const FRAME_MS: i64 = 33;
-/// The shortest time between two paints that show terminal output, so a
-/// program writing fast is parsed in large runs rather than painted per read.
-/// Output after a quiet spell paints at once, whatever else painted lately.
+/// The shortest time between two paints that show terminal output on a
+/// display that reports no refresh rate, so a program writing fast is parsed in
+/// large runs rather than painted per read. Output after a quiet spell paints
+/// at once, whatever else painted lately.
 const OUTPUT_FRAME_MS: i64 = 16;
+
+// One refresh of the display `native` is on.
+fn output_frame_ms(native: &windowing::Window) -> i64 {
+    refresh_ms(
+        native
+            .display()
+            .map_or(0.0, |display| display.mode.refresh_rate),
+    )
+}
+
+// One refresh at `rate` hertz in whole milliseconds rounded down, so paints
+// keep up with the display rather than fall behind it.
+fn refresh_ms(rate: f64) -> i64 {
+    if rate > 0.0 {
+        ((1000.0 / rate) as i64).max(1)
+    } else {
+        OUTPUT_FRAME_MS
+    }
+}
 // How long a held toast waits before its timeout is looked at again.
 const TOAST_RECHECK_MS: i64 = 1000;
 // Assistive technology hears at most one announcement per interval, so a
@@ -770,6 +793,7 @@ impl Session {
         root.compact_maps();
         self.windows.push(WindowState {
             key: key.to_string(),
+            output_frame_ms: output_frame_ms(&native),
             native,
             title: title.to_string(),
             root: root.clone(),
@@ -1350,8 +1374,8 @@ impl Session {
         self.settle_paced(false)
     }
 
-    // `settle`, painting terminal output no more often than `OUTPUT_FRAME_MS`
-    // when `paced`.
+    // `settle`, painting terminal output no more often than each window's
+    // `output_frame_ms` when `paced`.
     fn settle_paced(&mut self, paced: bool) -> Result<(), errors::Error> {
         // A pass that held the terminals' wakes and then painted every frame
         // that waited has no frame left to take them back, so another pass
@@ -1397,7 +1421,7 @@ impl Session {
                 && self.windows.iter().any(|w| {
                     w.output_dirty
                         && w.output_presented
-                            .is_some_and(|at| now - at < OUTPUT_FRAME_MS)
+                            .is_some_and(|at| now - at < w.output_frame_ms)
                 });
             held_any |= held;
             let (terminals_changed, terminal_events) = crate::terminal::pump(&self.budget, held);
@@ -1442,7 +1466,7 @@ impl Session {
                 && (!paced
                     || window
                         .output_presented
-                        .is_none_or(|at| now - at >= OUTPUT_FRAME_MS))
+                        .is_none_or(|at| now - at >= window.output_frame_ms))
             {
                 window.output_dirty = false;
                 window.output_presented = Some(now);
@@ -1564,7 +1588,7 @@ impl Session {
             .filter(|w| w.output_dirty)
             .map(|w| {
                 w.output_presented
-                    .map_or(self.now(), |at| at + OUTPUT_FRAME_MS)
+                    .map_or(self.now(), |at| at + w.output_frame_ms)
             })
             .min()
     }
@@ -2058,6 +2082,22 @@ impl Session {
                         self.invalidate(w as i64, "display scale changed")
                     }
                     w += 1;
+                }
+            }
+            windowing::Event::DisplayChanged { window, .. } => {
+                let w = self.find_native(*window);
+                if w >= 0 {
+                    let window = &mut self.windows[w as usize];
+                    window.output_frame_ms = output_frame_ms(&window.native);
+                }
+            }
+            // A display waking or arriving takes over from the one SDL made up
+            // while none was connected, which reports no refresh rate.
+            windowing::Event::DisplayModeChanged { .. }
+            | windowing::Event::DisplayAdded { .. }
+            | windowing::Event::DisplayRemoved { .. } => {
+                for window in &mut self.windows {
+                    window.output_frame_ms = output_frame_ms(&window.native);
                 }
             }
             windowing::Event::Restored { window } | windowing::Event::WindowShown { window } => {
@@ -8044,7 +8084,7 @@ mod advance_tests {
             s.step_held_clock(0).unwrap();
             assert!(s.windows[0].output_dirty);
             assert_eq!(s.windows[0].frames, painted + 1);
-            s.step_held_clock(OUTPUT_FRAME_MS - 1).unwrap();
+            s.step_held_clock(s.windows[0].output_frame_ms - 1).unwrap();
             assert_eq!(s.windows[0].frames, painted + 1);
             s.step_held_clock(1).unwrap();
             assert_eq!(s.windows[0].frames, painted + 2);
@@ -8507,5 +8547,20 @@ mod window_command_tests {
             assert!(!s.windows[1].native.is_fullscreen());
             s.shutdown()
         })
+    }
+}
+
+#[cfg(test)]
+mod output_pacing_tests {
+    use super::*;
+
+    #[test]
+    fn output_paints_once_per_refresh_of_the_display_and_at_60_hz_without_one() {
+        assert_eq!(refresh_ms(60.0), 16);
+        assert_eq!(refresh_ms(59.94), 16);
+        assert_eq!(refresh_ms(120.0), 8);
+        assert_eq!(refresh_ms(144.0), 6);
+        assert_eq!(refresh_ms(30.0), 33);
+        assert_eq!(refresh_ms(0.0), OUTPUT_FRAME_MS);
     }
 }

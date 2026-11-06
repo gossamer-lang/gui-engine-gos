@@ -656,7 +656,9 @@ mod tests {
                 .insert(thread::current().name().map(str::to_owned));
         });
         let mut pty = Pty::spawn(
-            &command("seq 1 40000"),
+            // Output passes untranslated, so the bytes kept are the ones
+            // the program wrote.
+            &command("stty -onlcr; seq 1 40000"),
             24,
             80,
             (0, 0),
@@ -666,7 +668,7 @@ mod tests {
         )
         .unwrap();
         let text = collect(&pty, &wakes, &kept, |_, got| got.eof);
-        let expected: String = (1..=40000).map(|n| format!("{n}\r\n")).collect();
+        let expected: String = (1..=40000).map(|n| format!("{n}\n")).collect();
         assert!(
             text == expected,
             "{} bytes of {}",

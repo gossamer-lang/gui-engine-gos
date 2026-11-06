@@ -513,8 +513,9 @@ pub fn spawn(id: i64, command: &Command) -> Result<(), String> {
         }
         let (rows, cols) = entry.engine.size();
         let cell = entry.engine.cell();
-        // The reader parses the output it reads on its own thread, under the
-        // registry lock, while the session's thread paints what came before.
+        // The transport parses the output it reads on its own threads, under
+        // the registry lock, while the session's thread paints what came
+        // before.
         let sink: transport::Sink = Box::new(move |bytes: &[u8]| {
             if let Some(entry) = TERMINALS.lock().get_mut(&id) {
                 take_output(entry, bytes);
@@ -1011,7 +1012,7 @@ pub(crate) fn pump(budget: &Budget, held: bool) -> (bool, Vec<UiMsg>) {
         if held || !transport.has_pending_output() {
             continue;
         }
-        // The reader parsed the output; what is left is its end and the
+        // The transport parsed the output; what is left is its end and the
         // program's exit.
         let drained = transport.drain();
         for (title, body) in entry.engine.take_toasts() {

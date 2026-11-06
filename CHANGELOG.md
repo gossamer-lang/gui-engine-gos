@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.3 - Faster terminal output
+
+- Terminal output that keeps arriving while it takes longer to parse than to read, such as colored or non-Latin text, is parsed on a thread of its own while the next output is read, so it streams faster; plain text and a program's reply to typing are still parsed as they are read.
+- Text in non-Latin scripts, and text that mixes scripts, parses faster, and a combining mark at the start of output joins the character before it only when the two form one grapheme: builds on wezterm-lite 0.1.6.
+
 ## 0.2.2 - Faster terminal repaints
 
 - A terminal repaint copies each row that looks as it did in the frame before instead of drawing it again, so a keystroke, or a program redrawing a few lines of a full screen, costs about a tenth of a whole repaint.

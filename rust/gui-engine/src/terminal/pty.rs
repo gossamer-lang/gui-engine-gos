@@ -1,6 +1,6 @@
 //! Unix pseudo-terminal sessions. Blocking readiness waits are interrupted
 //! through a socket pair, and fixed reservations cover the queues, IO buffers
-//! and the three IO threads' stacks.
+//! and the IO threads' stacks.
 
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
@@ -13,7 +13,8 @@ use portable_pty::{Child, CommandBuilder, MasterPty};
 
 use super::Command;
 use super::transport::{
-    BATCH, CHUNK, Drain, Ending, INPUT, Notify, Queue, STACK, Sink, Slot, check_command, pty_size,
+    BATCH, CHUNK, Drain, Ending, Handoff, INPUT, Notify, Output, Queue, STACK, Sink, Slot,
+    check_command, pty_size,
 };
 use crate::memory::{Budget, Lease};
 
@@ -25,6 +26,7 @@ pub struct Pty {
     cancel: UnixStream,
     /// Wakes the reader to hand back memory freed while it waited.
     release: UnixStream,
+    handoff: Arc<Handoff>,
     stopping: Arc<AtomicBool>,
     reader: Option<JoinHandle<()>>,
     writer: Option<JoinHandle<()>>,
@@ -152,6 +154,18 @@ fn readiness(fd: i32, cancel: i32, release: Option<i32>, events: i16) -> Result<
     }
 }
 
+/// Whether `fd` has output to read now.
+fn readable(fd: i32) -> bool {
+    let mut pollfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `pollfd` is one initialized record; the PTY descriptor stays
+    // open until the reader that calls this has joined.
+    unsafe { libc::poll(&mut pollfd, 1, 0) > 0 }
+}
+
 fn would_block(error: &std::io::Error) -> bool {
     matches!(
         error.kind(),
@@ -175,7 +189,7 @@ impl Pty {
         let slot = Slot::acquire()?;
         let notify = Arc::new(Notify::new(wake));
         let dimensions = pty_size(rows, cols, cell)?;
-        let lease = budget.reserve(3 * INPUT + 3 * STACK + 4 * CHUNK + BATCH + 64 * 1024)?;
+        let lease = budget.reserve(3 * INPUT + 4 * STACK + 4 * CHUNK + 3 * BATCH + 64 * 1024)?;
         let pair = portable_pty::native_pty_system()
             .openpty(dimensions)
             .map_err(|e| e.to_string())?;
@@ -216,12 +230,14 @@ impl Pty {
         let input = Arc::new(Queue::new(INPUT));
         let ending = Arc::new(Ending::default());
         let stopping = Arc::new(AtomicBool::new(false));
+        let handoff = Arc::new(Handoff::default());
         let mut pty = Self {
             master: Some(pair.master),
             input: input.clone(),
             ending: ending.clone(),
             cancel,
             release,
+            handoff: handoff.clone(),
             stopping: stopping.clone(),
             reader: None,
             writer: None,
@@ -235,6 +251,7 @@ impl Pty {
         let end = ending.clone();
         let stop = stopping.clone();
         let wake = notify.clone();
+        let mut output = Output::new(sink, notify.clone(), handoff);
         pty.reader = Some(
             thread::Builder::new()
                 .name("gui-pty-read".into())
@@ -242,9 +259,7 @@ impl Pty {
                 .spawn(move || {
                     let mut buffer = [0; CHUNK];
                     let mut batch = Vec::with_capacity(BATCH + CHUNK);
-                    // Output goes to the sink as it is read; while the sink
-                    // parses a batch, the kernel holds what the program
-                    // writes, so a slow sink holds the program back.
+                    let mut ended = false;
                     while !stop.load(Ordering::Acquire) {
                         match readiness(
                             fd,
@@ -260,8 +275,9 @@ impl Pty {
                             }
                             Ok(Wake::Cancelled) | Err(_) => break,
                         }
+                        let ready = std::time::Instant::now();
                         batch.clear();
-                        let ended = loop {
+                        ended = loop {
                             match reader.read(&mut buffer) {
                                 Ok(0) => break true,
                                 Ok(n) => {
@@ -274,13 +290,20 @@ impl Pty {
                                 Err(_) => break true,
                             }
                         };
-                        if !batch.is_empty() {
-                            sink(&batch);
-                            wake.fire();
+                        let read = ready.elapsed();
+                        if !batch.is_empty() && !output.deliver(&batch, read, || readable(fd)) {
+                            break;
                         }
                         if ended {
                             break;
                         }
+                    }
+                    // The program's last output is parsed before its end is
+                    // known; a cancelled reader drops what is left.
+                    if ended {
+                        output.finish();
+                    } else {
+                        drop(output);
                     }
                     end.finish(true, None);
                     wake.fire();
@@ -418,6 +441,7 @@ impl Pty {
     /// waits for output, as a compaction of its history does.
     pub fn release_memory(&self) {
         let _ = (&self.release).write(&[1]);
+        self.handoff.release();
     }
 
     /// Input bytes waiting for the program.
@@ -497,6 +521,7 @@ impl Pty {
             return Ok(());
         }
         self.input.close();
+        self.handoff.close();
         let _ = (&self.cancel).write_all(&[1]);
         if let Some(master) = &self.master
             && let Some(fd) = master.as_raw_fd()
@@ -611,6 +636,44 @@ mod tests {
         assert!(text.contains("got:héllo 界"), "{text}");
         assert!(text.contains("18 66"), "{text}");
         assert_eq!(pty.drain().exit, Some(Ok(7)));
+        pty.close().unwrap();
+        drop(pty);
+        assert_eq!(budget.usage().0, 0);
+    }
+
+    #[test]
+    fn a_stream_outrunning_its_parse_goes_through_the_parser_whole_and_before_its_end() {
+        let budget = Budget::new(8 * 1024 * 1024);
+        let (wake, wakes) = waker();
+        let kept = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let parsers = Arc::new(parking_lot::Mutex::new(std::collections::BTreeSet::new()));
+        let (into, seen) = (kept.clone(), parsers.clone());
+        // Each parse takes long enough for more of the stream to arrive.
+        let output: Sink = Box::new(move |bytes: &[u8]| {
+            thread::sleep(std::time::Duration::from_millis(2));
+            into.lock().extend_from_slice(bytes);
+            seen.lock()
+                .insert(thread::current().name().map(str::to_owned));
+        });
+        let mut pty = Pty::spawn(
+            &command("seq 1 40000"),
+            24,
+            80,
+            (0, 0),
+            &budget,
+            wake,
+            output,
+        )
+        .unwrap();
+        let text = collect(&pty, &wakes, &kept, |_, got| got.eof);
+        let expected: String = (1..=40000).map(|n| format!("{n}\r\n")).collect();
+        assert!(
+            text == expected,
+            "{} bytes of {}",
+            text.len(),
+            expected.len()
+        );
+        assert!(parsers.lock().contains(&Some("gui-term-parse".to_owned())));
         pty.close().unwrap();
         drop(pty);
         assert_eq!(budget.usage().0, 0);

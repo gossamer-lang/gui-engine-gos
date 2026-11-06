@@ -208,7 +208,7 @@ fn a_synchronized_frame_is_shown_once_the_program_ends_it() {
     );
     assert!(!held, "a frame still open was reported as a change");
     std::fs::write(&gate, "\n").unwrap();
-    // The reader parses the frame's end; the next pump reports it.
+    // The transport parses the frame's end; the next pump reports it.
     while !text().contains("whole") {
         std::thread::yield_now();
     }

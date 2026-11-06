@@ -17,7 +17,8 @@ use windows_sys::Win32::System::Threading::{
 
 use super::Command;
 use super::transport::{
-    BATCH, CHUNK, Drain, Ending, INPUT, Notify, Queue, STACK, Sink, Slot, check_command, pty_size,
+    BATCH, CHUNK, Drain, Ending, Handoff, INPUT, Notify, Output, Queue, STACK, Sink, Slot,
+    check_command, pty_size,
 };
 use crate::memory::{Budget, Lease};
 
@@ -29,6 +30,7 @@ pub struct Pty {
     input: Arc<Queue>,
     ending: Arc<Ending>,
     closing: Arc<AtomicBool>,
+    handoff: Arc<Handoff>,
     reader: Option<JoinHandle<()>>,
     writer: Option<JoinHandle<()>>,
     waiter: Option<JoinHandle<()>>,
@@ -94,7 +96,7 @@ impl Pty {
         check_command(&command.program, &command.args)?;
         let slot = Slot::acquire()?;
         let notify = Arc::new(Notify::new(wake));
-        let lease = budget.reserve(3 * INPUT + 4 * STACK + 4 * CHUNK + BATCH + 64 * 1024)?;
+        let lease = budget.reserve(3 * INPUT + 5 * STACK + 4 * CHUNK + 3 * BATCH + 64 * 1024)?;
         let pair = portable_pty::native_pty_system()
             .openpty(pty_size(rows, cols, cell)?)
             .map_err(|e| e.to_string())?;
@@ -127,6 +129,7 @@ impl Pty {
         let input = Arc::new(Queue::new(INPUT));
         let ending = Arc::new(Ending::default());
         let closing = Arc::new(AtomicBool::new(false));
+        let handoff = Arc::new(Handoff::default());
         let mut pty = Self {
             master: Some(pair.master),
             process,
@@ -134,6 +137,7 @@ impl Pty {
             input: input.clone(),
             ending: ending.clone(),
             closing: closing.clone(),
+            handoff: handoff.clone(),
             reader: None,
             writer: None,
             waiter: None,
@@ -144,27 +148,35 @@ impl Pty {
         let end = ending.clone();
         let stop = closing.clone();
         let wake = notify.clone();
+        let mut output = Output::new(sink, notify.clone(), handoff);
         pty.reader = Some(
             thread::Builder::new()
                 .name("gui-conpty-read".into())
                 .stack_size(STACK)
                 .spawn(move || {
                     let mut buffer = vec![0; BATCH];
-                    // Output goes to the sink as it is read; while the sink
-                    // parses, the pipe holds what the program writes.
                     loop {
+                        let started = std::time::Instant::now();
                         match reader.read(&mut buffer) {
                             Ok(0) => break,
                             // Closing flushes output synchronously; it is read
                             // and discarded so the close can finish.
                             Ok(_) if stop.load(Ordering::Acquire) => (),
+                            // A read that fills the buffer left output behind it.
                             Ok(n) => {
-                                sink(&buffer[..n]);
-                                wake.fire();
+                                output
+                                    .deliver(&buffer[..n], started.elapsed(), || n == buffer.len());
                             }
                             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => (),
                             Err(_) => break,
                         }
+                    }
+                    // The program's last output is parsed before its end is
+                    // known; a closing transport drops what is left.
+                    if stop.load(Ordering::Acquire) {
+                        drop(output);
+                    } else {
+                        output.finish();
                     }
                     end.finish(true, None);
                     wake.fire();
@@ -244,9 +256,11 @@ impl Pty {
         self.input.want_room();
     }
 
-    /// The reader waits in a pipe read nothing wakes; it hands back memory
-    /// freed for it once output next arrives.
-    pub fn release_memory(&self) {}
+    /// The reader waits in a pipe read nothing wakes, so it hands back memory
+    /// freed for it once output next arrives; the parser thread does now.
+    pub fn release_memory(&self) {
+        self.handoff.release();
+    }
 
     pub fn has_pending_output(&self) -> bool {
         self.notify.is_pending()
@@ -290,6 +304,7 @@ impl Pty {
             return Ok(());
         }
         self.input.close();
+        self.handoff.close();
         let terminated = terminate(&self.process);
         if let Some(writer) = self.writer.take() {
             // SAFETY: the writer thread is alive until joined below; cancelling

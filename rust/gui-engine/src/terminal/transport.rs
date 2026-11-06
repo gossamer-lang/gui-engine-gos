@@ -3,6 +3,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
 
@@ -189,9 +190,199 @@ pub(crate) fn drain(ending: &Ending, notify: &Notify) -> Drain {
     }
 }
 
-/// Where a transport's reader hands what it reads, on the reader's own
-/// thread, so output is parsed while the session's thread paints.
-pub(crate) type Sink = Box<dyn Fn(&[u8]) + Send>;
+/// Where a transport hands the output it reads, on its reader's thread or
+/// its parser's, so output is parsed while the session's thread paints.
+pub(crate) type Sink = Box<dyn Fn(&[u8]) + Send + Sync>;
+
+/// Output read while the parser thread still parses what came before it.
+#[derive(Default)]
+struct Backlog {
+    bytes: Vec<u8>,
+    /// The parser holds output it has not finished, so later output goes
+    /// behind it rather than to the reader's own parse.
+    busy: bool,
+    /// The parser takes the backlog that is left, then ends.
+    finishing: bool,
+    /// The transport closes; output not yet parsed is dropped.
+    closed: bool,
+    /// The parser hands back memory others freed for it before it waits.
+    release: bool,
+}
+
+/// The state a transport's reader and its parser thread share.
+#[derive(Default)]
+pub(crate) struct Handoff {
+    state: Mutex<Backlog>,
+    arrived: Condvar,
+    room: Condvar,
+}
+
+impl Handoff {
+    /// Drops the backlog and ends the parser; a reader waiting for room
+    /// stops waiting.
+    pub(crate) fn close(&self) {
+        let mut state = self.state.lock();
+        state.closed = true;
+        state.bytes = Vec::new();
+        self.arrived.notify_all();
+        self.room.notify_all();
+    }
+
+    /// Has the parser hand back the memory others freed for it.
+    pub(crate) fn release(&self) {
+        self.state.lock().release = true;
+        self.arrived.notify_all();
+    }
+}
+
+/// A reader's way to the sink. Output that comes while nothing is parsing
+/// is parsed on the reader, which keeps a reply to typing one thread away.
+/// Output that keeps arriving while its parse takes longer than reading it
+/// goes to a parser thread, so the reader reads the next output during the
+/// parse; where reading takes the longer share, as for plain text, the
+/// parser thread would save little and cost a wake a batch.
+pub(crate) struct Output {
+    sink: Arc<Sink>,
+    notify: Arc<Notify>,
+    handoff: Arc<Handoff>,
+    parser: Option<std::thread::JoinHandle<()>>,
+    /// Output arrived while the reader parsed the last of it, which took
+    /// longer than reading it.
+    streaming: bool,
+}
+
+impl Output {
+    pub(crate) fn new(sink: Sink, notify: Arc<Notify>, handoff: Arc<Handoff>) -> Self {
+        Self {
+            sink: Arc::new(sink),
+            notify,
+            handoff,
+            parser: None,
+            streaming: false,
+        }
+    }
+
+    /// Parses `bytes`, which took `read` to read, here or on the parser
+    /// thread, in the order read; `arriving` answers, after a parse here,
+    /// whether more output waits. While the parser is behind by a batch the
+    /// reader waits for it, so a slow parse still holds the program back.
+    /// False once the transport closed.
+    pub(crate) fn deliver(
+        &mut self,
+        bytes: &[u8],
+        read: Duration,
+        arriving: impl FnOnce() -> bool,
+    ) -> bool {
+        let mut state = self.handoff.state.lock();
+        if state.closed {
+            return false;
+        }
+        if !state.busy && !self.streaming {
+            drop(state);
+            let parsing = Instant::now();
+            (self.sink)(bytes);
+            self.notify.fire();
+            self.streaming = parsing.elapsed() > read && arriving();
+            return true;
+        }
+        if self.parser.is_none() {
+            match self.spawn_parser() {
+                Some(parser) => self.parser = Some(parser),
+                None => {
+                    // Without a parser thread the reader parses output itself.
+                    drop(state);
+                    (self.sink)(bytes);
+                    self.notify.fire();
+                    return true;
+                }
+            }
+        }
+        self.streaming = false;
+        while !state.closed && !state.bytes.is_empty() && state.bytes.len() + bytes.len() > BATCH {
+            self.handoff.room.wait(&mut state);
+        }
+        if state.closed {
+            return false;
+        }
+        state.bytes.extend_from_slice(bytes);
+        state.busy = true;
+        self.handoff.arrived.notify_one();
+        true
+    }
+
+    fn spawn_parser(&self) -> Option<std::thread::JoinHandle<()>> {
+        let sink = self.sink.clone();
+        let notify = self.notify.clone();
+        let handoff = self.handoff.clone();
+        std::thread::Builder::new()
+            .name("gui-term-parse".into())
+            .stack_size(STACK)
+            .spawn(move || parse(&handoff, &sink, &notify))
+            .ok()
+    }
+
+    /// Parses the output handed off and not yet parsed, then ends the parser.
+    pub(crate) fn finish(mut self) {
+        {
+            let mut state = self.handoff.state.lock();
+            state.finishing = true;
+            self.handoff.arrived.notify_all();
+        }
+        if let Some(parser) = self.parser.take() {
+            let _ = parser.join();
+        }
+    }
+}
+
+impl Drop for Output {
+    fn drop(&mut self) {
+        if let Some(parser) = self.parser.take() {
+            self.handoff.close();
+            let _ = parser.join();
+        }
+    }
+}
+
+/// The parser thread: takes the backlog whole and parses it, until the
+/// transport closes, or finishes and the backlog is empty.
+fn parse(handoff: &Handoff, sink: &Sink, notify: &Notify) {
+    let mut taken = Vec::new();
+    loop {
+        let mut state = handoff.state.lock();
+        if state.closed {
+            return;
+        }
+        if state.bytes.is_empty() {
+            // Nothing is left to parse: the reader parses what comes next
+            // itself, and the stream's buffers go back.
+            state.busy = false;
+            state.bytes = Vec::new();
+            taken = Vec::new();
+            if state.finishing {
+                return;
+            }
+            state.release = false;
+            drop(state);
+            let bound = windowing::idle::thread_idle();
+            let mut state = handoff.state.lock();
+            if state.bytes.is_empty() && !(state.closed || state.finishing || state.release) {
+                match bound {
+                    Some(bound) => {
+                        handoff.arrived.wait_for(&mut state, bound);
+                    }
+                    None => handoff.arrived.wait(&mut state),
+                }
+            }
+            continue;
+        }
+        std::mem::swap(&mut taken, &mut state.bytes);
+        handoff.room.notify_one();
+        drop(state);
+        sink(&taken);
+        notify.fire();
+        taken.clear();
+    }
+}
 
 /// Bounds native IO threads and descriptors process-wide, beside the byte
 /// admission each transport makes.

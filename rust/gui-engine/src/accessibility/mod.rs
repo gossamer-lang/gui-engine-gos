@@ -5,7 +5,7 @@ pub mod live;
 pub mod native;
 pub mod protocol;
 pub mod provider;
-#[cfg(target_os = "linux")]
+#[cfg(free_unix)]
 pub mod wire;
 
 // accessibility: the semantic tree. Every window mirrors its widget tree

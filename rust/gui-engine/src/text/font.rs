@@ -58,12 +58,14 @@ pub struct ColorGlyph {
     pub bearing_y: i64,
 }
 
-/// A font file's bytes: a file built into the program, read where it lies, or
-/// one loaded at run time, shared by every face it holds.
+/// A font file's bytes: a file built into the program, read where it lies, one
+/// loaded at run time, or an installed file mapped read-only; shared by every
+/// face it holds.
 #[derive(Clone)]
 pub enum FontBytes {
     Static(&'static [u8]),
     Shared(std::sync::Arc<Vec<u8>>),
+    Mapped(std::sync::Arc<memmap2::Mmap>),
 }
 
 impl FontBytes {
@@ -72,10 +74,10 @@ impl FontBytes {
         Self::Shared(std::sync::Arc::new(data))
     }
 
-    /// The heap the bytes occupy; a built-in file occupies none.
+    /// The heap the bytes occupy; a built-in or mapped file occupies none.
     fn heap_bytes(&self) -> usize {
         match self {
-            Self::Static(_) => 0,
+            Self::Static(_) | Self::Mapped(_) => 0,
             Self::Shared(data) => data.len(),
         }
     }
@@ -87,13 +89,16 @@ impl std::ops::Deref for FontBytes {
         match self {
             Self::Static(data) => data,
             Self::Shared(data) => data,
+            Self::Mapped(data) => data,
         }
     }
 }
 
 impl PartialEq for FontBytes {
+    // The same file compares equal by address, without touching its pages.
     fn eq(&self, other: &Self) -> bool {
-        **self == **other
+        let (a, b): (&[u8], &[u8]) = (self, other);
+        std::ptr::eq(a, b) || a == b
     }
 }
 
@@ -143,7 +148,7 @@ impl Face {
     /// faces loaded from it, when it was loaded at run time.
     pub(crate) fn shared_file(&self) -> Option<(usize, usize)> {
         match &self.data {
-            FontBytes::Static(_) => None,
+            FontBytes::Static(_) | FontBytes::Mapped(_) => None,
             FontBytes::Shared(data) => Some((std::sync::Arc::as_ptr(data) as usize, data.len())),
         }
     }

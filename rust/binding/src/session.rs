@@ -83,7 +83,7 @@ fn activate_window(native: windowing::Window, token: &str) -> Result<(), String>
         .focus_with_activation(token)
         .map_err(|e| e.to_string())?;
     native.sync().map_err(|e| e.to_string())?;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     if windowing::video_driver() == "x11" && native.is_visible() {
         use x11_dl::xlib;
         let windowing::surface::RawHandle::Xlib {

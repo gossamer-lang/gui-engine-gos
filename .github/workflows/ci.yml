@@ -16,7 +16,7 @@ env:
   WINDOWING_REPO: gossamer-lang/windowing-gos
   # The windowing release project.toml depends on. The Rust crates check
   # against a checkout of the same tag beside this one.
-  WINDOWING_REF: ${{ vars.WINDOWING_REF || 'v0.1.9' }}
+  WINDOWING_REF: ${{ vars.WINDOWING_REF || 'v0.1.10' }}
   RUSTUP_TOOLCHAIN: 1.95.0
   # Every job draws into SDL's offscreen driver, which needs no display.
   SDL_VIDEO_DRIVER: offscreen

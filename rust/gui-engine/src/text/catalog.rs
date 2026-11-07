@@ -32,14 +32,15 @@ pub struct FontRecord {
     /// Whether the face draws color bitmaps (CBDT) instead of outlines.
     pub color: bool,
     /// The scalars the face has glyphs for, as inclusive (first, last)
-    /// pairs flattened into one sorted list.
-    pub coverage: Vec<i64>,
+    /// pairs flattened into one sorted list. Faces that cover the same
+    /// scalars, as a family's weights and styles mostly do, share one list.
+    pub coverage: std::sync::Arc<[u32]>,
 }
 
 impl FontRecord {
     /// Whether the face has a glyph for `c`.
     pub fn covers(&self, c: char) -> bool {
-        let code = c as i64;
+        let code = u32::from(c);
         let mut lo = 0;
         let mut hi = self.coverage.len() / 2;
         while lo < hi {
@@ -126,7 +127,11 @@ pub fn scan_file(file: &str) -> Result<Vec<FontRecord>, errors::Error> {
             weight: face.weight,
             monospace: face.monospace,
             color,
-            coverage: face.coverage(),
+            coverage: face
+                .coverage()
+                .into_iter()
+                .map(|code| u32::try_from(code).unwrap_or(u32::MAX))
+                .collect(),
         })
     }
     Ok(out)
@@ -206,7 +211,7 @@ impl FontRecord {
             + self.path.capacity()
             + self.family.capacity()
             + self.style.capacity()
-            + self.coverage.capacity() * size_of::<i64>()
+            + self.coverage.len() * size_of::<u32>()
     }
 }
 
@@ -309,7 +314,22 @@ pub fn load_cancellable(
             let _ = services::write_atomic(cache, &bytes.0);
         }
     }
-    Ok(entries.into_iter().flat_map(|entry| entry.faces).collect())
+    let mut records: Vec<FontRecord> = entries.into_iter().flat_map(|entry| entry.faces).collect();
+    share_coverage(&mut records);
+    Ok(records)
+}
+
+// Equal coverage lists become one shared allocation.
+fn share_coverage(records: &mut [FontRecord]) {
+    let mut lists: HashSet<std::sync::Arc<[u32]>> = HashSet::new();
+    for record in records {
+        match lists.get(&record.coverage) {
+            Some(list) => record.coverage = std::sync::Arc::clone(list),
+            None => {
+                lists.insert(std::sync::Arc::clone(&record.coverage));
+            }
+        }
+    }
 }
 
 /// Where the toolkit caches the summaries of installed fonts.
@@ -366,5 +386,28 @@ mod tests {
         fs::write(&cache, text.replace("DejaVu Sans", "Cached Sans")).unwrap();
         assert_eq!(load(&[SANS.to_string()], &cache)[0].family, "Cached Sans");
         assert_eq!(load(&[], &cache).len(), 0)
+    }
+
+    #[test]
+    fn faces_covering_the_same_scalars_share_one_list() {
+        let config = crate::services::private_test_config();
+        let _defer = scopeguard::guard((), |_| {
+            crate::services::remove_test_config(&config);
+        });
+        let cache = paths::join(&config, "fonts.json");
+        let mono = "assets/fonts/DejaVuSansMono.ttf".to_string();
+        for _ in 0..2 {
+            let records = load(&[SANS.to_string(), mono.clone(), SANS.to_string()], &cache);
+            assert_eq!(records.len(), 3);
+            assert!(std::sync::Arc::ptr_eq(
+                &records[0].coverage,
+                &records[2].coverage
+            ));
+            assert!(!std::sync::Arc::ptr_eq(
+                &records[0].coverage,
+                &records[1].coverage
+            ));
+            assert!(records[0].covers('A') && !records[0].covers('\u{10FFFF}'));
+        }
     }
 }

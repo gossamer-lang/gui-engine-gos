@@ -366,6 +366,8 @@ struct Subtrees {
     limit: usize,
     clock: u64,
     hits: u64,
+    /// Entries last used before this clock are dropped by the next sweep.
+    swept: u64,
 }
 #[derive(Debug)]
 struct Subtree {
@@ -416,6 +418,17 @@ impl SubtreeCache {
     }
     fn take_hits(&self) -> u64 {
         std::mem::take(&mut self.0.lock().hits)
+    }
+    fn sweep(&self) -> bool {
+        let mut data = self.0.lock();
+        let next = data.clock + 1;
+        let mark = std::mem::replace(&mut data.swept, next);
+        data.entries.retain(|e| e.used >= mark);
+        if data.entries.is_empty() {
+            data.entries = Vec::new();
+        }
+        data.bytes = data.entries.iter().map(|e| e.bytes).sum();
+        !data.entries.is_empty()
     }
 }
 impl Scene {
@@ -538,6 +551,8 @@ pub struct Retained {
     /// The recording the next commit retains.
     pending_id: u64,
     tiles: Vec<Tile>,
+    /// Tiles last used before this frame are dropped by the next sweep.
+    swept: u64,
     /// The latest content revisions each tile position showed, newest last.
     /// A raster is cached only for content that comes back after other
     /// content replaced it there: content that recurs (a blinking cursor, a
@@ -572,6 +587,7 @@ impl Retained {
             scene_id: 0,
             pending_id: 0,
             tiles: vec![],
+            swept: 0,
             seen: HashMap::new(),
             subtrees: SubtreeCache::default(),
             budgets: Budgets::default(),
@@ -609,6 +625,24 @@ impl Retained {
     }
     pub fn scene(&self) -> &Scene {
         &self.scene
+    }
+    /// Drops the raster tiles and subtrees no frame has reused since the
+    /// previous sweep; content that comes back later rasters again. Answers
+    /// whether any remain for a later sweep.
+    pub fn sweep(&mut self) -> bool {
+        let mark = std::mem::replace(&mut self.swept, self.clock + 1);
+        self.tiles.retain(|t| t.used >= mark);
+        if self.tiles.is_empty() {
+            self.tiles = Vec::new();
+        }
+        let subtrees = self.subtrees.sweep();
+        self.stats.layer_bytes =
+            self.tiles.iter().map(|t| t.pixels.len()).sum::<usize>() + self.subtrees.bytes();
+        subtrees || !self.tiles.is_empty()
+    }
+    /// Whether raster tiles or subtrees are cached for a later frame.
+    pub fn caches_layers(&self) -> bool {
+        !self.tiles.is_empty() || self.subtrees.bytes() > 0
     }
     pub fn invalidate(&mut self) {
         self.valid = false;
@@ -1139,6 +1173,34 @@ mod tests {
             show(&mut r, &mut shown, recorded(300, 200, 100 + frame % 2));
         }
         assert!(r.stats.cache_hits > 0);
+    }
+    #[test]
+    fn a_sweep_keeps_layers_that_recur_and_drops_those_no_frame_reused() {
+        let mut r = Retained::new();
+        let mut shown = Canvas::new(300, 200);
+        for frame in 0..6 {
+            show(&mut r, &mut shown, recorded(300, 200, frame % 2));
+        }
+        assert!(r.caches_layers());
+        let cached = r.stats.layer_bytes;
+        // Reused since the window last painted, so the first sweep keeps them.
+        assert!(r.sweep());
+        assert_eq!(r.stats.layer_bytes, cached);
+        // Two states still taking turns keep their layers through the next.
+        show(&mut r, &mut shown, recorded(300, 200, 0));
+        show(&mut r, &mut shown, recorded(300, 200, 1));
+        assert!(r.sweep());
+        assert_eq!(r.stats.layer_bytes, cached);
+        // A window gone quiet holds nothing after a sweep it did not paint in.
+        assert!(!r.sweep());
+        assert_eq!(r.stats.layer_bytes, 0);
+        assert!(!r.caches_layers());
+        assert_eq!(r.tiles.capacity(), 0);
+        // What comes back rasters again, the same as before.
+        let mut reference = Canvas::new(300, 200);
+        picture(&mut reference, 0);
+        show(&mut r, &mut shown, recorded(300, 200, 0));
+        assert_eq!(shown.pixels, reference.pixels);
     }
     #[test]
     fn byte_budgets_eviction_revision_reuse_and_purge_preserve_pixels() {

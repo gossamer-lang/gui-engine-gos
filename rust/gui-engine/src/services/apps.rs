@@ -1127,12 +1127,12 @@ pub fn with_icons(entries: &[AppEntry], size: i64) -> Vec<AppEntry> {
 // ---- the platform catalog ----
 
 /// The applications installed for this user, by name.
-#[cfg(target_os = "linux")]
+#[cfg(free_unix)]
 pub fn installed() -> Vec<AppEntry> {
     installed_cancellable(&|| true, &mut |_, _| {}).unwrap_or_default()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(free_unix)]
 pub fn installed_cancellable(
     active: &dyn Fn() -> bool,
     progress: &mut impl FnMut(i64, i64),
@@ -1654,29 +1654,30 @@ mod tests {
     #[test]
     fn a_launched_program_is_not_a_child_of_the_launcher() {
         use std::io::BufRead;
-        use std::os::fd::FromRawFd;
 
-        // The program inherits the write end, which has no close-on-exec.
-        let mut ends = [0; 2];
-        // SAFETY: ends has room for the two descriptors pipe writes.
-        assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0);
+        // A FIFO reaches the program by path: a descriptor number would have to
+        // be one digit for `sh` (dash) to redirect to it.
+        let dir = std::env::temp_dir().join(format!("gui-launch-parent-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("parent");
+        let path = std::ffi::CString::new(fifo.to_string_lossy().as_bytes()).unwrap();
+        // SAFETY: path is a NUL-terminated string that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
         let mut entry = named("sh", "Shell");
         entry.exec = vec![
             "sh".to_string(),
             "-c".to_string(),
-            "echo $PPID >&$0".to_string(),
-            ends[1].to_string(),
+            "echo $PPID > \"$0\"".to_string(),
+            fifo.to_string_lossy().to_string(),
         ];
         super::launch(&entry, &[]).unwrap();
-        // SAFETY: both descriptors came from pipe above and are owned here.
-        let read = unsafe {
-            libc::close(ends[1]);
-            fs::File::from_raw_fd(ends[0])
-        };
+        // Opening the FIFO waits for the program to open it for writing.
         let mut parent = String::new();
-        std::io::BufReader::new(read)
+        std::io::BufReader::new(fs::File::open(&fifo).unwrap())
             .read_line(&mut parent)
             .unwrap();
+        let _ = fs::remove_dir_all(&dir);
         let parent: u32 = parent.trim().parse().unwrap();
         assert_ne!(parent, std::process::id());
     }

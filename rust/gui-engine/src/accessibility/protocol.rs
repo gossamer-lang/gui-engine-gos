@@ -1,5 +1,5 @@
 // AT-SPI wire contracts, kept separate from transport and widget mutation.
-#[cfg(target_os = "linux")]
+#[cfg(free_unix)]
 mod linux {
     use crate::accessibility::Role;
     use crate::accessibility::atspi::Adapter;
@@ -1463,7 +1463,7 @@ mod linux {
         }
     }
 }
-#[cfg(target_os = "linux")]
+#[cfg(free_unix)]
 pub fn query(
     a: &mut crate::accessibility::atspi::Adapter,
     path: &str,
@@ -1474,7 +1474,7 @@ pub fn query(
     linux::query(a, path, interface, member, args)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(free_unix)]
 pub fn cache_entry(
     a: &crate::accessibility::atspi::Adapter,
     item: &crate::accessibility::provider::Published,

@@ -6,7 +6,7 @@
 // an object's stable path number is its element id. Requests the providers
 // queued come back through `poll` as the same `NativeAction`s AT-SPI makes.
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(free_unix))]
 mod platform {
     use crate::accessibility::AccessNode;
     use crate::accessibility::provider::{NativeAction, Published, Snapshot};
@@ -198,5 +198,5 @@ mod platform {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(free_unix))]
 pub type Adapter = platform::Adapter;

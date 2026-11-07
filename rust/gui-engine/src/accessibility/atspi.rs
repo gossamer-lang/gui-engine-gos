@@ -1,4 +1,4 @@
-#[cfg(target_os = "linux")]
+#[cfg(free_unix)]
 mod linux {
     // AT-SPI publishes the current semantic tree over the desktop accessibility
     // bus. zbus reads and writes the socket on its own executor; a reader
@@ -578,7 +578,7 @@ mod linux {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(free_unix))]
 pub use crate::accessibility::native::Adapter;
-#[cfg(target_os = "linux")]
+#[cfg(free_unix)]
 pub use linux::Adapter;

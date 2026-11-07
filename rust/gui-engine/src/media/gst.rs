@@ -138,7 +138,7 @@ api! {
     free: unsafe extern "C" fn(Pointer) = glib."g_free\0";
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(free_unix)]
 const LIBRARIES: [&[&str]; 4] = [
     &["libgstreamer-1.0.so.0"],
     &["libgstapp-1.0.so.0"],
@@ -171,7 +171,7 @@ const LIBRARIES: [&[&str]; 4] = [
     &["gobject-2.0-0.dll"],
     &["glib-2.0-0.dll"],
 ];
-#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+#[cfg(not(any(free_unix, target_os = "macos", windows)))]
 const LIBRARIES: [&[&str]; 4] = [&[], &[], &[], &[]];
 
 fn load() -> Result<Api, String> {

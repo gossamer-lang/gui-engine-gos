@@ -1,6 +1,6 @@
 // Introspection of the methods the native provider implements. Signatures
 // follow GNOME at-spi2-core/xml; unsupported interfaces are not advertised.
-#[cfg(target_os = "linux")]
+#[cfg(free_unix)]
 mod linux {
     use crate::strext::StrExt;
     fn method(name: &str, input: &str, output: &[String]) -> String {
@@ -571,7 +571,7 @@ mod linux {
         xml.to_owned() + "</node>"
     }
 }
-#[cfg(target_os = "linux")]
+#[cfg(free_unix)]
 /// The introspection XML of an object with the `supported` interfaces and
 /// `children`; `extents` adds the Text methods that need laid-out glyphs.
 pub fn describe(supported: &[String], children: &[String], extents: bool) -> String {

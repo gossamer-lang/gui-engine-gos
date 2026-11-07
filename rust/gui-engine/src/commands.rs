@@ -359,25 +359,29 @@ mod tests {
 
     #[test]
     fn standard_command_labels_and_categories_are_translated() {
-        install(&Catalog {
-            locale: PSEUDO_LOCALE.to_string(),
-            messages: vec![],
-        });
-        let _defer = scopeguard::guard((), |_| {
+        // The catalog is process-wide and the UI thread's tests install their
+        // own, so this test installs its catalogs there too.
+        crate::testing::on_ui_thread(|| {
             install(&Catalog {
-                locale: "en".to_string(),
+                locale: PSEUDO_LOCALE.to_string(),
                 messages: vec![],
             });
-        });
-        for c in super::standard_commands() {
-            assert!(
-                c.label.starts_with("[") && c.category.starts_with("["),
-                "{}: {} / {}",
-                c.id,
-                c.label,
-                c.category
-            )
-        }
+            let _defer = scopeguard::guard((), |_| {
+                install(&Catalog {
+                    locale: "en".to_string(),
+                    messages: vec![],
+                });
+            });
+            for c in super::standard_commands() {
+                assert!(
+                    c.label.starts_with("[") && c.category.starts_with("["),
+                    "{}: {} / {}",
+                    c.id,
+                    c.label,
+                    c.category
+                )
+            }
+        })
     }
 
     #[test]

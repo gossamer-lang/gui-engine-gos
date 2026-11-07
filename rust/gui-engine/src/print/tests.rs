@@ -330,7 +330,7 @@ fn rich_documents_print_headings_lists_quotes_and_code() {
     assert!(paginate(&[Item::Rich(id)], &PageSetup::default(), &|| false).is_err());
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(free_unix)]
 mod spooler {
     use super::*;
     use std::io::Read;

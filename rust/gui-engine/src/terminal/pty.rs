@@ -72,8 +72,63 @@ fn process_cwd(pid: i32) -> Option<String> {
     path.to_str().ok().map(str::to_owned)
 }
 
+/// The working directory of process `pid`.
+#[cfg(target_os = "freebsd")]
+fn process_cwd(pid: i32) -> Option<String> {
+    // SAFETY: the record is plain old data, which all zeros initializes.
+    let mut file: libc::kinfo_file = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::kinfo_file>();
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_CWD, pid];
+    // SAFETY: `mib` names one process's working-directory record, and
+    // `file` / `len` describe writable storage of that record's size.
+    let read = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            4,
+            (&raw mut file).cast(),
+            &raw mut len,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if read != 0 || len == 0 {
+        return None;
+    }
+    // SAFETY: the kernel writes a NUL-terminated path into the record.
+    let path = unsafe { std::ffi::CStr::from_ptr(file.kf_path.as_ptr()) };
+    path.to_str().ok().map(str::to_owned)
+}
+
+/// The name of process `pid`'s program.
+#[cfg(target_os = "freebsd")]
+fn process_name(pid: i32) -> Option<String> {
+    // SAFETY: the record is plain old data, which all zeros initializes.
+    let mut info: libc::kinfo_proc = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::kinfo_proc>();
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
+    // SAFETY: `mib` names one process's record, and `info` / `len` describe
+    // writable storage of that record's size.
+    let read = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            4,
+            (&raw mut info).cast(),
+            &raw mut len,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if read != 0 || len != std::mem::size_of::<libc::kinfo_proc>() {
+        return None;
+    }
+    // SAFETY: the kernel writes a NUL-terminated command name into the record.
+    let name = unsafe { std::ffi::CStr::from_ptr(info.ki_comm.as_ptr()) };
+    let name = name.to_str().ok()?;
+    (!name.is_empty()).then(|| name.to_string())
+}
+
 /// Other systems name no process's directory to an unprivileged reader.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "macos")))]
 fn process_cwd(_pid: i32) -> Option<String> {
     None
 }
@@ -96,7 +151,7 @@ fn process_name(pid: i32) -> Option<String> {
 }
 
 /// Other systems name no process's program to an unprivileged reader.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "macos")))]
 fn process_name(_pid: i32) -> Option<String> {
     None
 }
@@ -355,7 +410,7 @@ impl Pty {
                         let result = unsafe {
                             libc::waitid(
                                 libc::P_PID,
-                                pid,
+                                libc::id_t::from(pid),
                                 status.as_mut_ptr(),
                                 libc::WEXITED | libc::WNOWAIT,
                             )

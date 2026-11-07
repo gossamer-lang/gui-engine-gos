@@ -611,7 +611,19 @@ fn run_worker_with(
             while state.queue.is_empty() && !state.stopped {
                 state.parks += 1;
                 shared.idle.notify_all();
-                shared.ready.wait(&mut state);
+                // A font load or decode frees large buffers that stay in this
+                // thread's heap until it hands them back.
+                let due =
+                    parking_lot::MutexGuard::unlocked(&mut state, windowing::idle::thread_idle);
+                if !state.queue.is_empty() || state.stopped {
+                    break;
+                }
+                match due {
+                    Some(due) => {
+                        shared.ready.wait_for(&mut state, due);
+                    }
+                    None => shared.ready.wait(&mut state),
+                }
             }
             if state.stopped {
                 return;

@@ -205,6 +205,8 @@ const SETTINGS_DIALOG_SIZE: (i64, i64) = (720, 640);
 const SETTINGS_DIALOG_MIN: (i64, i64) = (480, 360);
 // How far a dialog window opened over another sits from it, in logical units.
 const DIALOG_CASCADE: i64 = 32;
+// Milliseconds between sweeps of raster layers no frame reused.
+const LAYER_SWEEP_MS: i64 = 5000;
 
 // The window a dialog opens in when it needs more room than the window that
 // asked may have: its key prefix, the size it opens at, and its minimum size.
@@ -252,6 +254,9 @@ pub struct Session {
     pending_leases: Vec<crate::memory::Lease>,
     resource_error: String,
     renderers: HashMap<String, WindowRenderer>,
+    /// When the windows' cached raster layers are next swept, or -1 while
+    /// none are cached.
+    layer_sweep: i64,
     started: bool,
     pub windows: Vec<WindowState>,
     pub app_id: String,
@@ -441,6 +446,7 @@ pub fn start(name: &str, app_id: &str) -> Result<Session, errors::Error> {
         pending_leases: Vec::new(),
         resource_error: String::new(),
         renderers: HashMap::new(),
+        layer_sweep: -1,
         hotkeys: HashMap::new(),
         launch_activation: None,
         started: false,
@@ -1608,7 +1614,24 @@ impl Session {
                 best = t.deadline
             }
         }
+        if self.layer_sweep >= 0 && (best < 0 || self.layer_sweep < best) {
+            best = self.layer_sweep;
+        }
         best
+    }
+
+    // Raster layers a window has stopped reusing go after one to two sweep
+    // intervals, so content that recurs keeps its pixels while it recurs and
+    // a window that went quiet holds none.
+    fn sweep_layers(&mut self, now: i64) {
+        if self.layer_sweep < 0 || now < self.layer_sweep {
+            return;
+        }
+        let mut remain = false;
+        for renderer in self.renderers.values_mut() {
+            remain |= renderer.retained.sweep();
+        }
+        self.layer_sweep = if remain { now + LAYER_SWEEP_MS } else { -1 };
     }
 
     /// Saves placements, closes windows, and ends the platform session.
@@ -2107,13 +2130,15 @@ impl Session {
                     self.windows[w as usize].dirty = true;
                 }
             }
-            windowing::Event::Minimized { window } | windowing::Event::Occluded { window } => {
+            windowing::Event::Minimized { window }
+            | windowing::Event::WindowHidden { window }
+            | windowing::Event::Occluded { window } => {
                 let w = self.find_native(*window);
                 // Keyboard focus is the platform's to report, through
                 // FocusGained and FocusLost; a window it covers or hides keeps it.
                 if w >= 0 {
                     self.windows[w as usize].occluded = true;
-                    if matches!(e, windowing::Event::Minimized { .. }) {
+                    if !matches!(e, windowing::Event::Occluded { .. }) {
                         self.release_pixels(w)
                     }
                 }
@@ -3363,8 +3388,9 @@ impl Session {
         }
     }
 
-    // A minimized window shows nothing until it is restored, which repaints
-    // it whole, so its surface, raster caches and GPU target are let go.
+    // A minimized or hidden window shows nothing until it is restored or
+    // shown, which repaints it whole, so its surface, raster caches and GPU
+    // target are let go.
     fn release_pixels(&mut self, w: i64) {
         let key = self.windows[w as usize].key.clone();
         if let Some(renderer) = self.renderers.get_mut(&key) {
@@ -3445,6 +3471,7 @@ impl Session {
 
     fn fire_timers(&mut self) -> Result<(), errors::Error> {
         let now = self.now();
+        self.sweep_layers(now);
         let mut due = vec![];
         let mut keep = vec![];
         for t in &self.timers {
@@ -4103,8 +4130,18 @@ impl Session {
                     let w = self.find(&window);
                     if w >= 0 {
                         let native = self.windows[w as usize].native;
+                        // A window shown in answer to a forwarded launch takes
+                        // focus as the launch's own.
+                        let activation = if shown {
+                            self.launch_activation.take()
+                        } else {
+                            None
+                        };
                         let changed = if shown {
-                            native.show().and_then(|()| native.focus())
+                            native.show().and_then(|()| match &activation {
+                                Some(activation) => native.focus_with_context(activation),
+                                None => native.focus(),
+                            })
                         } else {
                             native.hide()
                         };
@@ -5428,6 +5465,14 @@ impl Session {
             .or_default()
             .present(native, pw, ph, painted)?;
         let now = self.now();
+        if self.layer_sweep < 0
+            && self
+                .renderers
+                .get(&self.windows[w as usize].key)
+                .is_some_and(|r| r.retained.caches_layers())
+        {
+            self.layer_sweep = now + LAYER_SWEEP_MS;
+        }
         let window = &mut self.windows[w as usize];
         if window.output_dirty {
             window.output_presented = Some(now);
@@ -5908,6 +5953,7 @@ impl Session {
                 .filter(|t| !self.visual_timer_paused(t))
                 .map(|t| t.deadline)
                 .chain(self.output_due())
+                .chain((self.layer_sweep >= 0).then_some(self.layer_sweep))
                 .map(|deadline| (deadline - now).max(0))
                 .filter(|offset| *offset <= left)
                 .min();
@@ -6212,7 +6258,7 @@ mod popup_tests {
     }
 
     #[test]
-    fn a_minimized_window_lets_its_pixels_go_and_paints_again_when_restored() {
+    fn a_minimized_or_hidden_window_lets_its_pixels_go_and_paints_again_when_shown() {
         crate::testing::on_ui_thread(|| {
             let config = crate::services::private_test_config();
             let _defer = scopeguard::guard((), |_| {
@@ -6232,20 +6278,27 @@ mod popup_tests {
             let shown = s.budget.usage().0;
             assert!(s.frame_leases.contains_key("main"));
             let id = s.windows[0].native.id();
-            s.inject(&windowing::Event::Minimized { window: id })
-                .unwrap();
-            s.flush().unwrap();
-            assert!(!s.frame_leases.contains_key("main"));
-            assert!(s.budget.usage().0 < shown, "minimizing kept {shown} bytes");
-            let painted = s.windows[0].frames;
-            s.inject(&windowing::Event::Restored { window: id })
-                .unwrap();
-            s.flush().unwrap();
-            assert!(s.frame_leases.contains_key("main"));
-            assert!(
-                s.windows[0].frames > painted,
-                "the restored window did not paint"
-            );
+            let away = [
+                (
+                    windowing::Event::Minimized { window: id },
+                    windowing::Event::Restored { window: id },
+                ),
+                (
+                    windowing::Event::WindowHidden { window: id },
+                    windowing::Event::WindowShown { window: id },
+                ),
+            ];
+            for (leave, back) in away {
+                s.inject(&leave).unwrap();
+                s.flush().unwrap();
+                assert!(!s.frame_leases.contains_key("main"), "{leave:?}");
+                assert!(s.budget.usage().0 < shown, "{leave:?} kept {shown} bytes");
+                let painted = s.windows[0].frames;
+                s.inject(&back).unwrap();
+                s.flush().unwrap();
+                assert!(s.frame_leases.contains_key("main"), "{back:?}");
+                assert!(s.windows[0].frames > painted, "{back:?} did not paint");
+            }
             s.shutdown();
         })
     }
@@ -7937,6 +7990,40 @@ mod warning_tests {
 mod retained_render_tests {
     use super::*;
     #[test]
+    fn layers_a_quiet_window_stopped_reusing_go_within_two_sweeps() {
+        static SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _cleanup = scopeguard::guard((), |_| crate::services::remove_test_config(&config));
+            let mut s = start("Sweep tests", "dev.gossamer.sweep-tests").unwrap();
+            s.set_shell(
+                |_| {},
+                |_| {
+                    let shown = SHOWN.load(std::sync::atomic::Ordering::Relaxed);
+                    Widget::label(if shown { "Shown" } else { "Hidden away" })
+                },
+                |_| Vec::new(),
+            );
+            s.open_window("main", "Sweep", 320, 200).unwrap();
+            assert_eq!(s.layer_sweep, -1);
+            for flip in 0..6 {
+                SHOWN.store(flip % 2 == 0, std::sync::atomic::Ordering::Relaxed);
+                s.rebuild(0);
+                s.flush().unwrap();
+            }
+            let cached = s.rendering_stats(0).unwrap().layer_bytes;
+            assert!(cached > 0);
+            assert!(s.layer_sweep >= 0);
+            assert!(s.next_deadline() >= 0);
+            s.advance(LAYER_SWEEP_MS).unwrap();
+            assert_eq!(s.rendering_stats(0).unwrap().layer_bytes, cached);
+            s.advance(LAYER_SWEEP_MS).unwrap();
+            assert_eq!(s.rendering_stats(0).unwrap().layer_bytes, 0);
+            assert_eq!(s.layer_sweep, -1);
+            s.shutdown();
+        })
+    }
+    #[test]
     fn occlusion_pauses_visual_work_restore_repaints_and_low_memory_purges_layers() {
         crate::testing::on_ui_thread(|| {
             let config = crate::services::private_test_config();
@@ -8390,6 +8477,34 @@ mod window_command_tests {
                 s.launch_activation.is_none(),
                 "spent by the window opened next"
             );
+            s.shutdown()
+        })
+    }
+
+    #[test]
+    fn a_window_shown_in_answer_to_a_forwarded_launch_takes_its_focus() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _cleanup = scopeguard::guard((), |_| crate::services::remove_test_config(&config));
+            let mut s = start("Shown on launch", "dev.gossamer.shown-on-launch").unwrap();
+            s.set_shell(|_| {}, |_| Widget::label("hi"), |_| Vec::new());
+            s.open_window("main", "Main", 300, 200).unwrap();
+            effects::perform(Effect::SetWindowVisible("main".into(), false));
+            s.flush().unwrap();
+            s.answer_launch(windowing::instance::ForwardedRequest {
+                request: windowing::instance::Request::CommandLine {
+                    directory: String::new(),
+                    arguments: vec!["--quick".into()],
+                },
+                activation: windowing::instance::Activation::default(),
+            });
+            s.flush().unwrap();
+            effects::perform(Effect::SetWindowVisible("main".into(), false));
+            s.flush().unwrap();
+            assert!(s.launch_activation.is_some(), "hiding spends no activation");
+            effects::perform(Effect::SetWindowVisible("main".into(), true));
+            s.flush().unwrap();
+            assert!(s.launch_activation.is_none(), "spent by the window shown");
             s.shutdown()
         })
     }

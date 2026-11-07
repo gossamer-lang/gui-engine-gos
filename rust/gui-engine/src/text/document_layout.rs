@@ -442,54 +442,58 @@ mod tests {
     use std::time::{Duration, Instant};
     #[test]
     fn wrapped_unicode_viewports_and_long_lines_use_exact_background_geometry() {
-        let budget = crate::memory::Budget::new(1024 * 1024 * 1024);
-        crate::app::effects::set_budget(budget.clone());
-        for text in [
-            "let α = \"שלום e\u{301} 👩\u{200d}💻\"; ".repeat(2000),
-            "x".repeat(1024 * 1024),
-        ] {
-            let mut state = crate::editing::EditState::default();
-            state.sync(&text);
-            state.scroll_y = 0.0;
-            let style = TextStyle::mono(14.0);
-            let options = LayoutOptions::wrapped(600.0);
-            let area = Rect::new(0, 0, 600, 360);
-            assert!(viewport("layout-test", &state, style.clone(), options, area).is_none());
-            let requests = take_requests();
-            assert_eq!(requests.len(), 1);
-            let context = Context::standalone(Duration::from_secs(60));
-            let begin = Instant::now();
-            run(&requests[0], &context).unwrap();
-            adjust_state(&mut state);
-            assert!(state.scroll_y > 360.0);
-            let actual = viewport(
-                "layout-test",
-                &state,
-                style.clone(),
-                options,
-                Rect::new(state.scroll_x as i64, state.scroll_y as i64, 600, 360),
-            )
-            .unwrap();
-            let caret = actual.caret_rect(state.caret);
-            assert!(caret.y as f64 >= state.scroll_y - 1.0);
-            assert!(caret.y as f64 + caret.height as f64 <= state.scroll_y + 362.0);
-            assert!(actual.owned_bytes() < 2 * 1024 * 1024);
-            assert!(!state.text.flattened());
-            let before = state.caret;
-            state.vertical(&actual, -3, false);
-            assert!(state.caret < before);
-            println!(
-                "background paragraph bytes={} elapsed_ms={} viewport_bytes={}",
-                text.len(),
-                begin.elapsed().as_millis(),
-                actual.owned_bytes()
-            );
-            release(state.layout_key);
-        }
-        purge();
-        assert_eq!(budget.usage().0, 0);
-        crate::app::effects::set_budget(crate::memory::Budget::new(
-            crate::app::effects::EFFECT_BYTE_LIMIT,
-        ));
+        // Sessions purge and take document layouts, and read the effects
+        // budget, on the UI thread, so this test runs there too.
+        crate::testing::on_ui_thread(|| {
+            let budget = crate::memory::Budget::new(1024 * 1024 * 1024);
+            crate::app::effects::set_budget(budget.clone());
+            for text in [
+                "let α = \"שלום e\u{301} 👩\u{200d}💻\"; ".repeat(2000),
+                "x".repeat(1024 * 1024),
+            ] {
+                let mut state = crate::editing::EditState::default();
+                state.sync(&text);
+                state.scroll_y = 0.0;
+                let style = TextStyle::mono(14.0);
+                let options = LayoutOptions::wrapped(600.0);
+                let area = Rect::new(0, 0, 600, 360);
+                assert!(viewport("layout-test", &state, style.clone(), options, area).is_none());
+                let requests = take_requests();
+                assert_eq!(requests.len(), 1);
+                let context = Context::standalone(Duration::from_secs(60));
+                let begin = Instant::now();
+                run(&requests[0], &context).unwrap();
+                adjust_state(&mut state);
+                assert!(state.scroll_y > 360.0);
+                let actual = viewport(
+                    "layout-test",
+                    &state,
+                    style.clone(),
+                    options,
+                    Rect::new(state.scroll_x as i64, state.scroll_y as i64, 600, 360),
+                )
+                .unwrap();
+                let caret = actual.caret_rect(state.caret);
+                assert!(caret.y as f64 >= state.scroll_y - 1.0);
+                assert!(caret.y as f64 + caret.height as f64 <= state.scroll_y + 362.0);
+                assert!(actual.owned_bytes() < 2 * 1024 * 1024);
+                assert!(!state.text.flattened());
+                let before = state.caret;
+                state.vertical(&actual, -3, false);
+                assert!(state.caret < before);
+                println!(
+                    "background paragraph bytes={} elapsed_ms={} viewport_bytes={}",
+                    text.len(),
+                    begin.elapsed().as_millis(),
+                    actual.owned_bytes()
+                );
+                release(state.layout_key);
+            }
+            purge();
+            assert_eq!(budget.usage().0, 0);
+            crate::app::effects::set_budget(crate::memory::Budget::new(
+                crate::app::effects::EFFECT_BYTE_LIMIT,
+            ));
+        })
     }
 }

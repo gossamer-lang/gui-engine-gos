@@ -649,7 +649,16 @@ struct RowKey {
 #[derive(Debug, Default)]
 pub(super) struct RowCache {
     context: Option<RowContext>,
-    rows: Vec<Option<(RowKey, RecordedSpan)>>,
+    rows: Vec<Option<RecordedRow>>,
+}
+
+/// One row as a paint drew it: what it showed, where its drawing is
+/// recorded, and the keys of the run layouts it drew with.
+#[derive(Debug)]
+struct RecordedRow {
+    key: RowKey,
+    span: RecordedSpan,
+    runs: Vec<String>,
 }
 
 impl RowCache {
@@ -661,16 +670,23 @@ impl RowCache {
         self.rows.resize_with(rows, || None);
     }
 
-    fn recorded(&self, row: usize, key: &RowKey) -> Option<RecordedSpan> {
-        match self.rows.get(row)? {
-            Some((recorded, span)) if recorded == key => Some(*span),
-            _ => None,
+    fn recorded(&self, row: usize, key: &RowKey) -> Option<&RecordedRow> {
+        self.rows
+            .get(row)?
+            .as_ref()
+            .filter(|recorded| recorded.key == *key)
+    }
+
+    fn store(&mut self, row: usize, recorded: Option<RecordedRow>) {
+        if let Some(slot) = self.rows.get_mut(row) {
+            *slot = recorded;
         }
     }
 
-    fn store(&mut self, row: usize, recorded: Option<(RowKey, RecordedSpan)>) {
-        if let Some(slot) = self.rows.get_mut(row) {
-            *slot = recorded;
+    // A replayed row's drawing now sits at `span` in this paint's recording.
+    fn replayed(&mut self, row: usize, span: RecordedSpan) {
+        if let Some(Some(recorded)) = self.rows.get_mut(row) {
+            recorded.span = span;
         }
     }
 }
@@ -834,15 +850,18 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
                 .map(|l| (l.start, l.end))
                 .collect(),
         });
-        if let Some(span) = key
-            .as_ref()
-            .and_then(|key| recorded.recorded(index, key))
-            .and_then(|span| cx.canvas.replay_span(span))
+        if let Some(row_recording) = key.as_ref().and_then(|key| recorded.recorded(index, key))
+            && let Some(span) = cx.canvas.replay_span(row_recording.span)
         {
-            recorded.store(index, key.map(|key| (key, span)));
+            // A copied row is still on the screen, so its runs stay cached.
+            for run in &row_recording.runs {
+                layouts.get(run);
+            }
+            recorded.replayed(index, span);
             continue;
         }
         let mark = cx.canvas.recorded_mark();
+        let mut runs = Vec::new();
         // Cells take whole-pixel edges from the fractional grid, so each
         // meets its neighbors with neither a gap nor an overlap.
         let y = pad + (row as f64 * lh) as i64;
@@ -937,6 +956,7 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
                 run.italic = cell.italic;
                 let mut key = format!("{}#{}", run.key(), text);
                 lay_out(&mut layouts, &key, text, &run);
+                runs.push(key.clone());
                 let mut at = ((origin.x + x) as f64, (origin.y + y) as f64 + rise);
                 // A glyph wider than its cells, such as an emoji a program
                 // counts as one cell, is drawn smaller and centered on its
@@ -948,6 +968,7 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
                     run.size *= width as f64 / drawn;
                     key = format!("{}#{}", run.key(), text);
                     lay_out(&mut layouts, &key, text, &run);
+                    runs.push(key.clone());
                     if let Some(height) = layouts.get(&key).map(|l| l.height) {
                         at.1 += ((lh - height) / 2.0).max(0.0);
                     }
@@ -970,7 +991,11 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
             }
             col = end.max(col + 1);
         }
-        recorded.store(index, key.zip(cx.canvas.recorded_span(mark)));
+        recorded.store(
+            index,
+            key.zip(cx.canvas.recorded_span(mark))
+                .map(|(key, span)| RecordedRow { key, span, runs }),
+        );
     }
     // A row the screen no longer shows only comes back by scrolling back,
     // which lays it out again, so the cache keeps the runs this paint drew.

@@ -1584,6 +1584,21 @@ fn paint_fresh(view: &widget::View, size: crate::geometry::Size) -> crate::rende
 }
 
 #[test]
+fn a_repaint_that_copies_every_row_keeps_their_runs_laid_out() {
+    let id = create(&options(12, 40, 100), Budget::new(64 * 1024 * 1024)).unwrap();
+    let view = widget::View::new("term", id, "Term");
+    let mut retained = crate::render::retained::Retained::new();
+    let size = crate::geometry::Size::new(480, 320);
+    feed(id, b"hello\r\n\x1b[31mred\x1b[0m world\r\n").unwrap();
+    paint_retained(&view, size, &mut retained);
+    let laid = with_entry(id, |entry| entry.layouts.bytes()).unwrap();
+    assert!(laid > 0);
+    paint_retained(&view, size, &mut retained);
+    assert_eq!(with_entry(id, |entry| entry.layouts.bytes()).unwrap(), laid);
+    close(id);
+}
+
+#[test]
 fn a_screen_painted_after_its_last_frame_records_what_a_first_paint_would() {
     let budget = Budget::new(64 * 1024 * 1024);
     let kept = create(&options(12, 40, 100), budget.clone()).unwrap();

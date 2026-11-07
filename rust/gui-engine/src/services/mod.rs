@@ -24,7 +24,7 @@ use crate::paths;
 use windowing;
 
 /// The directory an application keeps its settings in, created on demand:
-/// `$XDG_CONFIG_HOME/<app>` (default `~/.config/<app>`) on Linux,
+/// `$XDG_CONFIG_HOME/<app>` (default `~/.config/<app>`) on Linux and FreeBSD,
 /// `~/Library/Application Support/<app>` on macOS, `%APPDATA%\<app>` on
 /// Windows.
 pub fn config_dir(app_id: &str) -> String {
@@ -45,10 +45,25 @@ pub fn set_config_root(root: &str) {
     *CONFIG_ROOT.lock() = root.to_string();
 }
 
+// The configuration root is one per process, so one test holds it at a time:
+// tests run on many threads, and another test's reset would empty or remove
+// the directory under a test still reading it.
+#[cfg(test)]
+static TEST_CONFIG_HELD: Mutex<bool> = Mutex::new(false);
+#[cfg(test)]
+static TEST_CONFIG_RELEASED: parking_lot::Condvar = parking_lot::Condvar::new();
+
 /// Points this test process's settings at a new empty directory, so a test
 /// neither reads nor writes the user's configuration; answers the directory.
+/// Waits while another test holds it, until that test's `remove_test_config`.
 #[cfg(test)]
 pub fn private_test_config() -> String {
+    let mut held = TEST_CONFIG_HELD.lock();
+    while *held {
+        TEST_CONFIG_RELEASED.wait(&mut held);
+    }
+    *held = true;
+    drop(held);
     let root = paths::join(
         &std::env::temp_dir().to_string_lossy(),
         &format!("gui-gos-test-config-{}", std::process::id()),
@@ -58,14 +73,17 @@ pub fn private_test_config() -> String {
     root
 }
 
-/// Removes a directory made by `private_test_config`.
+/// Removes a directory made by `private_test_config` and hands the
+/// configuration root to the next test waiting for it.
 #[cfg(test)]
 pub fn remove_test_config(root: &str) {
     set_config_root("");
     let _ = fs::remove_dir_all(root);
+    *TEST_CONFIG_HELD.lock() = false;
+    TEST_CONFIG_RELEASED.notify_one();
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(free_unix)]
 fn config_base() -> String {
     let xdg = std::env::var("XDG_CONFIG_HOME").unwrap_or("".to_string());
     if !xdg.is_empty() {
@@ -95,7 +113,7 @@ fn config_base() -> String {
 }
 
 /// The directory an application keeps rebuildable data in, which callers
-/// create: `$XDG_CACHE_HOME/<app>` (default `~/.cache/<app>`) on Linux,
+/// create: `$XDG_CACHE_HOME/<app>` (default `~/.cache/<app>`) on Linux and FreeBSD,
 /// `~/Library/Caches/<app>` on macOS, `%LOCALAPPDATA%\<app>` on Windows; under
 /// `<root>/cache` when `set_config_root` gave a root.
 pub fn cache_dir(app_id: &str) -> String {
@@ -107,7 +125,7 @@ pub fn cache_dir(app_id: &str) -> String {
     paths::join(&base, &sanitize(app_id))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(free_unix)]
 fn cache_base() -> String {
     let xdg = std::env::var("XDG_CACHE_HOME").unwrap_or("".to_string());
     if !xdg.is_empty() {

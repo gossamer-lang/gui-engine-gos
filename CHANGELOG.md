@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.5 - FreeBSD desktops, leaner memory
+
+- Builds on windowing-gos 0.1.10, whose Wayland windows present through shared memory instead of loading the GPU driver.
+
+- gui-engine builds and runs on FreeBSD, taking the paths it takes on Linux: AT-SPI accessibility over D-Bus, GStreamer media, desktop-entry application lists, XDG settings and cache directories, and system fonts under `/usr/local/share/fonts`. It did not compile there.
+- A terminal on FreeBSD knows the program running in it and its working directory, read through `sysctl` where Linux reads `/proc`.
+- A terminal repaint that copies rows unchanged since the frame before keeps their text laid out, so the next scroll or change lays out only new text; such a repaint emptied the terminal's layout cache.
+- An installed font file that no program of the user's can change is mapped instead of read into memory, so a fallback font such as a color emoji or CJK collection adds file pages the system shares and reclaims, not heap: a terminal showing Claude Code's symbols uses about 30 MB less. The 32 MB limit now applies only to fonts read into memory, so larger collections such as Apple Color Emoji load.
+- A hidden window lets its surface, raster tiles and recorded scene go, as a minimized one does, and paints whole when shown again; a hidden quick terminal held its frame.
+- Raster tiles and cached subtrees a window has not reused for five to ten seconds are let go, so a window that went quiet keeps none.
+- The installed-font catalog keeps one copy of each distinct coverage list, which a family's styles share: about 1.3 MB less with a typical set of fonts.
+- The background worker that loads fonts and images hands its freed memory back before it waits, and a bounded file read allocates once at the file's size.
+- A window shown in answer to a later launch of the program takes focus as that launch's own, as a window opened for one does.
+
 ## 0.2.4 - Terminal cursor focus and blinking
 
 - Builds on windowing-gos 0.1.9, whose macOS windows keep only the buffer they show in memory.

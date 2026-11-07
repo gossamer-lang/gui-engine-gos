@@ -125,6 +125,15 @@ fn face_at(i: i64) -> Face {
 
 pub const REGISTRY_BYTE_LIMIT: usize = 128 * 1024 * 1024;
 pub const FONT_BYTE_LIMIT: usize = 32 * 1024 * 1024;
+/// Largest installed font file mapped; a sanity bound, since mapped bytes are
+/// file pages the kernel can drop, not heap.
+pub const MAPPED_FONT_LIMIT: usize = 1024 * 1024 * 1024;
+
+type FileStamp = (u64, Option<std::time::SystemTime>);
+
+type MappedFiles = HashMap<std::path::PathBuf, (FileStamp, std::sync::Weak<memmap2::Mmap>)>;
+
+static MAPPED_FILES: LazyLock<Mutex<MappedFiles>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[cfg(test)]
 fn add_face(f: &Face) -> i64 {
@@ -459,7 +468,7 @@ fn register_bytes(data: FontBytes) -> Result<Vec<FaceId>, errors::Error> {
 }
 
 /// Directories searched for system fonts on this platform.
-#[cfg(target_os = "linux")]
+#[cfg(free_unix)]
 pub fn system_font_dirs() -> Vec<String> {
     let home = env::var("HOME").unwrap_or("".to_string());
     let mut dirs = vec![
@@ -779,15 +788,11 @@ pub(crate) fn prepare_installed(
 ) -> Result<i64, String> {
     let key = (r.path.clone(), r.index, bold);
     let result = (|| {
-        let data = crate::services::bounded_io::read(
-            std::path::Path::new(&r.path),
-            FONT_BYTE_LIMIT,
-            active,
-        )?;
+        let bytes = installed_bytes(std::path::Path::new(&r.path), active)?;
         if !active() {
             return Err("font load cancelled or expired".into());
         }
-        let face = Face::parse_bytes(FontBytes::owned(data), r.index).map_err(|e| e.to_string())?;
+        let face = Face::parse_bytes(bytes, r.index).map_err(|e| e.to_string())?;
         if !active() {
             return Err("font load cancelled or expired".into());
         }
@@ -803,6 +808,35 @@ pub(crate) fn prepare_installed(
             .insert(key, result.as_ref().copied().unwrap_or(-1), r.path.len());
     }
     result
+}
+
+// An installed file's bytes: one mapping per file while any face holds it,
+// when nothing the user runs can shorten the file, else read into the heap.
+fn installed_bytes(path: &std::path::Path, active: &dyn Fn() -> bool) -> Result<FontBytes, String> {
+    let stamp = std::fs::metadata(path)
+        .map(|m| (m.len(), m.modified().ok()))
+        .map_err(|e| e.to_string())?;
+    let mut mapped = MAPPED_FILES.lock();
+    mapped.retain(|_, (_, map)| map.strong_count() > 0);
+    if let Some((at, map)) = mapped.get(path)
+        && *at == stamp
+        && let Some(map) = map.upgrade()
+    {
+        return Ok(FontBytes::Mapped(map));
+    }
+    drop(mapped);
+    match crate::services::bounded_io::map_unchangeable(path, MAPPED_FONT_LIMIT, active)? {
+        Some(map) => {
+            let map = std::sync::Arc::new(map);
+            MAPPED_FILES
+                .lock()
+                .insert(path.to_path_buf(), (stamp, std::sync::Arc::downgrade(&map)));
+            Ok(FontBytes::Mapped(map))
+        }
+        None => {
+            crate::services::bounded_io::read(path, FONT_BYTE_LIMIT, active).map(FontBytes::owned)
+        }
+    }
 }
 
 // A variable face at regular (400) or bold (700) weight, within what its
@@ -1026,6 +1060,44 @@ mod tests {
             super::faces_bytes([&a, &b]),
             a.owned_bytes() + b.owned_bytes() - super::SANS.len()
         );
+    }
+
+    #[test]
+    fn a_mapped_font_parses_shares_its_pages_and_charges_no_heap() {
+        use crate::text::font::{Face, FontBytes};
+        let path = std::env::temp_dir().join(format!("gui-font-mapped-{}", std::process::id()));
+        let _cleanup = scopeguard::guard((), |_| {
+            let _ = std::fs::remove_file(&path);
+        });
+        std::fs::write(&path, super::SANS).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        // SAFETY: the test owns this file and leaves it unchanged while mapped.
+        let map = unsafe { memmap2::Mmap::map(&file) }.unwrap();
+        let bytes = FontBytes::Mapped(std::sync::Arc::new(map));
+        let a = Face::parse_bytes(bytes.clone(), 0).unwrap();
+        let b = Face::parse_bytes(bytes, 0).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a.family, "DejaVu Sans");
+        assert!(a.shared_file().is_none());
+        assert!(a.owned_bytes() < super::SANS.len());
+        assert_eq!(
+            super::faces_bytes([&a, &b]),
+            a.owned_bytes() + b.owned_bytes()
+        );
+    }
+
+    #[test]
+    fn an_installed_font_this_user_can_change_is_read_into_the_heap() {
+        use crate::text::font::FontBytes;
+        let path = std::env::temp_dir().join(format!("gui-font-owned-{}", std::process::id()));
+        let _cleanup = scopeguard::guard((), |_| {
+            let _ = std::fs::remove_file(&path);
+        });
+        std::fs::write(&path, super::SANS).unwrap();
+        let bytes = super::installed_bytes(&path, &|| true).unwrap();
+        assert_eq!(&bytes[..], super::SANS);
+        // Windows cannot truncate a mapped file, so every installed font maps there.
+        assert_eq!(matches!(bytes, FontBytes::Mapped(_)), cfg!(windows));
     }
 
     #[test]

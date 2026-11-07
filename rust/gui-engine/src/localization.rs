@@ -812,53 +812,57 @@ mod tests {
 
     #[test]
     fn numbers_and_dates_follow_the_locale() {
-        let at = |locale: String| {
-            super::install(&Catalog {
-                locale,
-                messages: vec![],
-            })
-        };
-        let _defer = scopeguard::guard((), |_| {
-            super::install(&Catalog {
-                locale: "en".to_string(),
-                messages: vec![],
+        // The catalog is process-wide and the UI thread's tests install their
+        // own, so this test installs its catalogs there too.
+        crate::testing::on_ui_thread(|| {
+            let at = |locale: String| {
+                super::install(&Catalog {
+                    locale,
+                    messages: vec![],
+                })
+            };
+            let _defer = scopeguard::guard((), |_| {
+                super::install(&Catalog {
+                    locale: "en".to_string(),
+                    messages: vec![],
+                });
             });
-        });
-        at("en-US".to_string());
-        assert_eq!(super::format_number(1234567.891, 2), "1,234,567.89");
-        assert_eq!(super::format_number(-1234.5, 1), "-1,234.5");
-        assert_eq!(super::format_date(2026, 3, 7), "03/07/2026");
-        assert_eq!(super::format_time(14, 5), "2:05 PM");
-        assert_eq!(super::parse_number("1,234.5"), Some(1234.5));
-        assert_eq!(super::parse_number("1,234"), Some(1234.0));
-        assert_eq!(super::parse_number("1,5"), Some(1.5));
-        assert_eq!(super::parse_number("1x"), None);
-        at("de-DE".to_string());
-        assert_eq!(super::parse_number("1.234"), Some(1234.0));
-        assert_eq!(super::format_number(1234.5, 1), "1.234,5");
-        assert_eq!(super::format_date(2026, 3, 7), "07.03.2026");
-        assert_eq!(super::format_time(14, 5), "14:05");
-        assert_eq!(super::parse_number("1.234,5"), Some(1234.5));
-        assert_eq!(super::parse_number("0,75"), Some(0.75));
-        assert_eq!(super::parse_number("0.75"), Some(0.75));
-        at("fr".to_string());
-        assert_eq!(super::format_number(1234.5, 1), "1\u{202F}234,5");
-        assert_eq!(super::parse_number("1 234,5"), Some(1234.5));
-        at("en-GB".to_string());
-        assert_eq!(super::format_date(2026, 3, 7), "07/03/2026");
-        at("ja".to_string());
-        assert_eq!(super::format_date(2026, 3, 7), "2026/03/07");
-        at("xx".to_string());
-        assert_eq!(super::format_date(2026, 3, 7), "2026-03-07");
-        assert_eq!(super::month_name(10), "October");
-        // An hour into 2026 in the system zone is some time on New Year's Eve or Day.
-        let stamp = super::format_timestamp(1_767_229_200_000);
-        assert!(
-            stamp.contains("2025") || stamp.contains("2026"),
-            "{}",
-            stamp
-        );
-        assert!(stamp.contains(":"), "{}", stamp)
+            at("en-US".to_string());
+            assert_eq!(super::format_number(1234567.891, 2), "1,234,567.89");
+            assert_eq!(super::format_number(-1234.5, 1), "-1,234.5");
+            assert_eq!(super::format_date(2026, 3, 7), "03/07/2026");
+            assert_eq!(super::format_time(14, 5), "2:05 PM");
+            assert_eq!(super::parse_number("1,234.5"), Some(1234.5));
+            assert_eq!(super::parse_number("1,234"), Some(1234.0));
+            assert_eq!(super::parse_number("1,5"), Some(1.5));
+            assert_eq!(super::parse_number("1x"), None);
+            at("de-DE".to_string());
+            assert_eq!(super::parse_number("1.234"), Some(1234.0));
+            assert_eq!(super::format_number(1234.5, 1), "1.234,5");
+            assert_eq!(super::format_date(2026, 3, 7), "07.03.2026");
+            assert_eq!(super::format_time(14, 5), "14:05");
+            assert_eq!(super::parse_number("1.234,5"), Some(1234.5));
+            assert_eq!(super::parse_number("0,75"), Some(0.75));
+            assert_eq!(super::parse_number("0.75"), Some(0.75));
+            at("fr".to_string());
+            assert_eq!(super::format_number(1234.5, 1), "1\u{202F}234,5");
+            assert_eq!(super::parse_number("1 234,5"), Some(1234.5));
+            at("en-GB".to_string());
+            assert_eq!(super::format_date(2026, 3, 7), "07/03/2026");
+            at("ja".to_string());
+            assert_eq!(super::format_date(2026, 3, 7), "2026/03/07");
+            at("xx".to_string());
+            assert_eq!(super::format_date(2026, 3, 7), "2026-03-07");
+            assert_eq!(super::month_name(10), "October");
+            // An hour into 2026 in the system zone is some time on New Year's Eve or Day.
+            let stamp = super::format_timestamp(1_767_229_200_000);
+            assert!(
+                stamp.contains("2025") || stamp.contains("2026"),
+                "{}",
+                stamp
+            );
+            assert!(stamp.contains(":"), "{}", stamp)
+        })
     }
 
     #[test]

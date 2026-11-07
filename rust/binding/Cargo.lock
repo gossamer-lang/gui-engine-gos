@@ -711,7 +711,7 @@ dependencies = [
 
 [[package]]
 name = "gos-windowing"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "block2",
  "getrandom 0.4.3",
@@ -766,7 +766,7 @@ dependencies = [
 
 [[package]]
 name = "gui-engine"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "anyhow",
  "encoding_rs",
@@ -802,7 +802,7 @@ dependencies = [
 
 [[package]]
 name = "gui-engine-binding"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "gos-windowing",
  "gossamer-binding",
@@ -1793,15 +1793,13 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "sdl3-src"
-version = "3.4.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed4dcad85f1657d3424642ca2ed8f9f185212975baefda8972ac606494755a62"
+version = "3.4.20"
+source = "git+https://github.com/danpozmanter/sdl3-sys-rs?rev=05a18e2fe2596bfc497d7e0625f8eaa5d06db706#05a18e2fe2596bfc497d7e0625f8eaa5d06db706"
 
 [[package]]
 name = "sdl3-sys"
-version = "0.6.6+SDL-3.4.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04e7f134def04ed72e6f55187c6c29c72f7dab5d359c4be0dd49c9b97fef59c7"
+version = "0.7.3+SDL-3.4.20"
+source = "git+https://github.com/danpozmanter/sdl3-sys-rs?rev=05a18e2fe2596bfc497d7e0625f8eaa5d06db706#05a18e2fe2596bfc497d7e0625f8eaa5d06db706"
 dependencies = [
  "cc",
  "cmake",

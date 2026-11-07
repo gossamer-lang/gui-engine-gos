@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.6 - Wayland windows that open reliably
+
+- Builds on windowing-gos 0.1.11, whose windows under libdecor no longer hang while they wait for their first configure.
+- A run box grows for its suggestions on a driver that cannot change a window's resizability, such as SDL's offscreen driver, instead of failing.
+
 ## 0.2.5 - FreeBSD desktops, leaner memory
 
 - Builds on windowing-gos 0.1.10, whose Wayland windows present through shared memory instead of loading the GPU driver.

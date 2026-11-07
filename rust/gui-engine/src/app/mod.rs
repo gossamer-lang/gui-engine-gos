@@ -1087,7 +1087,11 @@ impl Session {
             return Ok(());
         };
         let win = self.windows[w as usize].native;
-        win.set_resizable(false)?;
+        // A driver that cannot change resizability, such as the offscreen
+        // one, leaves the window as it is; the height below still applies.
+        if let Err(e) = win.set_resizable(false) {
+            self.log_line(&format!("window resizability unavailable: {}", e))
+        }
         let (lw, lh) = win.size();
         let (_, ph) = win.pixel_size();
         let base = window_extent(self.windows[w as usize].theme.px(height), lh, ph);

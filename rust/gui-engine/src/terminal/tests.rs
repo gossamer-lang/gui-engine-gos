@@ -1623,15 +1623,23 @@ fn repaints_match_first_paints(opacity: f64) {
         change(fresh);
         // Twice: the second paint follows a frame that already shows it all.
         for _ in 0..2 {
-            let scene = paint_retained(&kept_view, size, &mut retained);
-            let mut shown = crate::render::Canvas::new(size.width, size.height);
-            scene.replay(&mut shown);
-            assert!(
-                shown.pixels == paint(&fresh_view, size).pixels,
-                "{name} at opacity {opacity}"
-            );
-            if opacity < 1.0 {
-                assert_eq!(scene, paint_fresh(&fresh_view, size), "{name}");
+            // A face other tests load meanwhile changes what both draw, so
+            // they are compared only when both drew with the same faces.
+            loop {
+                let faces = crate::text::fonts::generation();
+                let scene = paint_retained(&kept_view, size, &mut retained);
+                let mut shown = crate::render::Canvas::new(size.width, size.height);
+                scene.replay(&mut shown);
+                let first = paint(&fresh_view, size);
+                let recorded = (opacity < 1.0).then(|| paint_fresh(&fresh_view, size));
+                if crate::text::fonts::generation() != faces {
+                    continue;
+                }
+                assert!(shown.pixels == first.pixels, "{name} at opacity {opacity}");
+                if let Some(recorded) = recorded {
+                    assert_eq!(scene, recorded, "{name}");
+                }
+                break;
             }
         }
     };
@@ -1722,15 +1730,15 @@ fn scrolled_output_draws_its_rows_from_the_layer() {
             .any(|c| matches!(c.paint, Primitive::Coverage(..))),
         "no glyph draws outside the layer"
     );
-    crate::terminal::sweep_layers();
+    // This terminal's own layer: a sweep of every terminal would reach the
+    // layers other tests paint meanwhile.
     assert_eq!(
-        with_entry(id, |entry| entry.layer.holds()),
+        with_entry(id, |entry| entry.layer.sweep()),
         Some(true),
         "a layer drawn since the last sweep stays"
     );
-    crate::terminal::sweep_layers();
     assert_eq!(
-        with_entry(id, |entry| entry.layer.holds()),
+        with_entry(id, |entry| entry.layer.sweep()),
         Some(false),
         "a layer no paint drew from goes"
     );

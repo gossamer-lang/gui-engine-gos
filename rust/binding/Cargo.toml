@@ -1,6 +1,6 @@
 [package]
 name = "gui-engine-binding"
-version = "0.2.7"
+version = "0.2.8"
 edition = "2024"
 publish = false
 
@@ -9,9 +9,16 @@ publish = false
 [lib]
 crate-type = ["rlib"]
 
+[features]
+default = ["markup", "svg", "jpeg", "gif"]
+markup = ["gui-engine/markup"]
+svg = ["gui-engine/svg"]
+jpeg = ["gui-engine/jpeg"]
+gif = ["gui-engine/gif"]
+
 [dependencies]
 gossamer-binding = "0.75.19"
-gui-engine = { path = "../gui-engine" }
+gui-engine = { path = "../gui-engine", default-features = false }
 # The program's build links windowing-gos's copy, which its own binding
 # carries; `gos` patches it in. Standalone Cargo runs patch it the same way.
 windowing = { package = "gos-windowing", version = "0.1.0" }

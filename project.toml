@@ -1,15 +1,26 @@
 [project]
 id = "github.com/gossamer-lang/gui-engine-gos"
-version = "0.2.7"
-gossamer-version = "^v0.76.0"
+version = "0.2.8"
+gossamer-version = "^v0.78.0"
 authors = ["Dan Pozmanter"]
 license = "Apache 2.0"
 
 [lib]
 name = "gui_engine"
 
+# The optional parts an application may leave out of its build.
+[features]
+default = ["markup", "svg", "jpeg", "gif"]
+# Markdown and HTML import into rich text.
+markup = ["gui-engine-binding/markup"]
+# SVG images and icons.
+svg = ["gui-engine-binding/svg"]
+# JPEG and GIF images in the image viewer.
+jpeg = ["gui-engine-binding/jpeg"]
+gif = ["gui-engine-binding/gif"]
+
 [rust-bindings]
-gui-engine-binding = { path = "rust/binding" }
+gui-engine-binding = { path = "rust/binding", default-features = false }
 
 [dependencies]
-"github.com/gossamer-lang/windowing-gos" = { git = "https://github.com/gossamer-lang/windowing-gos", tag = "v0.1.11" }
+"github.com/gossamer-lang/windowing-gos" = { git = "https://github.com/gossamer-lang/windowing-gos", tag = "v0.1.12" }

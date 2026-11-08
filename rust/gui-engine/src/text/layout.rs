@@ -505,18 +505,21 @@ static CACHE_HITS: AtomicI64 = AtomicI64::new(0);
 static CACHE_MISSES: AtomicI64 = AtomicI64::new(0);
 static PARAGRAPHS: LazyLock<Mutex<ByteCache<String, Vec<Line>>>> =
     LazyLock::new(|| Mutex::new(ByteCache::new(PARAGRAPH_BUDGET)));
-static PARAGRAPH_HITS: AtomicI64 = AtomicI64::new(0);
-static PARAGRAPH_MISSES: AtomicI64 = AtomicI64::new(0);
+thread_local! {
+    static PARAGRAPH_HITS: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+    static PARAGRAPH_MISSES: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+}
 const PARAGRAPH_BUDGET: usize = 8 * 1024 * 1024;
 
-/// Paragraph cache entries, hits, misses and accounted storage bytes.
-/// Accounting includes source keys and a conservative per-line/glyph allowance.
+/// Paragraph cache entries, the calling thread's hits and misses, and
+/// accounted storage bytes. Accounting includes source keys and a
+/// conservative per-line/glyph allowance.
 pub fn paragraph_cache_stats() -> (i64, i64, i64, i64) {
     let cache = PARAGRAPHS.lock();
     (
         cache.len() as i64,
-        PARAGRAPH_HITS.load(Ordering::Relaxed),
-        PARAGRAPH_MISSES.load(Ordering::Relaxed),
+        PARAGRAPH_HITS.get(),
+        PARAGRAPH_MISSES.get(),
         cache.bytes() as i64,
     )
 }
@@ -861,10 +864,10 @@ fn arabic_forms(chars: &[char]) -> Vec<String> {
 fn cached_paragraph(text: &str, style: &TextStyle, options: LayoutOptions) -> Vec<Line> {
     let key = format!("{}#{}#{}", style.key(), options.key(), text);
     if let Some(lines) = PARAGRAPHS.lock().get(&key) {
-        PARAGRAPH_HITS.fetch_add(1, Ordering::Relaxed);
+        PARAGRAPH_HITS.set(PARAGRAPH_HITS.get() + 1);
         return lines.to_vec();
     };
-    PARAGRAPH_MISSES.fetch_add(1, Ordering::Relaxed);
+    PARAGRAPH_MISSES.set(PARAGRAPH_MISSES.get() + 1);
     let lines = layout_paragraph(
         text,
         0,
@@ -2657,15 +2660,16 @@ mod byte_budget_tests {
         };
         COLOR_GLYPHS.lock().insert((-1, -1, 12), image, 64);
         assert!(glyph_cache_stats().1 >= 64);
-        let _ = layout(
-            "cache bytes",
-            &TextStyle::sans(12.0),
-            LayoutOptions::single_line(),
-        );
+        let style = TextStyle::sans(12.0);
+        let options = LayoutOptions::single_line();
+        let _ = layout("cache bytes", &style, options);
         let (bytes, limit) = cache_bytes();
         assert!(bytes > 0 && bytes <= limit);
         purge_caches();
-        assert_eq!(cache_bytes().0, 0);
-        assert_eq!(glyph_cache_stats(), (0, 0));
+        // Background layout work may cache text meanwhile, so the purge shows
+        // in what this test cached rather than in the process-wide totals.
+        let key = format!("{}#{}#{}", style.key(), options.key(), "cache bytes");
+        assert!(CACHE.lock().get(&key).is_none());
+        assert!(COLOR_GLYPHS.lock().get(&(-1, -1, 12)).is_none());
     }
 }

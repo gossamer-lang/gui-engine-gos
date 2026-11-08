@@ -28,6 +28,7 @@ pub const PIXEL_LIMIT: usize = 64 * 1024 * 1024;
 const FILE_LIMIT: usize = 128 * 1024 * 1024;
 const CACHE_BYTES: usize = 256 * 1024 * 1024;
 const PREVIEW_SIDE: i64 = 2048;
+#[cfg(feature = "svg")]
 const SVG_SIDE: i64 = 2048;
 
 /// The formats the viewer decodes.
@@ -95,6 +96,7 @@ fn sniff(bytes: &[u8]) -> Option<Format> {
 }
 
 /// The orientation (1..=8) an EXIF block records, or 1.
+#[cfg(feature = "jpeg")]
 fn exif_orientation(exif: &[u8]) -> u16 {
     let tiff = exif.strip_prefix(b"Exif\0\0").unwrap_or(exif);
     if tiff.len() < 8 {
@@ -208,90 +210,115 @@ pub fn decode(bytes: &[u8], cancelled: &dyn Fn() -> bool) -> Result<Image, Strin
                 })
                 .ok_or("PNG: the image data is damaged")?
         }
-        Format::Jpeg => {
-            use zune_core::bytestream::ZCursor;
-            use zune_core::colorspace::ColorSpace;
-            use zune_core::options::DecoderOptions;
-            let options = DecoderOptions::default()
-                .jpeg_set_out_colorspace(ColorSpace::RGBA)
-                .set_max_width(16_384)
-                .set_max_height(16_384);
-            let mut decoder =
-                zune_jpeg::JpegDecoder::new_with_options(ZCursor::new(bytes), options);
-            decoder
-                .decode_headers()
-                .map_err(|e| format!("JPEG: {e:?}"))?;
-            let info = decoder.info().ok_or("JPEG: no image header")?;
-            checked(i64::from(info.width), i64::from(info.height))?;
-            let orientation = decoder.exif().map_or(1, |exif| exif_orientation(exif));
-            if cancelled() {
-                return Err("decoding cancelled".into());
-            }
-            let rgba = decoder.decode().map_err(|e| format!("JPEG: {e:?}"))?;
-            let image = Image {
-                width: i64::from(info.width),
-                height: i64::from(info.height),
-                rgba: Pixels::new(rgba),
-                format,
-            };
-            if image.rgba.len() != (image.width * image.height * 4) as usize {
-                return Err("JPEG: the decoded pixels do not match the image size".into());
-            }
-            orient(image, orientation)
-        }
-        Format::Gif => {
-            let mut options = gif::DecodeOptions::new();
-            options.set_color_output(gif::ColorOutput::RGBA);
-            let mut decoder = options
-                .read_info(std::io::Cursor::new(bytes))
-                .map_err(|e| format!("GIF: {e}"))?;
-            let (w, h) = (i64::from(decoder.width()), i64::from(decoder.height()));
-            checked(w, h)?;
-            let frame = decoder
-                .read_next_frame()
-                .map_err(|e| format!("GIF: {e}"))?
-                .ok_or("GIF: no frames")?;
-            // The first frame is drawn into a canvas of the image's size.
-            let mut rgba = vec![0u8; (w * h * 4) as usize];
-            for row in 0..i64::from(frame.height) {
-                let y = i64::from(frame.top) + row;
-                if y >= h {
-                    break;
-                }
-                for col in 0..i64::from(frame.width) {
-                    let x = i64::from(frame.left) + col;
-                    if x >= w {
-                        break;
-                    }
-                    let from = ((row * i64::from(frame.width) + col) * 4) as usize;
-                    let to = ((y * w + x) * 4) as usize;
-                    rgba[to..to + 4].copy_from_slice(&frame.buffer[from..from + 4]);
-                }
-            }
-            Image {
-                width: w,
-                height: h,
-                rgba: Pixels::new(rgba),
-                format,
-            }
-        }
-        Format::Svg => {
-            let text = std::str::from_utf8(bytes).map_err(|_| "SVG: the file is not UTF-8 text")?;
-            let picture =
-                crate::render::svg::rasterize_cancellable(text, SVG_SIDE, &|| !cancelled())
-                    .map_err(|e| format!("SVG: {e}"))?;
-            Image {
-                width: picture.width,
-                height: picture.height,
-                rgba: Pixels::new(picture.rgba),
-                format,
-            }
-        }
+        Format::Jpeg => decode_jpeg(bytes, cancelled)?,
+        Format::Gif => decode_gif(bytes)?,
+        Format::Svg => decode_svg(bytes, cancelled)?,
     };
     if cancelled() {
         return Err("decoding cancelled".into());
     }
     Ok(image)
+}
+
+#[cfg(feature = "jpeg")]
+fn decode_jpeg(bytes: &[u8], cancelled: &dyn Fn() -> bool) -> Result<Image, String> {
+    use zune_core::bytestream::ZCursor;
+    use zune_core::colorspace::ColorSpace;
+    use zune_core::options::DecoderOptions;
+    let format = Format::Jpeg;
+    let options = DecoderOptions::default()
+        .jpeg_set_out_colorspace(ColorSpace::RGBA)
+        .set_max_width(16_384)
+        .set_max_height(16_384);
+    let mut decoder = zune_jpeg::JpegDecoder::new_with_options(ZCursor::new(bytes), options);
+    decoder
+        .decode_headers()
+        .map_err(|e| format!("JPEG: {e:?}"))?;
+    let info = decoder.info().ok_or("JPEG: no image header")?;
+    checked(i64::from(info.width), i64::from(info.height))?;
+    let orientation = decoder.exif().map_or(1, |exif| exif_orientation(exif));
+    if cancelled() {
+        return Err("decoding cancelled".into());
+    }
+    let rgba = decoder.decode().map_err(|e| format!("JPEG: {e:?}"))?;
+    let image = Image {
+        width: i64::from(info.width),
+        height: i64::from(info.height),
+        rgba: Pixels::new(rgba),
+        format,
+    };
+    if image.rgba.len() != (image.width * image.height * 4) as usize {
+        return Err("JPEG: the decoded pixels do not match the image size".into());
+    }
+    Ok(orient(image, orientation))
+}
+
+#[cfg(not(feature = "jpeg"))]
+fn decode_jpeg(_: &[u8], _: &dyn Fn() -> bool) -> Result<Image, String> {
+    Err("this build decodes no JPEG images".into())
+}
+
+#[cfg(feature = "gif")]
+fn decode_gif(bytes: &[u8]) -> Result<Image, String> {
+    let format = Format::Gif;
+    let mut options = gif::DecodeOptions::new();
+    options.set_color_output(gif::ColorOutput::RGBA);
+    let mut decoder = options
+        .read_info(std::io::Cursor::new(bytes))
+        .map_err(|e| format!("GIF: {e}"))?;
+    let (w, h) = (i64::from(decoder.width()), i64::from(decoder.height()));
+    checked(w, h)?;
+    let frame = decoder
+        .read_next_frame()
+        .map_err(|e| format!("GIF: {e}"))?
+        .ok_or("GIF: no frames")?;
+    // The first frame is drawn into a canvas of the image's size.
+    let mut rgba = vec![0u8; (w * h * 4) as usize];
+    for row in 0..i64::from(frame.height) {
+        let y = i64::from(frame.top) + row;
+        if y >= h {
+            break;
+        }
+        for col in 0..i64::from(frame.width) {
+            let x = i64::from(frame.left) + col;
+            if x >= w {
+                break;
+            }
+            let from = ((row * i64::from(frame.width) + col) * 4) as usize;
+            let to = ((y * w + x) * 4) as usize;
+            rgba[to..to + 4].copy_from_slice(&frame.buffer[from..from + 4]);
+        }
+    }
+    Ok(Image {
+        width: w,
+        height: h,
+        rgba: Pixels::new(rgba),
+        format,
+    })
+}
+
+#[cfg(not(feature = "gif"))]
+fn decode_gif(_: &[u8]) -> Result<Image, String> {
+    Err("this build decodes no GIF images".into())
+}
+
+#[cfg(feature = "svg")]
+fn decode_svg(bytes: &[u8], cancelled: &dyn Fn() -> bool) -> Result<Image, String> {
+    let format = Format::Svg;
+    let text = std::str::from_utf8(bytes).map_err(|_| "SVG: the file is not UTF-8 text")?;
+    let picture = crate::render::svg::rasterize_cancellable(text, SVG_SIDE, &|| !cancelled())
+        .map_err(|e| format!("SVG: {e}"))?;
+    Ok(Image {
+        width: picture.width,
+        height: picture.height,
+        rgba: Pixels::new(picture.rgba),
+        format,
+    })
+}
+
+#[cfg(not(feature = "svg"))]
+fn decode_svg(_: &[u8], _: &dyn Fn() -> bool) -> Result<Image, String> {
+    Err("this build draws no SVG images".into())
 }
 
 /// A copy no larger than `side` on either edge, for drawing a large image

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.8 - Optional parts and paste fixes
+
+- Markdown and HTML import, SVG, JPEG and GIF are features (`markup`, `svg`, `jpeg`, `gif`), all on by default; an application that turns one off leaves its code and crates out of its build, and the call answers why it cannot.
+- A large paste no longer stalls: the program taking pasted input could wake the session at the moment it handled the terminal's output, and that wake was lost, leaving the rest of the paste unsent until something else woke the window.
+- Closing a running program on Windows returns once the program has ended; it could return while Windows was still ending it.
+- Requires Gossamer 0.78.0, which builds a library's Rust binding with the features its package features choose, and builds on windowing-gos 0.1.12, whose SDL no longer loses a wake from another thread.
+
 ## 0.2.7 - Less CPU for terminal output
 
 - A terminal keeps its text as pixels between paints: output that scrolls turns a ring of rows instead of drawing them again, and only the rows that came in are drawn. A translucent terminal, or one showing images, draws as before.

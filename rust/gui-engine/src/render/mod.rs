@@ -4,6 +4,7 @@ pub mod png;
 mod pool;
 pub mod presenter;
 pub mod retained;
+#[cfg(feature = "svg")]
 pub mod svg;
 pub mod vector;
 

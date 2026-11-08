@@ -12,7 +12,7 @@ use portable_pty::{CommandBuilder, MasterPty};
 use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle, WAIT_OBJECT_0};
 use windows_sys::Win32::System::IO::CancelSynchronousIo;
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, TerminateProcess, WaitForSingleObject,
+    GetCurrentProcess, GetExitCodeProcess, INFINITE, TerminateProcess, WaitForSingleObject,
 };
 
 use super::Command;
@@ -66,6 +66,21 @@ fn duplicate(raw: RawHandle) -> Result<OwnedHandle, String> {
 fn exited(process: &OwnedHandle) -> bool {
     // SAFETY: `process` is an owned, open process handle.
     unsafe { WaitForSingleObject(process.as_raw_handle(), 0) == WAIT_OBJECT_0 }
+}
+
+// The exit code is set when termination begins, before the process object
+// signals; the program has ended only once it signals.
+fn wait_for_exit(process: &OwnedHandle) -> Result<u32, String> {
+    // SAFETY: `process` is an owned, open process handle.
+    if unsafe { WaitForSingleObject(process.as_raw_handle(), INFINITE) } != WAIT_OBJECT_0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let mut code = 0;
+    // SAFETY: `process` is an owned, open process handle and `code` a live u32.
+    if unsafe { GetExitCodeProcess(process.as_raw_handle(), &mut code) } == 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    Ok(code)
 }
 
 fn terminate(process: &OwnedHandle) -> Result<(), String> {
@@ -203,15 +218,13 @@ impl Pty {
                 })
                 .map_err(|e| e.to_string())?,
         );
+        let exit = duplicate(pty.process.as_raw_handle())?;
         pty.waiter = Some(
             thread::Builder::new()
                 .name("gui-conpty-exit".into())
                 .stack_size(STACK)
                 .spawn(move || {
-                    let result = child
-                        .wait()
-                        .map(|status| status.exit_code())
-                        .map_err(|e| e.to_string().chars().take(1024).collect());
+                    let result = wait_for_exit(&exit).map_err(|e| e.chars().take(1024).collect());
                     ending.finish(false, Some(result));
                     notify.fire();
                 })

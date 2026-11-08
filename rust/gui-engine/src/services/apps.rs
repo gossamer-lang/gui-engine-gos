@@ -13,6 +13,7 @@ use crate::errors;
 use crate::paths;
 use std::process::Command;
 
+#[cfg(feature = "svg")]
 use crate::render::svg;
 use crate::services;
 
@@ -50,6 +51,7 @@ pub struct AppIcon {
 
 impl AppIcon {
     /// The SVG document `text` drawn `size` pixels square.
+    #[cfg(feature = "svg")]
     pub fn from_svg(text: &str, size: i64) -> Result<AppIcon, errors::Error> {
         let picture = svg::rasterize(text, size)?;
         Ok(AppIcon {
@@ -57,6 +59,12 @@ impl AppIcon {
             width: picture.width,
             height: picture.height,
         })
+    }
+
+    /// The SVG document `text` drawn `size` pixels square.
+    #[cfg(not(feature = "svg"))]
+    pub fn from_svg(_: &str, _: i64) -> Result<AppIcon, errors::Error> {
+        Err(errors::new("this build draws no SVG images"))
     }
 
     /// The icon encoded as a PNG file's bytes, transparency kept.
@@ -1432,6 +1440,7 @@ mod tests {
         assert_eq!(loaded[0].image.as_ref().unwrap().width, 32);
     }
 
+    #[cfg(feature = "svg")]
     #[test]
     fn an_svg_document_becomes_an_icon_of_the_size_asked() {
         let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><rect width="10" height="10" fill="#b05e24"/></svg>"##;
@@ -1441,6 +1450,7 @@ mod tests {
         assert!(super::AppIcon::from_svg("not svg", 32).is_err());
     }
 
+    #[cfg(feature = "svg")]
     #[test]
     fn icons_come_from_the_folder_serving_the_size_and_svgs_are_drawn() {
         let config = crate::services::private_test_config();

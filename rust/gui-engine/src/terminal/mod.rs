@@ -637,6 +637,14 @@ struct Paste {
 }
 
 /// Queues as much of the pending paste as the input queue has room for.
+// Asks the writer to wake the session once it takes queued input, then looks
+// again: a chunk it took before the request would wake no one, so room it
+// made meanwhile is used now. Answers whether the paste waits for `needed`.
+fn waits_for_room(transport: &Transport, needed: usize) -> bool {
+    transport.want_input_room();
+    transport.input_room() < needed
+}
+
 fn feed_paste(entry: &mut Entry) {
     let (Some(paste), Some(transport)) = (&mut entry.paste, &entry.transport) else {
         return;
@@ -652,8 +660,10 @@ fn feed_paste(entry: &mut Entry) {
             .concat();
             if tail.len() > room {
                 paste.end = tail;
-                transport.want_input_room();
-                return;
+                if waits_for_room(transport, paste.end.len()) {
+                    return;
+                }
+                continue;
             }
             if transport.write(&tail).is_err() {
                 transport.want_input_room();
@@ -664,8 +674,10 @@ fn feed_paste(entry: &mut Entry) {
             return;
         }
         if room == 0 {
-            transport.want_input_room();
-            return;
+            if waits_for_room(transport, 1) {
+                return;
+            }
+            continue;
         }
         let take = left.min(room);
         if transport
@@ -1005,65 +1017,80 @@ pub(crate) fn pump(budget: &Budget, held: bool) -> (bool, Vec<UiMsg>) {
             changed = true;
             events.push(UiMsg::Terminal(*id, Event::Refused(why)));
         }
+        changed |= std::mem::take(&mut entry.output_shown);
+        entry.pumped = entry.revision;
+        if !held
+            && entry
+                .transport
+                .as_ref()
+                .is_some_and(Transport::has_pending_output)
+        {
+            changed |= take_ending(*id, entry, &mut events);
+        }
+        // The transport's one wake also says the program took queued input,
+        // and the drain above rearms it: a paste goes on after the drain, so
+        // room made before it is used here and room made after it wakes the
+        // session again.
         if entry.paste.is_some() {
             feed_paste(entry);
         }
-        changed |= std::mem::take(&mut entry.output_shown);
-        entry.pumped = entry.revision;
-        let Some(transport) = &entry.transport else {
-            continue;
-        };
-        if held || !transport.has_pending_output() {
-            continue;
-        }
-        // The transport parsed the output; what is left is its end and the
-        // program's exit.
-        let drained = transport.drain();
-        for (title, body) in entry.engine.take_toasts() {
-            events.push(UiMsg::Terminal(*id, Event::Notify(title, body)));
-        }
-        let (clipboard, primary) = entry.engine.take_clipboard();
-        if let Some(text) = clipboard {
-            events.push(UiMsg::Terminal(*id, Event::Clipboard(text)));
-        }
-        if let Some(text) = primary {
-            events.push(UiMsg::Terminal(*id, Event::PrimarySelection(text)));
-        }
-        let notes = entry.engine.notifications();
-        if notes.title_revision != entry.title_seen {
-            entry.title_seen = notes.title_revision;
-            events.push(UiMsg::Terminal(*id, Event::Title(notes.title.clone())));
-        }
-        if notes.bells != entry.bells_seen {
-            entry.bells_seen = notes.bells;
-            events.push(UiMsg::Terminal(*id, Event::Bell));
-        }
-        if drained.exit.is_some() {
-            entry.exit = drained.exit.clone();
-        }
-        // A program that ends inside a synchronized frame leaves it to show.
-        if drained.eof && entry.synchronized {
-            entry.engine.end_synchronized();
-            entry.synchronized = false;
-            changed = true;
-        }
-        // An exit is reported once the output before it has been parsed.
-        if !entry.exit_reported
-            && drained.eof
-            && let Some(exit) = &entry.exit
-        {
-            entry.exit_reported = true;
-            changed = true;
-            events.push(UiMsg::Terminal(
-                *id,
-                match exit {
-                    Ok(code) => Event::Exited(i64::from(*code)),
-                    Err(error) => Event::Failed(error.clone()),
-                },
-            ));
-        }
     }
     (changed, events)
+}
+
+// Takes the end of terminal `id`'s output, its program's exit and the events
+// its output raised, answering whether the screen changed. The transport
+// parsed the output itself.
+fn take_ending(id: i64, entry: &mut Entry, events: &mut Vec<UiMsg>) -> bool {
+    let Some(transport) = &entry.transport else {
+        return false;
+    };
+    let mut changed = false;
+    let drained = transport.drain();
+    for (title, body) in entry.engine.take_toasts() {
+        events.push(UiMsg::Terminal(id, Event::Notify(title, body)));
+    }
+    let (clipboard, primary) = entry.engine.take_clipboard();
+    if let Some(text) = clipboard {
+        events.push(UiMsg::Terminal(id, Event::Clipboard(text)));
+    }
+    if let Some(text) = primary {
+        events.push(UiMsg::Terminal(id, Event::PrimarySelection(text)));
+    }
+    let notes = entry.engine.notifications();
+    if notes.title_revision != entry.title_seen {
+        entry.title_seen = notes.title_revision;
+        events.push(UiMsg::Terminal(id, Event::Title(notes.title.clone())));
+    }
+    if notes.bells != entry.bells_seen {
+        entry.bells_seen = notes.bells;
+        events.push(UiMsg::Terminal(id, Event::Bell));
+    }
+    if drained.exit.is_some() {
+        entry.exit = drained.exit.clone();
+    }
+    // A program that ends inside a synchronized frame leaves it to show.
+    if drained.eof && entry.synchronized {
+        entry.engine.end_synchronized();
+        entry.synchronized = false;
+        changed = true;
+    }
+    // An exit is reported once the output before it has been parsed.
+    if !entry.exit_reported
+        && drained.eof
+        && let Some(exit) = &entry.exit
+    {
+        entry.exit_reported = true;
+        changed = true;
+        events.push(UiMsg::Terminal(
+            id,
+            match exit {
+                Ok(code) => Event::Exited(i64::from(*code)),
+                Err(error) => Event::Failed(error.clone()),
+            },
+        ));
+    }
+    changed
 }
 
 /// Whether terminal `id`'s output wake is taken: output since the last pump

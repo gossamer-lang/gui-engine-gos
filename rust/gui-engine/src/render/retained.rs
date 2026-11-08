@@ -2,12 +2,11 @@
 //! pixels that persist in the window's own surface.
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::Canvas;
+use super::{Canvas, Coverage, revision_hasher};
 use crate::geometry::Rect;
 use crate::style::color::Color;
 
@@ -18,14 +17,16 @@ pub enum Primitive {
     CircleStroke(i64, i64, i64, i64, Color),
     RoundRect(i64, i64, i64, i64, i64, i64, Color),
     Line(i64, i64, i64, i64, f64, Color),
-    Coverage(i64, i64, i64, i64, Arc<[u8]>, Color),
+    Coverage(i64, i64, i64, i64, Coverage, Color),
     Image(i64, i64, i64, i64, Arc<[u8]>, i64, i64),
     /// Pixels drawn by reference, as `Image` draws its own copy.
     Shared(i64, i64, i64, i64, super::Pixels, i64, i64),
     Layer(i64, i64, i64, i64, Arc<[u8]>, i64, i64),
+    /// A widget's own pixels, drawn by reference at their size.
+    Surface(i64, i64, super::Surface),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct Command {
     pub paint: Primitive,
     pub clip: Rect,
@@ -34,11 +35,23 @@ pub struct Command {
     revision: u64,
 }
 
+// Revisions differ for nearly every command that differs, so they are
+// compared before the payloads.
+impl PartialEq for Command {
+    fn eq(&self, other: &Self) -> bool {
+        self.revision == other.revision
+            && self.bounds == other.bounds
+            && self.opacity == other.opacity
+            && self.clip == other.clip
+            && self.paint == other.paint
+    }
+}
+
 impl Command {
     pub fn new(paint: Primitive, clip: Rect, opacity: i64) -> Self {
         let opacity = opacity.clamp(0, 255);
         let bounds = paint.bounds().intersect(clip);
-        let mut h = DefaultHasher::new();
+        let mut h = revision_hasher();
         // Hash the exact binary payload; floating point widths use their bits.
         paint.hash_into(&mut h);
         [clip.x, clip.y, clip.width, clip.height, opacity].hash(&mut h);
@@ -54,9 +67,10 @@ impl Command {
     pub fn bytes(&self) -> usize {
         std::mem::size_of::<Self>()
             + match &self.paint {
-                Primitive::Coverage(_, _, _, _, p, _)
-                | Primitive::Image(_, _, _, _, p, _, _)
-                | Primitive::Layer(_, _, _, _, p, _, _) => p.len(),
+                Primitive::Coverage(_, _, _, _, p, _) => p.len(),
+                Primitive::Image(_, _, _, _, p, _, _) | Primitive::Layer(_, _, _, _, p, _, _) => {
+                    p.len()
+                }
                 _ => 0,
             }
     }
@@ -77,7 +91,7 @@ impl Command {
         isolate(black.pixels, &white.pixels)
     }
 
-    fn replay(&self, canvas: &mut Canvas, dx: i64, dy: i64) {
+    pub(crate) fn replay(&self, canvas: &mut Canvas, dx: i64, dy: i64) {
         let old = canvas.clip;
         let opacity = canvas.opacity;
         canvas.push_clip(self.clip.offset(dx, dy));
@@ -94,7 +108,9 @@ impl Command {
             Primitive::Line(x, y, a, b, w, c) => {
                 canvas.line_aa_w(x + dx, y + dy, a + dx, b + dy, *w, *c)
             }
-            Primitive::Coverage(x, y, w, h, p, c) => canvas.coverage(x + dx, y + dy, *w, *h, p, *c),
+            Primitive::Coverage(x, y, w, h, p, c) => {
+                canvas.coverage_shared(x + dx, y + dy, *w, *h, p, *c)
+            }
             Primitive::Layer(x, y, w, h, p, sw, sh) => {
                 canvas.layer_scaled(x + dx, y + dy, *w, *h, p, *sw, *sh)
             }
@@ -104,6 +120,7 @@ impl Command {
             Primitive::Shared(x, y, w, h, p, sw, sh) => {
                 canvas.pixels_scaled(x + dx, y + dy, *w, *h, p, *sw, *sh)
             }
+            Primitive::Surface(x, y, s) => canvas.surface(x + dx, y + dy, s),
         }
         canvas.clip = old;
         canvas.opacity = opacity;
@@ -118,6 +135,7 @@ impl Primitive {
             | Self::Image(x, y, w, h, _, _, _)
             | Self::Shared(x, y, w, h, _, _, _)
             | Self::Layer(x, y, w, h, _, _, _) => Rect::new(*x, *y, *w, *h),
+            Self::Surface(x, y, s) => Rect::new(*x, *y, s.width(), s.height()),
             Self::RoundRect(x, y, w, h, _, _, _) => Rect::new(x - 2, y - 2, w + 4, h + 4),
             Self::Circle(x, y, r, _) | Self::CircleStroke(x, y, r, _, _) => {
                 Rect::new(x - r - 1, y - r - 1, r * 2 + 3, r * 2 + 3)
@@ -171,6 +189,10 @@ impl Primitive {
             Self::Shared(x, y, w, t, p, sw, sh) => {
                 [x, y, w, t, sw, sh].hash(h);
                 p.hash(h);
+            }
+            Self::Surface(x, y, s) => {
+                [x, y].hash(h);
+                s.hash(h);
             }
         }
     }
@@ -440,7 +462,7 @@ impl Scene {
         opacity: i64,
         cache: &SubtreeCache,
     ) -> Result<(), crate::errors::Error> {
-        let mut hash = DefaultHasher::new();
+        let mut hash = revision_hasher();
         for command in &source.commands {
             command.revision.hash(&mut hash);
         }
@@ -680,11 +702,28 @@ impl Retained {
             .take_while(|(a, b)| a == b)
             .count();
         let mut damage = vec![];
-        for c in self.scene.commands[prefix..self.scene.commands.len() - suffix]
-            .iter()
-            .chain(&scene.commands[prefix..scene.commands.len() - suffix])
-        {
-            add_damage(&mut damage, c.bounds.intersect(screen));
+        let old = &self.scene.commands[prefix..self.scene.commands.len() - suffix];
+        let new = &scene.commands[prefix..scene.commands.len() - suffix];
+        // Commands that stay in the same place of the same order paint the
+        // same pixels, unless one that differs covers them.
+        if old.len() == new.len() {
+            for (a, b) in old.iter().zip(new) {
+                if a == b {
+                    continue;
+                }
+                if let Some(changed) = rewritten(a, b) {
+                    for rect in changed {
+                        add_damage(&mut damage, rect.intersect(b.bounds).intersect(screen));
+                    }
+                    continue;
+                }
+                add_damage(&mut damage, a.bounds.intersect(screen));
+                add_damage(&mut damage, b.bounds.intersect(screen));
+            }
+        } else {
+            for c in old.iter().chain(new) {
+                add_damage(&mut damage, c.bounds.intersect(screen));
+            }
         }
         damage
     }
@@ -708,6 +747,8 @@ impl Retained {
         // Tiles worth keeping get their own pixels up front, while the layer
         // budget has room; the rest draw into a worker's scratch tile.
         let mut room = layer_budget;
+        let mut reaching = tile_commands(scene, width, height);
+        let columns = tile_count(width);
         let mut bands: Vec<Vec<Job>> = vec![];
         for y in (0..height).step_by(TILE as usize) {
             let mut band = vec![];
@@ -721,12 +762,9 @@ impl Retained {
                 if parts.is_empty() {
                     continue;
                 }
-                let commands: Vec<&Command> = scene
-                    .commands
-                    .iter()
-                    .filter(|c| nonempty(c.bounds.intersect(tile)))
-                    .collect();
-                let mut h = DefaultHasher::new();
+                let commands =
+                    std::mem::take(&mut reaching[((y / TILE) * columns + x / TILE) as usize]);
+                let mut h = revision_hasher();
                 [x, y, tile.width, tile.height].hash(&mut h);
                 for c in &commands {
                     c.revision.hash(&mut h);
@@ -794,7 +832,7 @@ impl Retained {
             done
         };
         // Bands own disjoint rows of the frame, so the bands with tiles to
-        // rasterize do so side by side.
+        // rasterize do so side by side on the pool's workers.
         let fresh = work
             .iter()
             .filter(|(_, jobs)| jobs.iter().any(|j| j.cached.is_none()))
@@ -809,24 +847,12 @@ impl Retained {
         while scratch.len() < chunks {
             scratch.push(Vec::with_capacity((TILE * TILE * 4) as usize));
         }
-        let results: Vec<Banded> = if workers == 1 {
-            vec![raster((&mut work, &mut scratch[0]))]
-        } else {
-            std::thread::scope(|scope| {
-                let handles: Vec<_> = work
-                    .chunks_mut(per)
-                    .zip(scratch.iter_mut())
-                    .map(|chunk| scope.spawn(|| raster(chunk)))
-                    .collect();
-                handles
-                    .into_iter()
-                    .map(|h| {
-                        h.join()
-                            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-                    })
-                    .collect()
-            })
-        };
+        let results: Vec<Banded> = super::pool::scope(
+            work.chunks_mut(per)
+                .zip(scratch.iter_mut())
+                .map(|chunk| || raster(chunk))
+                .collect(),
+        );
         for done in results {
             self.stats.rasterized_pixels += done.rasterized_pixels;
             self.stats.damage_pixels += done.damage_pixels;
@@ -884,6 +910,31 @@ impl Retained {
 // Fixed-size layers bound work and allocations even for a large primitive.
 const TILE: i64 = 128;
 
+/// Tiles of `TILE` pixels across `extent` pixels.
+fn tile_count(extent: i64) -> i64 {
+    (extent + TILE - 1).div_euclid(TILE).max(0)
+}
+
+/// The commands of `scene` that reach each tile of a `width` x `height`
+/// frame, row by row, each tile's in scene order.
+fn tile_commands(scene: &Scene, width: i64, height: i64) -> Vec<Vec<&Command>> {
+    let (columns, rows) = (tile_count(width), tile_count(height));
+    let mut reaching = vec![Vec::new(); (columns * rows) as usize];
+    let screen = Rect::new(0, 0, width, height);
+    for c in &scene.commands {
+        let b = c.bounds.intersect(screen);
+        if !nonempty(b) {
+            continue;
+        }
+        for ty in b.y / TILE..=(b.y + b.height - 1) / TILE {
+            for tx in b.x / TILE..=(b.x + b.width - 1) / TILE {
+                reaching[(ty * columns + tx) as usize].push(c);
+            }
+        }
+    }
+    reaching
+}
+
 /// A damaged tile: its damaged parts, the commands that reach it, and the
 /// cached raster of the same revision, if any.
 struct Job<'a> {
@@ -929,6 +980,9 @@ fn band_raster(
     let inside = Rect::new(0, band.y, band.width, band.rows);
     for job in jobs {
         let tile = job.tile;
+        if job.cached.is_none() && copy_surface(band, job, inside, done) {
+            continue;
+        }
         let keep = job.kept.is_some();
         let raster: Cow<[u8]> = match job.cached {
             Some(i) => Cow::Borrowed(&tiles[i].pixels),
@@ -960,11 +1014,7 @@ fn band_raster(
                             *d = [s[0], s[1], s[2], s[3]];
                         }
                     }
-                    (2, 1, 0) => {
-                        for (d, s) in into.iter_mut().zip(from) {
-                            *d = [s[2], s[1], s[0], s[3]];
-                        }
-                    }
+                    (2, 1, 0) => swap_red_blue(into, from),
                     _ => {
                         for (d, s) in into.iter_mut().zip(from) {
                             d[ro] = s[0];
@@ -990,6 +1040,76 @@ fn band_raster(
             }
         }
     }
+}
+
+/// Copies a tile's damage straight from an opaque surface on top of all else
+/// that reaches the tile, which then needs no raster of its own. Answers
+/// whether it did.
+fn copy_surface(band: &mut Band, job: &Job, inside: Rect, done: &mut Banded) -> bool {
+    let Some(top) = job.commands.last() else {
+        return false;
+    };
+    let Primitive::Surface(x, y, surface) = &top.paint else {
+        return false;
+    };
+    let shown = Rect::new(*x, *y, surface.width, surface.height).intersect(top.clip);
+    if !surface.opaque || top.opacity < 255 || shown.intersect(job.tile) != job.tile {
+        return false;
+    }
+    let rgba = surface.rgba.read();
+    let (ro, go, bo) = band.offsets;
+    for part in &job.parts {
+        let part = part.intersect(inside);
+        if !nonempty(part) {
+            continue;
+        }
+        let len = part.width as usize * 4;
+        for row in part.y..part.y + part.height {
+            let src = (surface.stored_row(row - y) * surface.width + part.x - x) as usize * 4;
+            let dst = (row - band.y) as usize * band.stride + part.x as usize * 4;
+            let into = band.pixels[dst..dst + len].as_chunks_mut::<4>().0;
+            let from = rgba[src..src + len].as_chunks::<4>().0;
+            match (ro, go, bo) {
+                (0, 1, 2) => into.copy_from_slice(from),
+                (2, 1, 0) => {
+                    swap_red_blue(into, from);
+                }
+                _ => {
+                    for (d, s) in into.iter_mut().zip(from) {
+                        d[ro] = s[0];
+                        d[go] = s[1];
+                        d[bo] = s[2];
+                        d[3] = s[3];
+                    }
+                }
+            }
+        }
+        done.damage_pixels += (part.width * part.height) as u64;
+    }
+    true
+}
+
+/// Copies pixels exchanging their first and third bytes, as whole words,
+/// which vectorizes where a byte shuffle does not.
+fn swap_red_blue(into: &mut [[u8; 4]], from: &[[u8; 4]]) {
+    for (d, s) in into.iter_mut().zip(from) {
+        let p = u32::from_le_bytes(*s);
+        *d = ((p & 0xff00_ff00) | ((p & 0xff) << 16) | ((p >> 16) & 0xff)).to_le_bytes();
+    }
+}
+
+/// The frame rectangles that differ when `b` draws a surface's content in
+/// place of the content `a` drew there, where that is known.
+fn rewritten(a: &Command, b: &Command) -> Option<Vec<Rect>> {
+    let (Primitive::Surface(ax, ay, was), Primitive::Surface(x, y, now)) = (&a.paint, &b.paint)
+    else {
+        return None;
+    };
+    if (ax, ay) != (x, y) || a.clip != b.clip || a.opacity != b.opacity {
+        return None;
+    }
+    let changed = now.changed_since(was)?;
+    Some(changed.iter().map(|r| r.offset(*x, *y)).collect())
 }
 
 fn add_damage(regions: &mut Vec<Rect>, mut rect: Rect) {

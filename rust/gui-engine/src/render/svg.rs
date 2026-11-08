@@ -215,6 +215,7 @@ pub fn rasterize_cancellable(
     let options = roxmltree::ParsingOptions {
         allow_dtd: true,
         nodes_limit: 16_384,
+        entity_resolver: None,
     };
     let document = roxmltree::Document::parse_with_options(text, options)
         .map_err(|e| errors::wrap(e, "reading the SVG document"))?;

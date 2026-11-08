@@ -1599,12 +1599,22 @@ fn a_repaint_that_copies_every_row_keeps_their_runs_laid_out() {
 }
 
 #[test]
-fn a_screen_painted_after_its_last_frame_records_what_a_first_paint_would() {
+fn a_screen_painted_after_its_last_frame_shows_what_a_first_paint_would() {
+    // Opaque, the rows draw through the terminal's layer; translucent, into
+    // the window's recording, which copies rows from the frame before.
+    for opacity in [1.0, 0.9] {
+        repaints_match_first_paints(opacity);
+    }
+}
+
+fn repaints_match_first_paints(opacity: f64) {
     let budget = Budget::new(64 * 1024 * 1024);
     let kept = create(&options(12, 40, 100), budget.clone()).unwrap();
     let fresh = create(&options(12, 40, 100), budget).unwrap();
-    let kept_view = widget::View::new("kept", kept, "Kept");
-    let fresh_view = widget::View::new("fresh", fresh, "Fresh");
+    let mut kept_view = widget::View::new("kept", kept, "Kept");
+    let mut fresh_view = widget::View::new("fresh", fresh, "Fresh");
+    kept_view.options.opacity = opacity;
+    fresh_view.options.opacity = opacity;
     let mut retained = crate::render::retained::Retained::new();
     let small = crate::geometry::Size::new(480, 320);
     let large = crate::geometry::Size::new(560, 360);
@@ -1613,11 +1623,16 @@ fn a_screen_painted_after_its_last_frame_records_what_a_first_paint_would() {
         change(fresh);
         // Twice: the second paint follows a frame that already shows it all.
         for _ in 0..2 {
-            assert_eq!(
-                paint_retained(&kept_view, size, &mut retained),
-                paint_fresh(&fresh_view, size),
-                "{name}"
+            let scene = paint_retained(&kept_view, size, &mut retained);
+            let mut shown = crate::render::Canvas::new(size.width, size.height);
+            scene.replay(&mut shown);
+            assert!(
+                shown.pixels == paint(&fresh_view, size).pixels,
+                "{name} at opacity {opacity}"
             );
+            if opacity < 1.0 {
+                assert_eq!(scene, paint_fresh(&fresh_view, size), "{name}");
+            }
         }
     };
     let output = |bytes: &'static str| move |id: i64| feed(id, bytes.as_bytes()).unwrap();
@@ -1679,4 +1694,87 @@ fn a_screen_painted_after_its_last_frame_records_what_a_first_paint_would() {
     step("wide", small, &output("日本語 😀 e\u{301}\r\n"));
     step("cleared", small, &output("\x1b[2J\x1b[Hafter"));
     step("resized", large, &output("wider\r\n"));
+}
+
+#[test]
+fn scrolled_output_draws_its_rows_from_the_layer() {
+    let id = create(&options(12, 40, 100), Budget::new(64 * 1024 * 1024)).unwrap();
+    let view = widget::View::new("term", id, "Term");
+    let mut retained = crate::render::retained::Retained::new();
+    let size = crate::geometry::Size::new(480, 320);
+    for i in 0..30 {
+        feed(id, format!("line {i}\r\n").as_bytes()).unwrap();
+    }
+    paint_retained(&view, size, &mut retained);
+    feed(id, b"one more\r\n").unwrap();
+    let scene = paint_retained(&view, size, &mut retained);
+    use crate::render::retained::Primitive;
+    assert!(
+        scene
+            .commands
+            .iter()
+            .any(|c| matches!(c.paint, Primitive::Surface(..)))
+    );
+    assert!(
+        !scene
+            .commands
+            .iter()
+            .any(|c| matches!(c.paint, Primitive::Coverage(..))),
+        "no glyph draws outside the layer"
+    );
+    crate::terminal::sweep_layers();
+    assert_eq!(
+        with_entry(id, |entry| entry.layer.holds()),
+        Some(true),
+        "a layer drawn since the last sweep stays"
+    );
+    crate::terminal::sweep_layers();
+    assert_eq!(
+        with_entry(id, |entry| entry.layer.holds()),
+        Some(false),
+        "a layer no paint drew from goes"
+    );
+    close(id);
+}
+
+#[test]
+fn a_layer_goes_once_output_stops_scrolling_and_a_still_screen_takes_none() {
+    let id = create(&options(12, 40, 100), Budget::new(64 * 1024 * 1024)).unwrap();
+    let view = widget::View::new("term", id, "Term");
+    let mut retained = crate::render::retained::Retained::new();
+    let size = crate::geometry::Size::new(480, 320);
+    let theme = crate::style::Theme::default();
+    let states = crate::widgets::state::StateStore::new();
+    let mut paint_at = |now: i64| {
+        let recording = retained.recording(size.width, size.height);
+        let mut cx = crate::widgets::cx::PaintCx::new(&recording, &theme, &states);
+        cx.now = now;
+        widget::paint_terminal(&view, &crate::widgets::cx::Node::leaf(size), &mut cx);
+        retained.commit(cx.canvas.take_scene().unwrap());
+    };
+    let holds = || with_entry(id, |entry| entry.layer.holds()).unwrap();
+    feed(id, b"prompt").unwrap();
+    paint_at(0);
+    paint_at(10);
+    assert!(!holds(), "a screen that does not scroll keeps no layer");
+    for i in 0..30 {
+        feed(id, format!("line {i}\r\n").as_bytes()).unwrap();
+    }
+    paint_at(15);
+    feed(id, b"three\r\nmore\r\nlines\r\n").unwrap();
+    paint_at(20);
+    assert!(holds(), "scrolled output draws through a layer");
+    assert_eq!(
+        with_entry(id, |entry| entry.animation_due).unwrap(),
+        Some(1_021),
+        "the terminal paints again when the layer goes quiet"
+    );
+    paint_at(500);
+    assert!(holds());
+    paint_at(2_000);
+    assert!(
+        !holds(),
+        "a layer goes once the output has been still a while"
+    );
+    close(id);
 }

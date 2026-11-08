@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.7 - Less CPU for terminal output
+
+- A terminal keeps its text as pixels between paints: output that scrolls turns a ring of rows instead of drawing them again, and only the rows that came in are drawn. A translucent terminal, or one showing images, draws as before.
+- Raster work for a frame runs on workers that stay parked between frames, instead of threads started for every frame.
+- A glyph is drawn from the glyph cache's own coverage, without copying it for each frame; recorded paint is hashed with foldhash and compared by its revision first.
+- A frame sorts its paint into tiles once, and repaints only the paint that changed when the rest of the frame keeps its order.
+- An opaque surface on top of a tile is copied straight into the window, and pixels swap their red and blue bytes as whole words.
+- Builds on wezterm-lite 0.1.7, pulldown-cmark 0.13, roxmltree 0.21, miniz_oxide 0.9 and libloading 0.9.
+
 ## 0.2.6 - Wayland windows that open reliably
 
 - Builds on windowing-gos 0.1.11, whose windows under libdecor no longer hang while they wait for their first configure.

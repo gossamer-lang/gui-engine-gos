@@ -66,7 +66,7 @@ pub struct Cell {
 /// Which version of a buffer row a screen row shows: the same version holds
 /// the same cells. Every change to a row, and every move of a row to another
 /// stable row, gives it a later sequence number.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RowVersion {
     stable: isize,
     seqno: usize,

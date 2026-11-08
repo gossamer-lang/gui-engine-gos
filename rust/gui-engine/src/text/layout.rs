@@ -1883,7 +1883,11 @@ fn hit_in_line(line: &Line, x: f64, boundaries: &[i64]) -> i64 {
 /// A rasterised glyph mask and its placement relative to the pen.
 #[derive(Debug, Clone, PartialEq, Default)]
 struct GlyphBitmap {
-    mask: Mask,
+    left: i64,
+    top: i64,
+    width: i64,
+    height: i64,
+    coverage: render::Coverage,
 }
 
 const SUBPIXEL: i64 = 4;
@@ -1901,11 +1905,11 @@ pub fn glyph_cache_stats() -> (i64, i64) {
     )
 }
 
-fn glyph_mask(face_id: FaceId, gid: i64, size: f64, sub: i64, italic: bool) -> Mask {
+fn glyph_mask(face_id: FaceId, gid: i64, size: f64, sub: i64, italic: bool) -> GlyphBitmap {
     let fid: i64 = face_id.into();
     let key = (fid, gid, (size * 64.0) as i64, sub, italic);
     if let Some(found) = GLYPHS.lock().get(&key) {
-        return found.mask.clone();
+        return found.clone();
     }
     let face = fonts::face(face_id);
     let outline = face.outline(gid);
@@ -1921,11 +1925,16 @@ fn glyph_mask(face_id: FaceId, gid: i64, size: f64, sub: i64, italic: bool) -> M
         0.0,
         FillRule::NonZero,
     );
-    let bytes = mask.coverage.capacity();
-    GLYPHS
-        .lock()
-        .insert(key, GlyphBitmap { mask: mask.clone() }, bytes);
-    mask
+    let bytes = mask.coverage.len();
+    let glyph = GlyphBitmap {
+        left: mask.left,
+        top: mask.top,
+        width: mask.width,
+        height: mask.height,
+        coverage: render::Coverage::new(mask.coverage),
+    };
+    GLYPHS.lock().insert(key, glyph.clone(), bytes);
+    glyph
 }
 
 // A color glyph sized for one text size: drawn `width` by `height` from
@@ -2238,7 +2247,7 @@ fn draw_glyph(
     );
     if m.width > 0 {
         let gy = (baseline + g.y + 0.5).floor() as i64;
-        canvas.coverage(
+        canvas.coverage_shared(
             whole as i64 + m.left,
             gy + m.top,
             m.width,

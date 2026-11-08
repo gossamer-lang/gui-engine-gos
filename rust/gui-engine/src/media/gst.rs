@@ -181,7 +181,7 @@ fn load() -> Result<Api, String> {
         let found = names.iter().find_map(|name| {
             // SAFETY: loading GStreamer runs its library constructors, which
             // have no preconditions.
-            match unsafe { libloading::Library::new(name) } {
+            match unsafe { libloading::Library::new(*name) } {
                 Ok(library) => Some(library),
                 Err(error) => {
                     failure = error.to_string();

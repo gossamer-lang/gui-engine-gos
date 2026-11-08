@@ -1635,6 +1635,7 @@ impl Session {
         for renderer in self.renderers.values_mut() {
             remain |= renderer.retained.sweep();
         }
+        remain |= crate::terminal::sweep_layers();
         self.layer_sweep = if remain { now + LAYER_SWEEP_MS } else { -1 };
     }
 
@@ -5470,10 +5471,11 @@ impl Session {
             .present(native, pw, ph, painted)?;
         let now = self.now();
         if self.layer_sweep < 0
-            && self
+            && (self
                 .renderers
                 .get(&self.windows[w as usize].key)
                 .is_some_and(|r| r.retained.caches_layers())
+                || crate::terminal::holds_layers())
         {
             self.layer_sweep = now + LAYER_SWEEP_MS;
         }

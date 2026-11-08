@@ -1,6 +1,7 @@
 pub mod display;
 pub mod icons;
 pub mod png;
+mod pool;
 pub mod presenter;
 pub mod retained;
 pub mod svg;
@@ -80,6 +81,179 @@ impl std::hash::Hash for Pixels {
     }
 }
 
+/// Rows `top..top + len` of a surface turned by `shift` rows: shown row `y`
+/// of that stretch holds stored row `top + (y - top + shift) % len`, so a
+/// ring of rows turns without moving its pixels.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Turn {
+    pub top: i64,
+    pub len: i64,
+    pub shift: i64,
+}
+
+impl Turn {
+    /// The stored row shown at row `y`.
+    pub fn stored(&self, y: i64) -> i64 {
+        if self.len > 0 && y >= self.top && y < self.top + self.len {
+            self.top + (y - self.top + self.shift).rem_euclid(self.len)
+        } else {
+            y
+        }
+    }
+}
+
+/// Pixels a widget keeps between frames and rewrites in place, which scenes
+/// draw by reference at their own size. Each content gets its own identity,
+/// which scenes compare and hash in place of the bytes.
+#[derive(Debug, Clone, Default)]
+pub struct Surface {
+    id: u64,
+    width: i64,
+    height: i64,
+    /// Every pixel is fully covered, so drawing it hides what lies under it.
+    opaque: bool,
+    turn: Turn,
+    /// The content this one replaced, and the shown rectangles in which they
+    /// differ; `None` when they may differ anywhere.
+    previous: u64,
+    changed: Option<Arc<[Rect]>>,
+    rgba: Arc<parking_lot::RwLock<Vec<u8>>>,
+}
+
+impl Surface {
+    pub fn width(&self) -> i64 {
+        self.width
+    }
+
+    pub fn height(&self) -> i64 {
+        self.height
+    }
+
+    /// Whether the surface holds pixels, which `release` lets go.
+    pub fn holds(&self) -> bool {
+        self.width > 0 && self.height > 0
+    }
+
+    /// Lets the pixels go; the next `rewrite` starts from blank ones.
+    pub fn release(&mut self) {
+        *self = Self::default();
+    }
+
+    /// The shown rectangles in which this content differs from the content
+    /// `previous` names, when that is known.
+    pub(crate) fn changed_since(&self, previous: &Surface) -> Option<&[Rect]> {
+        (self.previous == previous.id
+            && Arc::ptr_eq(&self.rgba, &previous.rgba)
+            && self.width == previous.width
+            && self.height == previous.height)
+            .then_some(self.changed.as_deref())
+            .flatten()
+    }
+
+    /// The stored row shown at row `y`.
+    pub(crate) fn stored_row(&self, y: i64) -> i64 {
+        self.turn.stored(y)
+    }
+
+    /// Rewrites the content through a canvas over the current pixels, which
+    /// are blank when the size changes, and shows it turned by `turn`, giving
+    /// it a new identity. `changed` names the shown rectangles the rewrite
+    /// can change, or `None` for any; it holds only while the size, opacity
+    /// and turn stay. A scene
+    /// that drew the old content keeps its identity, so it reads as changed.
+    pub fn rewrite(
+        &mut self,
+        width: i64,
+        height: i64,
+        opaque: bool,
+        turn: Turn,
+        changed: Option<Vec<Rect>>,
+        draw: impl FnOnce(&mut Canvas, bool),
+    ) {
+        let len = (width.max(0) * height.max(0) * 4) as usize;
+        let kept = self.width == width && self.height == height;
+        let mut pixels = self.rgba.write();
+        let mut buffer = std::mem::take(&mut *pixels);
+        if !kept || buffer.len() != len {
+            buffer.clear();
+            buffer.resize(len, 0);
+        }
+        let mut canvas = Canvas::onto(width, height, buffer);
+        draw(&mut canvas, kept);
+        *pixels = canvas.pixels;
+        drop(pixels);
+        self.width = width;
+        self.height = height;
+        let same = kept && self.opaque == opaque && self.turn == turn;
+        self.opaque = opaque;
+        self.turn = turn;
+        self.previous = self.id;
+        self.changed = changed.filter(|_| same).map(Into::into);
+        self.id = NEXT_PIXELS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl PartialEq for Surface {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl std::hash::Hash for Surface {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        self.id.hash(h)
+    }
+}
+
+/// Coverage bytes shared by the glyph cache and the scenes that draw them,
+/// with their content hash computed once, where they are made.
+#[derive(Debug, Clone, Default)]
+pub struct Coverage {
+    hash: u64,
+    bytes: Arc<[u8]>,
+}
+
+impl Coverage {
+    pub fn new(bytes: impl Into<Arc<[u8]>>) -> Self {
+        use std::hash::Hasher;
+        let bytes = bytes.into();
+        let mut h = revision_hasher();
+        h.write(&bytes);
+        Self {
+            hash: h.finish(),
+            bytes,
+        }
+    }
+}
+
+impl PartialEq for Coverage {
+    fn eq(&self, other: &Self) -> bool {
+        self.hash == other.hash
+            && (Arc::ptr_eq(&self.bytes, &other.bytes) || self.bytes == other.bytes)
+    }
+}
+
+impl Deref for Coverage {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl std::hash::Hash for Coverage {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        self.hash.hash(h)
+    }
+}
+
+/// The hasher recorded paint takes its revisions from: fixed, so equal
+/// content hashes equally in every scene.
+pub(crate) fn revision_hasher() -> impl std::hash::Hasher {
+    use std::hash::BuildHasher;
+    foldhash::quality::FixedState::default().build_hasher()
+}
+
 /// A software drawing surface in RGBA order, 4 bytes per pixel, rows
 /// packed (stride = width * 4). Widgets draw in their own coordinates;
 /// the session blits the finished canvas into the window.
@@ -155,6 +329,55 @@ impl Canvas {
             previous: None,
             recording_id: 0,
         })
+    }
+
+    /// A `width` x `height` canvas over `pixels`, which hold its content.
+    pub(crate) fn onto(width: i64, height: i64, pixels: Vec<u8>) -> Canvas {
+        debug_assert_eq!(pixels.len(), (width.max(0) * height.max(0) * 4) as usize);
+        let mut canvas = Self::over(0, 0, Vec::new());
+        canvas.pixels = pixels;
+        canvas.width = width;
+        canvas.height = height;
+        canvas.clip = Rect::new(0, 0, width, height);
+        canvas
+    }
+
+    /// The commands recorded since `mark`, taken out of the recording.
+    pub(crate) fn take_recorded(&mut self, mark: usize) -> Vec<retained::Command> {
+        let Some(scene) = &mut self.recording else {
+            return Vec::new();
+        };
+        let taken: Vec<_> = scene
+            .commands
+            .drain(mark.min(scene.commands.len())..)
+            .collect();
+        let bytes: usize = taken.iter().map(retained::Command::bytes).sum();
+        self.recorded_bytes = self.recorded_bytes.saturating_sub(bytes);
+        taken
+    }
+
+    /// Whether this canvas records commands rather than drawing pixels.
+    pub(crate) fn is_recording(&self) -> bool {
+        self.recording.is_some()
+    }
+
+    /// Draws `surface` at (`x`, `y`) at its own size; a recording holds it by
+    /// reference.
+    pub fn surface(&mut self, x: i64, y: i64, surface: &Surface) {
+        if self.record(0, || retained::Primitive::Surface(x, y, surface.clone())) {
+            return;
+        }
+        let rgba = surface.rgba.read();
+        let clip = self.clip;
+        image_rgba_rows(
+            &mut self.pixels,
+            self.width * 4,
+            clip,
+            self.opacity,
+            (x, y, surface.width, surface.height),
+            &rgba,
+            |row| surface.stored_row(row),
+        )
     }
 
     /// A blank `width` x `height` canvas drawn into `pixels`, reusing their
@@ -485,10 +708,33 @@ impl Canvas {
     /// paint state. The text rasteriser's way onto the canvas.
     pub fn coverage(&mut self, x: i64, y: i64, w: i64, h: i64, cov: &[u8], color: Color) {
         if self.record(cov.len(), || {
-            retained::Primitive::Coverage(x, y, w, h, cov.into(), color)
+            retained::Primitive::Coverage(x, y, w, h, Coverage::new(cov), color)
         }) {
             return;
         }
+        self.blend_coverage(x, y, w, h, cov, color);
+    }
+
+    /// Draws coverage the glyph cache shares, which a recording holds by
+    /// reference.
+    pub fn coverage_shared(
+        &mut self,
+        x: i64,
+        y: i64,
+        w: i64,
+        h: i64,
+        cov: &Coverage,
+        color: Color,
+    ) {
+        if self.record(cov.len(), || {
+            retained::Primitive::Coverage(x, y, w, h, cov.clone(), color)
+        }) {
+            return;
+        }
+        self.blend_coverage(x, y, w, h, cov, color);
+    }
+
+    fn blend_coverage(&mut self, x: i64, y: i64, w: i64, h: i64, cov: &[u8], color: Color) {
         let c = self.clip;
         let op = self.op(color);
         blend_coverage(
@@ -956,7 +1202,29 @@ fn image_rgba(
     height: i64,
     rgba: &[u8],
 ) {
-    if width <= 0 || height <= 0 || stride <= 0 {
+    image_rgba_rows(
+        dst,
+        stride,
+        clip,
+        opacity,
+        (x, y, width, height),
+        rgba,
+        |row| row,
+    )
+}
+
+// Draws image `rgba` into the rectangle at its own size, taking image row
+// `row` from stored row `stored(row)`.
+fn image_rgba_rows(
+    dst: &mut [u8],
+    stride: i64,
+    clip: Rect,
+    opacity: i64,
+    (x, y, width, height): (i64, i64, i64, i64),
+    rgba: &[u8],
+    stored: impl Fn(i64) -> i64,
+) {
+    if width <= 0 || height <= 0 || stride <= 0 || rgba.len() < (width * height * 4) as usize {
         return;
     };
     let left = x.max(clip.x).max(0);
@@ -965,27 +1233,32 @@ fn image_rgba(
     let bottom = (y + height)
         .min(clip.y + clip.height)
         .min((dst.len() / stride as usize) as i64);
-    let mut row = top;
-    while row < bottom {
-        let mut col = left;
-        while col < right {
-            let src = ((row - y) * width + col - x) * 4;
-            let d = row * stride + col * 4;
-            let a = clamp255(opacity * rgba[(src + 3) as usize] as i64 / 255);
-            if a == 255 {
-                dst[d as usize] = rgba[src as usize];
-                dst[(d + 1) as usize] = rgba[(src + 1) as usize];
-                dst[(d + 2) as usize] = rgba[(src + 2) as usize];
-                dst[(d + 3) as usize] = 255;
-            } else if a > 0 {
-                dst[d as usize] = mix(dst[d as usize], rgba[src as usize], a);
-                dst[(d + 1) as usize] = mix(dst[(d + 1) as usize], rgba[(src + 1) as usize], a);
-                dst[(d + 2) as usize] = mix(dst[(d + 2) as usize], rgba[(src + 2) as usize], a);
-                dst[(d + 3) as usize] = mix(dst[(d + 3) as usize], 255, a)
-            }
-            col += 1;
+    if left >= right {
+        return;
+    }
+    let len = ((right - left) * 4) as usize;
+    for row in top..bottom {
+        let src = ((stored(row - y) * width + left - x) * 4) as usize;
+        let d = (row * stride + left * 4) as usize;
+        let into = dst[d..d + len].as_chunks_mut::<4>().0;
+        let from = rgba[src..src + len].as_chunks::<4>().0;
+        if opacity >= 255 && from.iter().all(|s| s[3] == 255) {
+            into.copy_from_slice(from);
+            continue;
         }
-        row += 1;
+        for (p, s) in into.iter_mut().zip(from) {
+            let a = clamp255(opacity * i64::from(s[3]) / 255);
+            if a == 255 {
+                *p = [s[0], s[1], s[2], 255];
+            } else if a > 0 {
+                *p = [
+                    mix(p[0], s[0], a),
+                    mix(p[1], s[1], a),
+                    mix(p[2], s[2], a),
+                    mix(p[3], 255, a),
+                ];
+            }
+        }
     }
 }
 

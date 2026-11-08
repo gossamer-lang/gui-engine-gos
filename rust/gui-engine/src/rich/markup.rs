@@ -66,6 +66,7 @@ fn inline_html(
         roxmltree::ParsingOptions {
             allow_dtd: false,
             nodes_limit: 32,
+            entity_resolver: None,
         },
     )
     .map_err(|e| format!("inline HTML: {e}"))?;
@@ -312,6 +313,7 @@ fn html(source: &str, active: &impl Fn() -> bool) -> Result<Import, String> {
         roxmltree::ParsingOptions {
             allow_dtd: false,
             nodes_limit: (SPAN_LIMIT * 4 + NODE_LIMIT * 4) as u32,
+            entity_resolver: None,
         },
     )
     .map_err(|error| format!("unsupported/malformed HTML subset: {error}"))?;

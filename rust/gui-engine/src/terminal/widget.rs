@@ -12,6 +12,7 @@ use std::sync::Arc;
 use super::frame::{Color as CellColor, Frame, RowVersion};
 use super::images;
 use super::keyboard;
+use super::layer::LayerContext;
 use super::links::{Link, Place, place};
 use super::shapes;
 use super::{Cell, Event as TerminalEvent, Span, with_entry};
@@ -613,6 +614,198 @@ fn selected_columns(selection: Option<(Cell, Cell)>, row: i64, cols: i64) -> Opt
     (from < to).then_some((from, to))
 }
 
+/// What every row of one paint draws with besides its own cells.
+#[derive(Clone, Copy)]
+pub(super) struct RowPaint<'a> {
+    v: &'a View,
+    theme: &'a Theme,
+    colors: &'a ColorPalette,
+    style: &'a TextStyle,
+    selection: Option<(Cell, Cell)>,
+    highlighted: &'a [Vec<(i64, i64)>],
+    hovered: &'a [&'a Link],
+    foreground: Color,
+    background: Color,
+    highlight_bg: Color,
+    selection_bg: Color,
+    selection_fg: Color,
+    cw: f64,
+    pub(super) lh: f64,
+    rise: f64,
+    pad: i64,
+    left: i64,
+    pub(super) origin: Rect,
+}
+
+impl RowPaint<'_> {
+    /// The top and height, in the view, of screen row `row`. Cells take
+    /// whole-pixel edges from the fractional grid, so each meets its
+    /// neighbors with neither a gap nor an overlap.
+    pub(super) fn band(&self, row: i64) -> (i64, i64) {
+        let y = self.pad + (row as f64 * self.lh) as i64;
+        (y, self.pad + ((row + 1) as f64 * self.lh) as i64 - y)
+    }
+}
+
+/// Draws screen row `row`, whose cells are `cells`, answering the keys of the
+/// run layouts it drew with.
+pub(super) fn draw_row(
+    p: &RowPaint,
+    layouts: &mut ByteCache<String, layout::TextLayout>,
+    cx: &mut PaintCx,
+    row: i64,
+    cells: &[super::frame::Cell],
+) -> Vec<String> {
+    let RowPaint {
+        v,
+        theme,
+        colors,
+        style,
+        selection,
+        highlighted,
+        hovered,
+        foreground,
+        background,
+        highlight_bg,
+        selection_bg,
+        selection_fg,
+        cw,
+        lh,
+        rise,
+        left,
+        origin,
+        ..
+    } = *p;
+    let screen_row = row as u16;
+    let mut runs = Vec::new();
+    let (y, height) = p.band(row);
+    let mut col = 0;
+    while col < cells.len() {
+        let cell = &cells[col];
+        // The second column of a wide cell is drawn with the cell.
+        if cell.continuation {
+            col += 1;
+            continue;
+        }
+        let selected = in_selection(selection, row, col as i64);
+        let marks = &highlighted[row as usize];
+        let marked = in_highlight(marks, col as i64);
+        let lit = hovered_at(hovered, screen_row, col);
+        let ink = match cell.fg {
+            CellColor::Indexed(i) if v.options.bold_bright && cell.bold && i < 8 => {
+                CellColor::Indexed(i + 8)
+            }
+            ref other => other.clone(),
+        };
+        let (mut fg, mut bg) = (
+            resolve(&ink, foreground, colors),
+            resolve(&cell.bg, background, colors),
+        );
+        if cell.inverse {
+            std::mem::swap(&mut fg, &mut bg);
+        }
+        if marked {
+            bg = highlight_bg;
+        }
+        // Blocks and box pieces build pictures, as chafa's symbols do, from
+        // colors meant to sit close together; only letters are made legible.
+        if v.options.legible && !shapes::is_shape(cell.text.as_str()) {
+            fg = legible(fg, bg);
+        }
+        if selected {
+            fg = selection_fg;
+            bg = selection_bg;
+        }
+        if cell.dim {
+            fg = fg.mix(bg, 0.4);
+        }
+        // ASCII cells of one style draw as one run; any other cell draws
+        // alone at its column, so fallback fonts cannot shift the grid.
+        let ascii =
+            |c: &super::frame::Cell| !c.continuation && c.text.len() <= 1 && c.text.is_ascii();
+        let mut end = col + 1;
+        if ascii(cell) {
+            while end < cells.len()
+                && ascii(&cells[end])
+                && cells[end].fg == cell.fg
+                && cells[end].bg == cell.bg
+                && cells[end].inverse == cell.inverse
+                && cells[end].bold == cell.bold
+                && cells[end].italic == cell.italic
+                && cells[end].underline == cell.underline
+                && cells[end].dim == cell.dim
+                && in_selection(selection, row, end as i64) == selected
+                && in_highlight(marks, end as i64) == marked
+                && hovered_at(hovered, screen_row, end) == lit
+            {
+                end += 1;
+            }
+        }
+        let span = if cell.wide { 2 } else { end - col };
+        let x = left + (col as f64 * cw) as i64;
+        let width = left + ((col + span) as f64 * cw) as i64 - x;
+        if bg != background {
+            cx.fill(Rect::new(x, y, width, height), bg);
+        }
+        let text: String = cells[col..end]
+            .iter()
+            .filter(|c| !c.continuation)
+            .map(|c| {
+                if c.text.is_empty() {
+                    " "
+                } else {
+                    c.text.as_str()
+                }
+            })
+            .collect();
+        // Blank cells draw no ink, and backgrounds and underlines fill
+        // their cells, so a run is laid out only up to its last glyph.
+        let text = text.trim_end_matches(' ');
+        let shape = Rect::new(origin.x + x, origin.y + y, width, height);
+        let drawn = !ascii(cell) && shapes::draw(&mut cx.canvas, text, shape, fg, bg);
+        if !drawn && !text.trim().is_empty() {
+            let mut run = style.clone();
+            run.bold = cell.bold;
+            run.italic = cell.italic;
+            let mut key = format!("{}#{}", run.key(), text);
+            lay_out(layouts, &key, text, &run);
+            runs.push(key.clone());
+            let mut at = ((origin.x + x) as f64, (origin.y + y) as f64 + rise);
+            // A glyph wider than its cells, such as an emoji a program
+            // counts as one cell, is drawn smaller and centered on its
+            // row, so it stays inside them.
+            if !ascii(cell)
+                && let Some(drawn) = layouts.get(&key).map(|l| l.width)
+                && drawn > width as f64
+            {
+                run.size *= width as f64 / drawn;
+                key = format!("{}#{}", run.key(), text);
+                lay_out(layouts, &key, text, &run);
+                runs.push(key.clone());
+                if let Some(height) = layouts.get(&key).map(|l| l.height) {
+                    at.1 += ((lh - height) / 2.0).max(0.0);
+                }
+            }
+            match layouts.get(&key) {
+                Some(laid) => layout::draw(&mut cx.canvas, laid, at.0, at.1, &run, fg),
+                // A run too large for the cache is laid out for this paint.
+                None => {
+                    let laid = layout::layout_uncached(text, &run, LayoutOptions::single_line());
+                    layout::draw(&mut cx.canvas, &laid, at.0, at.1, &run, fg);
+                }
+            }
+        }
+        if cell.underline || lit {
+            cx.fill(
+                Rect::new(x, y + height - theme.px(2), width, theme.px(1).max(1)),
+                fg,
+            );
+        }
+        col = end.max(col + 1);
+    }
+    runs
+}
+
 /// What every row of a paint draws with besides its own cells and marks. A
 /// row recorded with another context would not draw as this paint does.
 #[derive(Debug, PartialEq)]
@@ -636,9 +829,9 @@ struct RowContext {
 
 /// What one row draws: the version of its cells, and the columns the
 /// selection, highlights and hovered links cover in it.
-#[derive(Debug, PartialEq)]
-struct RowKey {
-    version: RowVersion,
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct RowKey {
+    pub(super) version: RowVersion,
     selected: Option<(i64, i64)>,
     marks: Vec<(i64, i64)>,
     lit: Vec<(u16, u16)>,
@@ -668,6 +861,27 @@ impl RowCache {
             self.context = Some(context);
         }
         self.rows.resize_with(rows, || None);
+    }
+
+    // Whether most of the rows `keys` name sat in other rows of the paint
+    // before: the output scrolled.
+    fn scrolled(&self, keys: &[Option<RowKey>]) -> bool {
+        let at: std::collections::HashMap<RowVersion, usize> = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(i, row)| row.as_ref().map(|row| (row.key.version, i)))
+            .collect();
+        let moved = keys
+            .iter()
+            .enumerate()
+            .filter(|(i, key)| {
+                key.as_ref()
+                    .and_then(|key| at.get(&key.version))
+                    .is_some_and(|j| j != i)
+            })
+            .count();
+        moved * 2 > keys.len()
     }
 
     fn recorded(&self, row: usize, key: &RowKey) -> Option<&RecordedRow> {
@@ -773,7 +987,6 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
     let (selection_bg, selection_fg) = (shown(colors.selection_bg), shown(colors.selection_fg));
     // Highlights read as a weaker selection, so the selected match stands out.
     let highlight_bg = selection_bg.mix(background, 0.55);
-    cx.fill(r, background.with_alpha(alpha));
     let hovered: Vec<&Link> = frame
         .links()
         .iter()
@@ -783,6 +996,32 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
     let left = left_of(v, &theme);
     let rise = text_offset(&style, lh);
     let origin = cx.abs(r);
+    let generation = crate::text::fonts::generation();
+    let mut layer =
+        with_entry(v.terminal, |entry| std::mem::take(&mut entry.layer)).unwrap_or_default();
+    // The layer holds opaque text alone: a translucent or faded terminal, or
+    // one showing images, paints its rows into the window's recording.
+    let layer_context = (alpha == 255
+        && cx.canvas.opacity == 255
+        && cx.canvas.is_recording()
+        && frame.images().is_empty())
+    .then(|| LayerContext {
+        palette: colors.clone(),
+        style: style.clone(),
+        metrics: [cw.to_bits(), lh.to_bits(), rise.to_bits()],
+        inset: (left, pad),
+        rule: (theme.px(1), theme.px(2)),
+        bold_bright: v.options.bold_bright,
+        legible: v.options.legible,
+        fonts: generation,
+        size: (r.width, r.height),
+        rows: frame.cells().len(),
+        background,
+    })
+    .filter(|context| layer.usable(context));
+    if layer_context.is_none() {
+        cx.fill(r, background.with_alpha(alpha));
+    }
     let mut pictures =
         with_entry(v.terminal, |entry| std::mem::take(&mut entry.pictures)).unwrap_or_default();
     let mut used = images::Used::default();
@@ -805,7 +1044,6 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
     // Run layouts are kept per terminal, sized to its screen: output brings
     // rows that never come back, which the shared layout cache would hold to
     // its whole budget.
-    let generation = crate::text::fonts::generation();
     let mut layouts = with_entry(v.terminal, |entry| {
         // Faces that arrived since may draw these runs differently.
         if entry.layouts_generation != generation {
@@ -818,184 +1056,101 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
     layouts
         .set_limit(usize::from(frame.rows()) * usize::from(frame.cols()) * LAYOUT_BYTES_PER_CELL);
     let painted_from = layouts.mark();
+    let paint = RowPaint {
+        v,
+        theme: &theme,
+        colors: &colors,
+        style: &style,
+        selection,
+        highlighted: &highlighted,
+        hovered: &hovered,
+        foreground,
+        background,
+        highlight_bg,
+        selection_bg,
+        selection_fg,
+        cw,
+        lh,
+        rise,
+        pad,
+        left,
+        origin,
+    };
+    let keys: Vec<Option<RowKey>> = frame
+        .cells()
+        .iter()
+        .enumerate()
+        .map(|(index, cells)| {
+            let screen_row = index as u16;
+            frame.version(screen_row).map(|version| RowKey {
+                version,
+                selected: selected_columns(selection, index as i64, cells.len() as i64),
+                marks: highlighted[index].clone(),
+                lit: hovered
+                    .iter()
+                    .filter(|l| l.row == screen_row)
+                    .map(|l| (l.start, l.end))
+                    .collect(),
+            })
+        })
+        .collect();
     let mut recorded =
         with_entry(v.terminal, |entry| std::mem::take(&mut entry.rows)).unwrap_or_default();
-    recorded.begin(
-        RowContext {
-            palette: colors.clone(),
-            style: style.clone(),
-            metrics: [cw.to_bits(), lh.to_bits(), rise.to_bits()],
-            origin,
-            inset: (left, pad),
-            rule: (theme.px(1), theme.px(2)),
-            clip: cx.canvas.clip,
-            opacity: cx.canvas.opacity,
-            bold_bright: v.options.bold_bright,
-            legible: v.options.legible,
-            fonts: generation,
-            cols: usize::from(frame.cols()),
-        },
-        frame.cells().len(),
-    );
-    for (index, cells) in frame.cells().iter().enumerate() {
-        let screen_row = index as u16;
-        let row = index as i64;
-        let key = frame.version(screen_row).map(|version| RowKey {
-            version,
-            selected: selected_columns(selection, row, cells.len() as i64),
-            marks: highlighted[index].clone(),
-            lit: hovered
-                .iter()
-                .filter(|l| l.row == screen_row)
-                .map(|l| (l.start, l.end))
-                .collect(),
+    // The layer costs a screen of pixels, so a terminal keeps one only while
+    // its output scrolls.
+    if layer.quiet(cx.now) {
+        layer.release();
+    }
+    let layered = layer_context
+        .as_ref()
+        .filter(|_| layer.holds() || recorded.scrolled(&keys))
+        .is_some_and(|context| {
+            super::layer::paint(&mut layer, context, &paint, &keys, &frame, &mut layouts, cx)
         });
-        if let Some(row_recording) = key.as_ref().and_then(|key| recorded.recorded(index, key))
-            && let Some(span) = cx.canvas.replay_span(row_recording.span)
-        {
-            // A copied row is still on the screen, so its runs stay cached.
-            for run in &row_recording.runs {
-                layouts.get(run);
-            }
-            recorded.replayed(index, span);
-            continue;
+    if layered {
+        // The window's recording holds no rows to copy from the next paint.
+        recorded = RowCache::default();
+    } else {
+        if layer_context.is_some() {
+            cx.fill(r, background.with_alpha(alpha));
         }
-        let mark = cx.canvas.recorded_mark();
-        let mut runs = Vec::new();
-        // Cells take whole-pixel edges from the fractional grid, so each
-        // meets its neighbors with neither a gap nor an overlap.
-        let y = pad + (row as f64 * lh) as i64;
-        let height = pad + ((row + 1) as f64 * lh) as i64 - y;
-        let mut col = 0;
-        while col < cells.len() {
-            let cell = &cells[col];
-            // The second column of a wide cell is drawn with the cell.
-            if cell.continuation {
-                col += 1;
+        recorded.begin(
+            RowContext {
+                palette: colors.clone(),
+                style: style.clone(),
+                metrics: [cw.to_bits(), lh.to_bits(), rise.to_bits()],
+                origin,
+                inset: (left, pad),
+                rule: (theme.px(1), theme.px(2)),
+                clip: cx.canvas.clip,
+                opacity: cx.canvas.opacity,
+                bold_bright: v.options.bold_bright,
+                legible: v.options.legible,
+                fonts: generation,
+                cols: usize::from(frame.cols()),
+            },
+            frame.cells().len(),
+        );
+        for ((index, cells), key) in frame.cells().iter().enumerate().zip(keys) {
+            let row = index as i64;
+            if let Some(row_recording) = key.as_ref().and_then(|key| recorded.recorded(index, key))
+                && let Some(span) = cx.canvas.replay_span(row_recording.span)
+            {
+                // A copied row is still on the screen, so its runs stay cached.
+                for run in &row_recording.runs {
+                    layouts.get(run);
+                }
+                recorded.replayed(index, span);
                 continue;
             }
-            let selected = in_selection(selection, row, col as i64);
-            let marks = &highlighted[row as usize];
-            let marked = in_highlight(marks, col as i64);
-            let lit = hovered_at(&hovered, screen_row, col);
-            let ink = match cell.fg {
-                CellColor::Indexed(i) if v.options.bold_bright && cell.bold && i < 8 => {
-                    CellColor::Indexed(i + 8)
-                }
-                ref other => other.clone(),
-            };
-            let (mut fg, mut bg) = (
-                resolve(&ink, foreground, &colors),
-                resolve(&cell.bg, background, &colors),
+            let mark = cx.canvas.recorded_mark();
+            let runs = draw_row(&paint, &mut layouts, cx, row, cells);
+            recorded.store(
+                index,
+                key.zip(cx.canvas.recorded_span(mark))
+                    .map(|(key, span)| RecordedRow { key, span, runs }),
             );
-            if cell.inverse {
-                std::mem::swap(&mut fg, &mut bg);
-            }
-            if marked {
-                bg = highlight_bg;
-            }
-            // Blocks and box pieces build pictures, as chafa's symbols do, from
-            // colors meant to sit close together; only letters are made legible.
-            if v.options.legible && !shapes::is_shape(cell.text.as_str()) {
-                fg = legible(fg, bg);
-            }
-            if selected {
-                fg = selection_fg;
-                bg = selection_bg;
-            }
-            if cell.dim {
-                fg = fg.mix(bg, 0.4);
-            }
-            // ASCII cells of one style draw as one run; any other cell draws
-            // alone at its column, so fallback fonts cannot shift the grid.
-            let ascii =
-                |c: &super::frame::Cell| !c.continuation && c.text.len() <= 1 && c.text.is_ascii();
-            let mut end = col + 1;
-            if ascii(cell) {
-                while end < cells.len()
-                    && ascii(&cells[end])
-                    && cells[end].fg == cell.fg
-                    && cells[end].bg == cell.bg
-                    && cells[end].inverse == cell.inverse
-                    && cells[end].bold == cell.bold
-                    && cells[end].italic == cell.italic
-                    && cells[end].underline == cell.underline
-                    && cells[end].dim == cell.dim
-                    && in_selection(selection, row, end as i64) == selected
-                    && in_highlight(marks, end as i64) == marked
-                    && hovered_at(&hovered, screen_row, end) == lit
-                {
-                    end += 1;
-                }
-            }
-            let span = if cell.wide { 2 } else { end - col };
-            let x = left + (col as f64 * cw) as i64;
-            let width = left + ((col + span) as f64 * cw) as i64 - x;
-            if bg != background {
-                cx.fill(Rect::new(x, y, width, height), bg);
-            }
-            let text: String = cells[col..end]
-                .iter()
-                .filter(|c| !c.continuation)
-                .map(|c| {
-                    if c.text.is_empty() {
-                        " "
-                    } else {
-                        c.text.as_str()
-                    }
-                })
-                .collect();
-            // Blank cells draw no ink, and backgrounds and underlines fill
-            // their cells, so a run is laid out only up to its last glyph.
-            let text = text.trim_end_matches(' ');
-            let shape = Rect::new(origin.x + x, origin.y + y, width, height);
-            let drawn = !ascii(cell) && shapes::draw(&mut cx.canvas, text, shape, fg, bg);
-            if !drawn && !text.trim().is_empty() {
-                let mut run = style.clone();
-                run.bold = cell.bold;
-                run.italic = cell.italic;
-                let mut key = format!("{}#{}", run.key(), text);
-                lay_out(&mut layouts, &key, text, &run);
-                runs.push(key.clone());
-                let mut at = ((origin.x + x) as f64, (origin.y + y) as f64 + rise);
-                // A glyph wider than its cells, such as an emoji a program
-                // counts as one cell, is drawn smaller and centered on its
-                // row, so it stays inside them.
-                if !ascii(cell)
-                    && let Some(drawn) = layouts.get(&key).map(|l| l.width)
-                    && drawn > width as f64
-                {
-                    run.size *= width as f64 / drawn;
-                    key = format!("{}#{}", run.key(), text);
-                    lay_out(&mut layouts, &key, text, &run);
-                    runs.push(key.clone());
-                    if let Some(height) = layouts.get(&key).map(|l| l.height) {
-                        at.1 += ((lh - height) / 2.0).max(0.0);
-                    }
-                }
-                match layouts.get(&key) {
-                    Some(laid) => layout::draw(&mut cx.canvas, laid, at.0, at.1, &run, fg),
-                    // A run too large for the cache is laid out for this paint.
-                    None => {
-                        let laid =
-                            layout::layout_uncached(text, &run, LayoutOptions::single_line());
-                        layout::draw(&mut cx.canvas, &laid, at.0, at.1, &run, fg);
-                    }
-                }
-            }
-            if cell.underline || lit {
-                cx.fill(
-                    Rect::new(x, y + height - theme.px(2), width, theme.px(1).max(1)),
-                    fg,
-                );
-            }
-            col = end.max(col + 1);
         }
-        recorded.store(
-            index,
-            key.zip(cx.canvas.recorded_span(mark))
-                .map(|(key, span)| RecordedRow { key, span, runs }),
-        );
     }
     // A row the screen no longer shows only comes back by scrolling back,
     // which lays it out again, so the cache keeps the runs this paint drew.
@@ -1010,14 +1165,15 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
         cx.now,
     );
     pictures.keep(&used);
+    // A held layer paints once more after its output goes still, so it lets
+    // its pixels go whether or not anything else repaints the terminal.
+    let release_due = layer.release_due();
     with_entry(v.terminal, |entry| {
         entry.layouts = layouts;
         entry.rows = recorded;
+        entry.layer = layer;
         entry.pictures = pictures;
-        entry.animation_due = match (below, above) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
+        entry.animation_due = [below, above, release_due].into_iter().flatten().min();
     });
     // The cursor shows focus, filled while the terminal has it and hollow
     // otherwise, so the terminal draws no focus ring around its screen.

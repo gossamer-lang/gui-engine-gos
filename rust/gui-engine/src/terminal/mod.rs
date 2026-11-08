@@ -10,6 +10,7 @@ pub mod engine;
 pub mod frame;
 mod images;
 pub mod keyboard;
+mod layer;
 pub mod links;
 mod modes;
 mod shapes;
@@ -205,6 +206,8 @@ struct Entry {
     layouts_generation: u64,
     /// The rows the widget recorded when it last painted the screen.
     rows: widget::RowCache,
+    /// The text as pixels kept between paints.
+    layer: layer::Layer,
     /// The links the screen showed when the widget last painted it.
     links: Vec<links::Link>,
     /// The link under the pointer, which the screen underlines.
@@ -369,6 +372,7 @@ pub fn create(options: &Options, budget: Budget) -> Result<i64, String> {
             layouts: ByteCache::new(0),
             layouts_generation: 0,
             rows: widget::RowCache::default(),
+            layer: layer::Layer::default(),
             links: Vec::new(),
             hovered: None,
             pointed: None,
@@ -1161,6 +1165,21 @@ fn compactor() -> Option<&'static Compactor> {
 /// Runs `f` on a terminal's entry for the widget, which draws and drives it.
 fn with_entry<T>(id: i64, f: impl FnOnce(&mut Entry) -> T) -> Option<T> {
     TERMINALS.lock().get_mut(&id).map(f)
+}
+
+/// Lets go of the text pixels of terminals no paint drew since the last
+/// sweep; answers whether any terminal still holds some.
+pub fn sweep_layers() -> bool {
+    let mut held = false;
+    for entry in TERMINALS.lock().values_mut() {
+        held |= entry.layer.sweep();
+    }
+    held
+}
+
+/// Whether any terminal keeps its text as pixels for a later sweep.
+pub fn holds_layers() -> bool {
+    TERMINALS.lock().values().any(|entry| entry.layer.holds())
 }
 
 /// Terminals open across every session, for disposal checks.

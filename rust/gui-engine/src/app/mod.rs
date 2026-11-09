@@ -132,6 +132,10 @@ pub struct WindowState {
     pub output_presented: Option<i64>,
     pub layout_dirty: bool,
     pub caret_on: bool,
+    /// The caret has stopped blinking until the next input or output.
+    pub caret_resting: bool,
+    /// Session time of the last input or output the caret's blink counts from.
+    pub caret_activity: i64,
     pub active: bool,
     pub close_policy: ClosePolicy,
     /// The edge a docked window hangs from, with the fractions of that edge
@@ -391,6 +395,9 @@ fn refresh_ms(rate: f64) -> i64 {
 }
 // How long a held toast waits before its timeout is looked at again.
 const TOAST_RECHECK_MS: i64 = 1000;
+/// How long after the last input or output a caret stops blinking and stays
+/// lit, so an untouched window asks nothing of the display.
+pub(crate) const CARET_REST_MS: i64 = 10_000;
 // Assistive technology hears at most one announcement per interval, so a
 // burst of status changes cannot drown out speech for focus and caret moves.
 const ANNOUNCE_INTERVAL_MS: i64 = 750;
@@ -827,6 +834,8 @@ impl Session {
             output_presented: None,
             layout_dirty: true,
             caret_on: true,
+            caret_resting: false,
+            caret_activity: 0,
             active: true,
             close_policy: ClosePolicy::Close,
             docked: None,
@@ -1435,6 +1444,11 @@ impl Session {
                 });
             held_any |= held;
             let (terminals_changed, terminal_events) = crate::terminal::pump(&self.budget, held);
+            if terminals_changed {
+                for w in 0..self.windows.len() as i64 {
+                    self.caret_touched(w);
+                }
+            }
             // An animated image whose frame is due repaints like new output.
             let terminals_changed = terminals_changed
                 || crate::terminal::animation_due().is_some_and(|due| due <= self.now());
@@ -1821,6 +1835,18 @@ impl Session {
 
     /// Handles one platform event.
     pub fn handle(&mut self, e: &windowing::Event) -> Result<(), errors::Error> {
+        if let windowing::Event::KeyDown { window, .. }
+        | windowing::Event::Text { window, .. }
+        | windowing::Event::Composing { window, .. }
+        | windowing::Event::ButtonDown { window, .. }
+        | windowing::Event::Wheel { window, .. }
+        | windowing::Event::FocusGained { window } = e
+        {
+            let w = self.find_native(*window);
+            if w >= 0 {
+                self.caret_touched(w);
+            }
+        }
         match e {
             windowing::Event::QuitRequested => self.request_quit(),
             windowing::Event::Wake => {
@@ -3115,8 +3141,9 @@ impl Session {
             .filter(|t| !(t.window == *key && t.owner.is_empty() && t.tag == "gui:caret"))
             .cloned()
             .collect::<Vec<_>>();
-        if self.focus_has_caret(w) && self.windows[w as usize].active {
+        if self.caret_blinks(w) {
             let blink = self.windows[w as usize].theme.motion.caret_blink;
+            self.windows[w as usize].caret_activity = self.now();
             self.timers.push(Timer {
                 deadline: self.now() + blink,
                 window: key.to_string(),
@@ -3124,6 +3151,21 @@ impl Session {
                 tag: "gui:caret".to_string(),
                 repeat: blink,
             })
+        }
+    }
+
+    fn caret_blinks(&self, w: i64) -> bool {
+        let window = &self.windows[w as usize];
+        window.active && !window.caret_resting && self.focus_has_caret(w)
+    }
+
+    // Input or output counts toward the caret's rest, and a resting caret
+    // goes back to blinking from its visible phase.
+    fn caret_touched(&mut self, w: i64) {
+        self.windows[w as usize].caret_activity = self.now();
+        if self.windows[w as usize].caret_resting {
+            self.windows[w as usize].caret_resting = false;
+            self.update_caret_timer(w);
         }
     }
 
@@ -3514,8 +3556,15 @@ impl Session {
                 continue;
             }
             if t.owner.is_empty() && t.tag == "gui:caret" {
-                self.windows[w as usize].caret_on = !self.windows[w as usize].caret_on;
-                self.windows[w as usize].dirty = true;
+                if now - self.windows[w as usize].caret_activity >= CARET_REST_MS {
+                    self.windows[w as usize].caret_resting = true;
+                    self.windows[w as usize].dirty |= !self.windows[w as usize].caret_on;
+                    self.windows[w as usize].caret_on = true;
+                    self.update_caret_timer(w);
+                } else {
+                    self.windows[w as usize].caret_on = !self.windows[w as usize].caret_on;
+                    self.windows[w as usize].dirty = true;
+                }
                 continue;
             }
             if t.owner.is_empty() && t.tag.starts_with("gui:toast:") {
@@ -3819,7 +3868,7 @@ impl Session {
             .timers
             .iter()
             .any(|t| t.window == key && t.owner.is_empty() && t.tag == "gui:caret");
-        if blinking != (self.focus_has_caret(w) && self.windows[w as usize].active) {
+        if blinking != self.caret_blinks(w) {
             self.update_caret_timer(w)
         }
         self.invalidate(w, "view rebuilt")

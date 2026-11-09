@@ -870,6 +870,72 @@ mod session {
     }
 
     #[test]
+    fn an_untouched_cursor_rests_lit_until_output_arrives() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| crate::services::remove_test_config(&config));
+            let (mut s, id, _) =
+                shown_program("cursor-rest", "printf ready; read x; printf more; read y");
+            let window = s.windows[0].native.id();
+            s.inject(&windowing::Event::FocusGained { window }).unwrap();
+            let blink = s.windows[0].theme.motion.caret_blink;
+            let lit = s.capture().unwrap();
+            s.advance(crate::app::CARET_REST_MS + 2 * blink).unwrap();
+            let rested = s.capture().unwrap();
+            assert_eq!(
+                changed(&lit, &rested),
+                None,
+                "the resting cursor is not lit"
+            );
+            s.advance(blink).unwrap();
+            assert_eq!(
+                changed(&rested, &s.capture().unwrap()),
+                None,
+                "the cursor kept blinking"
+            );
+            assert!(s.windows[0].caret_resting);
+
+            input(id, b"\n").unwrap();
+            while !snapshot(id).unwrap().text.contains("more") {
+                s.inject(&windowing::Event::Wake).unwrap();
+                std::thread::yield_now();
+            }
+            s.inject(&windowing::Event::Wake).unwrap();
+            assert!(
+                !s.windows[0].caret_resting,
+                "output did not wake the cursor"
+            );
+            let awake = s.capture().unwrap();
+            s.advance(blink).unwrap();
+            assert!(
+                changed(&awake, &s.capture().unwrap()).is_some(),
+                "the cursor did not blink again"
+            );
+            close(id);
+            s.shutdown();
+        })
+    }
+
+    #[test]
+    fn focus_wakes_a_resting_cursor() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| crate::services::remove_test_config(&config));
+            let (mut s, id, _) = shown_program("cursor-focus", "printf ready; read x");
+            let window = s.windows[0].native.id();
+            s.inject(&windowing::Event::FocusGained { window }).unwrap();
+            let blink = s.windows[0].theme.motion.caret_blink;
+            s.advance(crate::app::CARET_REST_MS + 2 * blink).unwrap();
+            assert!(s.windows[0].caret_resting);
+            s.inject(&windowing::Event::FocusLost { window }).unwrap();
+            s.inject(&windowing::Event::FocusGained { window }).unwrap();
+            assert!(!s.windows[0].caret_resting, "focus did not wake the cursor");
+            close(id);
+            s.shutdown();
+        })
+    }
+
+    #[test]
     fn turning_blinking_on_in_a_focused_terminal_starts_the_blink() {
         crate::testing::on_ui_thread(|| {
             let config = crate::services::private_test_config();

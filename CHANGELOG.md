@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.9 - Quieter when idle, faster when scrolling
+
+- A caret stops blinking and stays lit 10 seconds after the last input or terminal output, and blinks again on the next, so an untouched window asks almost nothing of the system.
+- Terminal output that scrolls past a full scrollback parses about 20% faster, with wezterm-lite 0.1.8.
+- macOS: builds on windowing-gos 0.1.13, whose quiet windows free their spare display buffers and which loads fewer system frameworks.
+
 ## 0.2.8 - Optional parts and paste fixes
 
 - Markdown and HTML import, SVG, JPEG and GIF are features (`markup`, `svg`, `jpeg`, `gif`), all on by default; an application that turns one off leaves its code and crates out of its build, and the call answers why it cannot.

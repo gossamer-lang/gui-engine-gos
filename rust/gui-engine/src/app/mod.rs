@@ -130,6 +130,9 @@ pub struct WindowState {
     /// Session time of the window's last paint that showed new terminal
     /// output, in milliseconds.
     pub output_presented: Option<i64>,
+    /// How long the window's last paint of new terminal output took, in
+    /// milliseconds.
+    pub output_paint_ms: i64,
     pub layout_dirty: bool,
     pub caret_on: bool,
     /// The caret has stopped blinking until the next input or output.
@@ -173,6 +176,16 @@ pub struct WindowState {
     pub occluded: bool,
 }
 
+impl WindowState {
+    // The shortest time from the start of one paint of new terminal output
+    // to the next: a refresh of the display, and no less than twice the last
+    // such paint took, so output that streams faster than frames paint
+    // leaves the thread as much time as its paints take.
+    fn output_interval(&self) -> i64 {
+        self.output_frame_ms.max(2 * self.output_paint_ms)
+    }
+}
+
 /// A pending timer.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 struct Timer {
@@ -209,8 +222,11 @@ const SETTINGS_DIALOG_SIZE: (i64, i64) = (720, 640);
 const SETTINGS_DIALOG_MIN: (i64, i64) = (480, 360);
 // How far a dialog window opened over another sits from it, in logical units.
 const DIALOG_CASCADE: i64 = 32;
-// Milliseconds between sweeps of raster layers no frame reused.
-const LAYER_SWEEP_MS: i64 = 5000;
+// Milliseconds between sweeps of raster layers no frame reused: longer than
+// a caret's blink cycle, the slowest content that comes back on its own, so
+// its layers stay while the rest of what a window stopped showing goes within
+// two sweeps.
+const LAYER_SWEEP_MS: i64 = 1500;
 
 // The window a dialog opens in when it needs more room than the window that
 // asked may have: its key prefix, the size it opens at, and its minimum size.
@@ -408,6 +424,10 @@ const MEDIA_TAG: &str = "gui:media-tick";
 // Owner of the toolkit's own timers that belong to no window, kept apart
 // from the application's (no window, no owner) so its tags cannot collide.
 const TOOLKIT_OWNER: &str = "gui";
+// The owner of the toolkit's own scan of the installed fonts, and the prefix
+// of its loads of single faces.
+const FONT_CATALOG_OWNER: &str = "gui:font-catalog";
+const FONT_FACE_OWNER: &str = "gui:font-face:";
 
 // Tests drive sessions without a display: a window on a desktop would take
 // that desktop's pointer and focus changes as input. `SDL_VIDEO_DRIVER` still
@@ -832,6 +852,7 @@ impl Session {
             dirty: true,
             output_dirty: false,
             output_presented: None,
+            output_paint_ms: 0,
             layout_dirty: true,
             caret_on: true,
             caret_resting: false,
@@ -1411,14 +1432,14 @@ impl Session {
         let mut held_any = false;
         loop {
             if crate::text::fonts::take_catalog_request() {
-                self.run_job(&services::jobs::Job::Fonts("gui:font-catalog".into()));
+                self.run_job(&services::jobs::Job::Fonts(FONT_CATALOG_OWNER.into()));
             }
             for (record, bold) in crate::text::fonts::take_face_requests() {
                 use std::hash::{Hash, Hasher};
                 let mut hash = std::collections::hash_map::DefaultHasher::new();
                 (&record.path, record.index, bold).hash(&mut hash);
                 self.run_job(&services::jobs::Job::FontFace(
-                    format!("gui:font-face:{:x}", hash.finish()),
+                    format!("{FONT_FACE_OWNER}{:x}", hash.finish()),
                     record,
                     bold,
                 ));
@@ -1440,7 +1461,7 @@ impl Session {
                 && self.windows.iter().any(|w| {
                     w.output_dirty
                         && w.output_presented
-                            .is_some_and(|at| now - at < w.output_frame_ms)
+                            .is_some_and(|at| now - at < w.output_interval())
                 });
             held_any |= held;
             let (terminals_changed, terminal_events) = crate::terminal::pump(&self.budget, held);
@@ -1486,12 +1507,12 @@ impl Session {
             self.fit_growing_window(w as i64);
             let now = self.now();
             let window = &mut self.windows[w];
-            if window.output_dirty
+            let output = window.output_dirty
                 && (!paced
                     || window
                         .output_presented
-                        .is_none_or(|at| now - at >= window.output_frame_ms))
-            {
+                        .is_none_or(|at| now - at >= window.output_interval()));
+            if output {
                 window.output_dirty = false;
                 window.output_presented = Some(now);
                 window.dirty = true;
@@ -1503,6 +1524,9 @@ impl Session {
                 if self.windows[w].dirty {
                     self.render(w as i64)?
                 }
+            }
+            if output {
+                self.windows[w].output_paint_ms = self.now() - now;
             }
             w += 1;
         }
@@ -1612,7 +1636,7 @@ impl Session {
             .filter(|w| w.output_dirty)
             .map(|w| {
                 w.output_presented
-                    .map_or(self.now(), |at| at + w.output_frame_ms)
+                    .map_or(self.now(), |at| at + w.output_interval())
             })
             .min()
     }
@@ -3708,9 +3732,12 @@ impl Session {
                 }
             }
             if let UiMsg::Task(owner, _) = &m
-                && owner == "gui:font-catalog"
+                && owner == FONT_CATALOG_OWNER
             {
                 crate::text::fonts::catalog_failed();
+            }
+            if toolkit_font_answer(&m) {
+                continue;
             }
 
             if let UiMsg::WorkFinished(owner, request, revision, outcome) = &m {
@@ -6136,6 +6163,17 @@ fn is_motion(e: &windowing::Event) -> bool {
 }
 
 /// The widget id a message names.
+// Whether `m` answers one of the toolkit's own font jobs, which the toolkit
+// takes in full: the application asked for none of them, and the catalog is
+// the whole of the installed fonts.
+fn toolkit_font_answer(m: &UiMsg) -> bool {
+    match m {
+        UiMsg::FontsLoaded(owner, _) | UiMsg::Task(owner, _) => owner == FONT_CATALOG_OWNER,
+        UiMsg::FontReady(owner) => owner.starts_with(FONT_FACE_OWNER),
+        _ => false,
+    }
+}
+
 pub fn msg_id(m: &UiMsg) -> String {
     match m {
         UiMsg::Clicked(id)
@@ -6287,6 +6325,7 @@ mod popup_tests {
 
     #[test]
     fn text_is_laid_out_again_when_the_installed_fonts_arrive() {
+        static HEARD: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new());
         crate::testing::on_ui_thread(|| {
             let config = crate::services::private_test_config();
             let _defer = scopeguard::guard((), |_| {
@@ -6296,7 +6335,12 @@ mod popup_tests {
                 "Fonts",
                 "dev.gossamer.gui-fonts-arrive-test",
                 || 0,
-                |m: i64, _msg: UiMsg| m,
+                |m: i64, msg: UiMsg| {
+                    if let UiMsg::FontsLoaded(owner, _) = msg {
+                        HEARD.lock().push(owner);
+                    }
+                    m
+                },
                 view,
             )
             .size(420, 320)
@@ -6305,9 +6349,16 @@ mod popup_tests {
             s.flush().unwrap();
             assert!(!s.windows[0].layout_dirty);
             s.pending
-                .push(UiMsg::FontsLoaded("gui:font-catalog".into(), vec![]));
+                .push(UiMsg::FontsLoaded(super::FONT_CATALOG_OWNER.into(), vec![]));
             s.deliver_messages();
             assert!(s.windows[0].layout_dirty && s.windows[0].dirty);
+            // The toolkit's own catalog stays with it; one the application
+            // asked for reaches it.
+            assert!(HEARD.lock().is_empty());
+            s.pending
+                .push(UiMsg::FontsLoaded("settings".into(), vec![]));
+            s.deliver_messages();
+            assert_eq!(*HEARD.lock(), vec!["settings".to_string()]);
             s.shutdown();
         })
     }
@@ -8238,6 +8289,73 @@ mod advance_tests {
             assert!(s.windows[0].output_dirty);
             assert_eq!(s.windows[0].frames, painted + 1);
             s.step_held_clock(s.windows[0].output_frame_ms - 1).unwrap();
+            assert_eq!(s.windows[0].frames, painted + 1);
+            s.step_held_clock(1).unwrap();
+            assert_eq!(s.windows[0].frames, painted + 2);
+            assert!(!s.windows[0].output_dirty);
+            terminal::close(id);
+            s.shutdown()
+        })
+    }
+
+    #[test]
+    fn output_that_paints_slower_than_a_frame_waits_twice_its_paint_for_the_next() {
+        use crate::terminal::{self, Command, Options};
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _cleanup = scopeguard::guard((), |_| crate::services::remove_test_config(&config));
+            let mut s = start("Slow", "dev.gossamer.gui-output-cost-test").unwrap();
+            let options = Options {
+                rows: 8,
+                cols: 40,
+                scrollback: 100,
+                byte_limit: 1 << 20,
+            };
+            let id = terminal::create(&options, effects::current_budget()).unwrap();
+            s.set_shell(
+                |_| {},
+                move |_| Widget::Terminal(terminal::widget::View::new("term", id, "Slow")),
+                |_| Vec::new(),
+            );
+            s.clock_held = Some(s.now());
+            s.open_window("main", "Slow", 420, 240).unwrap();
+            // Opening queues the window's size, focus and shown events; their
+            // repaint comes before the program writes anything.
+            while let Some(event) = s.app.poll() {
+                s.handle(&event).unwrap();
+            }
+            s.flush().unwrap();
+            let painted = s.windows[0].frames;
+            let command = Command {
+                program: "/bin/sh".into(),
+                args: vec![
+                    "-c".into(),
+                    "echo first; read line; echo second; read line".into(),
+                ],
+                ..Command::default()
+            };
+            terminal::spawn(id, &command).unwrap();
+            while !terminal::snapshot(id).unwrap().text.contains("first") {
+                assert!(s.step().unwrap(), "the session ended");
+            }
+            // The clock has not moved since the window painted, but that paint
+            // showed no output.
+            s.step_held_clock(0).unwrap();
+            assert_eq!(s.windows[0].frames, painted + 1);
+            assert!(!s.windows[0].output_dirty);
+            terminal::input(id, b"\n").unwrap();
+            while !terminal::snapshot(id).unwrap().text.contains("second") {
+                assert!(s.step().unwrap(), "the session ended");
+            }
+            // The last output paint took a frame and a half.
+            let frame = s.windows[0].output_frame_ms;
+            let paint = frame + frame / 2;
+            s.windows[0].output_paint_ms = paint;
+            s.step_held_clock(0).unwrap();
+            assert!(s.windows[0].output_dirty);
+            s.step_held_clock(frame).unwrap();
+            assert_eq!(s.windows[0].frames, painted + 1);
+            s.step_held_clock(2 * paint - frame - 1).unwrap();
             assert_eq!(s.windows[0].frames, painted + 1);
             s.step_held_clock(1).unwrap();
             assert_eq!(s.windows[0].frames, painted + 2);

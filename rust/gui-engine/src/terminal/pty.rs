@@ -316,6 +316,8 @@ impl Pty {
                     let mut buffer = [0; CHUNK];
                     let mut batch = Vec::with_capacity(BATCH + CHUNK);
                     let mut ended = false;
+                    // When the reader last finished with output.
+                    let mut waiting = std::time::Instant::now();
                     while !stop.load(Ordering::Acquire) {
                         match readiness(
                             fd,
@@ -331,14 +333,20 @@ impl Pty {
                             }
                             Ok(Wake::Cancelled) | Err(_) => break,
                         }
-                        let ready = std::time::Instant::now();
+                        let waited = waiting.elapsed();
                         batch.clear();
                         ended = loop {
                             match reader.read(&mut buffer) {
                                 Ok(0) => break true,
                                 Ok(n) => {
                                     batch.extend_from_slice(&buffer[..n]);
-                                    if batch.len() >= BATCH {
+                                    // macOS hands over a kilobyte per read and
+                                    // refills only once the reader took it, so
+                                    // a second read finds nothing; elsewhere
+                                    // the terminal refills during the copy and
+                                    // draining it batches the output.
+                                    let drained = cfg!(target_os = "macos") && n < buffer.len();
+                                    if drained || batch.len() >= BATCH {
                                         break false;
                                     }
                                 }
@@ -346,10 +354,10 @@ impl Pty {
                                 Err(_) => break true,
                             }
                         };
-                        let read = ready.elapsed();
-                        if !batch.is_empty() && !output.deliver(&batch, read, || readable(fd)) {
+                        if !batch.is_empty() && !output.deliver(&batch, waited, || readable(fd)) {
                             break;
                         }
+                        waiting = std::time::Instant::now();
                         if ended {
                             break;
                         }

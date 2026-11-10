@@ -196,6 +196,14 @@ pub(super) fn paint(
                 .collect()
         });
         // Every band starts from the opaque background the context paints.
+        // The surface keeps its pixels in the order window surfaces take, so
+        // a band drawn in the canvas's order is put in that order at once,
+        // while it is still in the cache, and every frame copies it as is.
+        let stored_background = Color {
+            r: background.b,
+            b: background.r,
+            ..background
+        };
         layer.surface.rewrite(
             width,
             height,
@@ -204,7 +212,7 @@ pub(super) fn paint(
             changed,
             |canvas: &mut Canvas, kept| {
                 if !valid || !kept {
-                    canvas.fill(background);
+                    canvas.fill(stored_background);
                 }
                 for (i, drawn) in drawn.iter().enumerate() {
                     let Some((commands, _)) = drawn else {
@@ -216,6 +224,11 @@ pub(super) fn paint(
                     canvas.rect(0, stored, width, line, background);
                     for command in commands {
                         command.replay(canvas, -origin.x, -origin.y + stored - shown);
+                    }
+                    let rows =
+                        (stored * width * 4) as usize..((stored + line) * width * 4) as usize;
+                    if let Some(band) = canvas.pixels.get_mut(rows) {
+                        crate::render::swap_red_blue_in_place(band);
                     }
                 }
                 canvas.clip = Rect::new(0, 0, width, height);

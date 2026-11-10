@@ -254,21 +254,19 @@ impl Handoff {
     }
 }
 
-/// A reader's way to the sink. Output that comes while nothing is parsing
-/// is parsed on the reader, which keeps a reply to typing one thread away.
-/// Output that keeps arriving while its parse takes longer than reading it
-/// and waking the parser goes to a parser thread, so the reader reads the
-/// next output during the parse. Where reading takes the longer share, as
-/// for plain text, or a batch parses faster than the parser wakes, as for
-/// the kilobyte a macOS pseudo-terminal holds, the parser thread would save
-/// nothing and cost a wake a batch.
+/// A reader's way to the sink. Output that comes after a pause is parsed on
+/// the reader, which keeps a reply to typing one thread away. Once output is
+/// waiting by the time the reader has parsed the last of it, the stream goes
+/// to a parser thread, so the reader goes straight back to reading: a
+/// pseudo-terminal holds little (a kilobyte on macOS), and the program
+/// writing to it waits while the reader parses. The stream stays with the
+/// parser until output pauses for longer than waking the parser takes.
 pub(crate) struct Output {
     sink: Arc<Sink>,
     notify: Arc<Notify>,
     handoff: Arc<Handoff>,
     parser: Option<std::thread::JoinHandle<()>>,
-    /// Output arrived while the reader parsed the last of it, which took
-    /// longer than reading it and waking the parser.
+    /// Output goes to the parser thread.
     streaming: bool,
 }
 
@@ -283,28 +281,32 @@ impl Output {
         }
     }
 
-    /// Parses `bytes`, which took `read` to read, here or on the parser
-    /// thread, in the order read; `arriving` answers, after a parse here,
-    /// whether more output waits. While the parser is behind by a batch the
-    /// reader waits for it, so a slow parse still holds the program back.
-    /// False once the transport closed.
+    /// Parses `bytes`, which the reader waited `waited` for, here or on the
+    /// parser thread, in the order read; `arriving` answers, after a parse
+    /// here, whether more output waits. While the parser is behind by a
+    /// batch the reader waits for it, so a slow parse still holds the program
+    /// back. False once the transport closed.
     pub(crate) fn deliver(
         &mut self,
         bytes: &[u8],
-        read: Duration,
+        waited: Duration,
         arriving: impl FnOnce() -> bool,
     ) -> bool {
         let mut state = self.handoff.state.lock();
         if state.closed {
             return false;
         }
+        // Output that came sooner than the idle parser could have woken for
+        // it is the same stream going on; until a wake is measured, so is
+        // all output.
+        if self.streaming && !state.busy && !state.wake.is_zero() && waited > state.wake {
+            self.streaming = false;
+        }
         if !state.busy && !self.streaming {
-            let wake = state.wake;
             drop(state);
-            let parsing = Instant::now();
             (self.sink)(bytes);
             self.notify.fire();
-            self.streaming = parsing.elapsed() > read + wake && arriving();
+            self.streaming = arriving();
             return true;
         }
         if self.parser.is_none() {
@@ -319,7 +321,6 @@ impl Output {
                 }
             }
         }
-        self.streaming = false;
         while !state.closed && !state.bytes.is_empty() && state.bytes.len() + bytes.len() > BATCH {
             self.handoff.room.wait(&mut state);
         }
@@ -566,24 +567,27 @@ mod tests {
         (Output::new(sink, notify, handoff), threads)
     }
 
-    #[test]
-    fn output_that_parses_faster_than_the_parser_wakes_stays_on_the_reader() {
-        let handoff = Arc::new(Handoff::default());
-        handoff.state.lock().woke(Duration::from_secs(3600));
-        let (mut output, threads) = timed_output(Duration::from_millis(2), handoff);
-        for _ in 0..3 {
-            assert!(output.deliver(b"x", Duration::ZERO, || true));
-        }
-        output.finish();
-        let reader = std::thread::current()
+    fn reader_name() -> String {
+        std::thread::current()
             .name()
             .unwrap_or_default()
-            .to_string();
-        assert_eq!(*threads.lock(), vec![reader; 3]);
+            .to_string()
     }
 
     #[test]
-    fn output_that_parses_longer_than_reading_and_waking_goes_to_the_parser() {
+    fn output_after_pauses_longer_than_the_parser_wakes_stays_on_the_reader() {
+        let handoff = Arc::new(Handoff::default());
+        handoff.state.lock().woke(Duration::from_micros(1));
+        let (mut output, threads) = timed_output(Duration::from_millis(2), handoff);
+        for _ in 0..3 {
+            assert!(output.deliver(b"x", Duration::from_millis(50), || true));
+        }
+        output.finish();
+        assert_eq!(*threads.lock(), vec![reader_name(); 3]);
+    }
+
+    #[test]
+    fn output_waiting_after_a_parse_on_the_reader_goes_to_the_parser() {
         let handoff = Arc::new(Handoff::default());
         let (mut output, threads) = timed_output(Duration::from_millis(2), handoff);
         for _ in 0..2 {
@@ -594,6 +598,29 @@ mod tests {
         assert_eq!(threads.len(), 2);
         assert_ne!(threads[0], "gui-term-parse");
         assert_eq!(threads[1], "gui-term-parse");
+    }
+
+    #[test]
+    fn a_stream_stays_with_the_parser_after_it_catches_up() {
+        let handoff = Arc::new(Handoff::default());
+        handoff.state.lock().woke(Duration::from_secs(3600));
+        let (parsed, done) = std::sync::mpsc::channel();
+        let sink = Box::new(move |_: &[u8]| {
+            let name = std::thread::current()
+                .name()
+                .unwrap_or_default()
+                .to_string();
+            let _ = parsed.send(name);
+        });
+        let notify = Arc::new(Notify::new(Arc::new(|| {})));
+        let mut output = Output::new(sink, notify, handoff);
+        assert!(output.deliver(b"x", Duration::ZERO, || true));
+        assert_eq!(done.recv().ok(), Some(reader_name()));
+        for _ in 0..3 {
+            assert!(output.deliver(b"x", Duration::ZERO, || false));
+            assert_eq!(done.recv().ok().as_deref(), Some("gui-term-parse"));
+        }
+        output.finish();
     }
 
     #[test]

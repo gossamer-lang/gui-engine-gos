@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.11 - Lighter frames, a parser that keeps up
+
+- Terminal output that keeps coming goes to the parser thread once output is waiting after a read's parse, and stays there until output pauses for longer than the parser takes to wake, where it used to come back to the reader after each batch and wake the parser again. On macOS the reader makes one read per wake instead of a second that finds nothing.
+- A terminal keeps its scrolled rows in the byte order window surfaces take, so a frame that scrolls copies them unchanged instead of swapping red and blue in every pixel.
+- Text blends into a frame faster, with the same pixels: pixels a glyph does not cover are skipped, and the rest blend without a division.
+- While output streams faster than frames paint, the next output frame waits at least as long as the last one took to paint, so painting leaves the thread time for other work.
+- A frame rasterizes on one thread per physical core, less one left to the program's other work, such as parsing the output it shows.
+- Laying out a terminal row's text makes one string per run instead of four.
+- Raster layers a window stopped using go sooner.
+- The installed fonts the toolkit reads for its own fallback stay in the engine: the whole catalog no longer reaches the application as a message it never asked for, and a face the toolkit loads no longer rebuilds the application's windows.
+- The font cache streams to disk as it is written instead of being built in memory first.
+- Builds on windowing-gos 0.1.15 and wezterm-lite 0.1.9.
+
 ## 0.2.10 - Lighter repaints, fewer terminal wakes
 
 - Terminal output that parses faster than its parser thread wakes is parsed on the thread that read it: the parser thread measures how long a wake takes, and a reader hands it output only when parsing takes longer than reading and that wake. On macOS, whose pseudo-terminal hands over about a kilobyte at a time, output no longer wakes the parser for each read.

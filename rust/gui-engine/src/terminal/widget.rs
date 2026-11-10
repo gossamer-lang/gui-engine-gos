@@ -678,6 +678,8 @@ pub(super) fn draw_row(
     } = *p;
     let screen_row = row as u16;
     let mut runs = Vec::new();
+    // The layout key of each bold and italic style, made once per row.
+    let mut style_keys: [Option<String>; 4] = Default::default();
     let (y, height) = p.band(row);
     let mut col = 0;
     while col < cells.len() {
@@ -747,46 +749,56 @@ pub(super) fn draw_row(
         if bg != background {
             cx.fill(Rect::new(x, y, width, height), bg);
         }
-        let text: String = cells[col..end]
-            .iter()
-            .filter(|c| !c.continuation)
-            .map(|c| {
-                if c.text.is_empty() {
-                    " "
-                } else {
-                    c.text.as_str()
-                }
-            })
-            .collect();
+        // A run's layout key is its style's key, `#`, then its text, so the
+        // text is read from the key rather than copied apart from it.
+        let style_key = style_keys[usize::from(cell.bold) * 2 + usize::from(cell.italic)]
+            .get_or_insert_with(|| {
+                let mut run = style.clone();
+                run.bold = cell.bold;
+                run.italic = cell.italic;
+                run.key()
+            });
+        let prefix = style_key.len() + 1;
+        let mut key = String::with_capacity(prefix + end - col);
+        key.push_str(style_key);
+        key.push('#');
+        for c in cells[col..end].iter().filter(|c| !c.continuation) {
+            key.push_str(if c.text.is_empty() {
+                " "
+            } else {
+                c.text.as_str()
+            });
+        }
         // Blank cells draw no ink, and backgrounds and underlines fill
         // their cells, so a run is laid out only up to its last glyph.
-        let text = text.trim_end_matches(' ');
+        key.truncate(key.trim_end_matches(' ').len().max(prefix));
+        let text = &key[prefix..];
         let shape = Rect::new(origin.x + x, origin.y + y, width, height);
         let drawn = !ascii(cell) && shapes::draw(&mut cx.canvas, text, shape, fg, bg);
         if !drawn && !text.trim().is_empty() {
             let mut run = style.clone();
             run.bold = cell.bold;
             run.italic = cell.italic;
-            let mut key = format!("{}#{}", run.key(), text);
             lay_out(layouts, &key, text, &run);
-            runs.push(key.clone());
             let mut at = ((origin.x + x) as f64, (origin.y + y) as f64 + rise);
             // A glyph wider than its cells, such as an emoji a program
             // counts as one cell, is drawn smaller and centered on its
             // row, so it stays inside them.
+            let mut drawn_key = None;
             if !ascii(cell)
                 && let Some(drawn) = layouts.get(&key).map(|l| l.width)
                 && drawn > width as f64
             {
                 run.size *= width as f64 / drawn;
-                key = format!("{}#{}", run.key(), text);
-                lay_out(layouts, &key, text, &run);
-                runs.push(key.clone());
-                if let Some(height) = layouts.get(&key).map(|l| l.height) {
+                let smaller = format!("{}#{}", run.key(), text);
+                lay_out(layouts, &smaller, text, &run);
+                if let Some(height) = layouts.get(&smaller).map(|l| l.height) {
                     at.1 += ((lh - height) / 2.0).max(0.0);
                 }
+                drawn_key = Some(smaller);
             }
-            match layouts.get(&key) {
+            let shown = drawn_key.as_ref().unwrap_or(&key);
+            match layouts.get(shown) {
                 Some(laid) => layout::draw(&mut cx.canvas, laid, at.0, at.1, &run, fg),
                 // A run too large for the cache is laid out for this paint.
                 None => {
@@ -794,6 +806,8 @@ pub(super) fn draw_row(
                     layout::draw(&mut cx.canvas, &laid, at.0, at.1, &run, fg);
                 }
             }
+            runs.push(key);
+            runs.extend(drawn_key);
         }
         if cell.underline || lit {
             cx.fill(
@@ -1263,14 +1277,14 @@ fn pixels_of(length: f64) -> u16 {
 // Lays out `text` in `run` under `key` unless the cache holds it.
 fn lay_out(
     layouts: &mut ByteCache<String, layout::TextLayout>,
-    key: &str,
+    key: &String,
     text: &str,
     run: &TextStyle,
 ) {
-    if layouts.get(&key.to_string()).is_none() {
+    if layouts.get(key).is_none() {
         let laid = layout::layout_uncached(text, run, LayoutOptions::single_line());
         let bytes = key.len() + laid.owned_bytes();
-        layouts.insert(key.to_string(), laid, bytes);
+        layouts.insert(key.clone(), laid, bytes);
     }
 }
 

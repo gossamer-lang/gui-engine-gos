@@ -171,7 +171,7 @@ impl Pty {
                 .spawn(move || {
                     let mut buffer = vec![0; BATCH];
                     loop {
-                        let started = std::time::Instant::now();
+                        let waiting = std::time::Instant::now();
                         match reader.read(&mut buffer) {
                             Ok(0) => break,
                             // Closing flushes output synchronously; it is read
@@ -180,7 +180,7 @@ impl Pty {
                             // A read that fills the buffer left output behind it.
                             Ok(n) => {
                                 output
-                                    .deliver(&buffer[..n], started.elapsed(), || n == buffer.len());
+                                    .deliver(&buffer[..n], waiting.elapsed(), || n == buffer.len());
                             }
                             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => (),
                             Err(_) => break,

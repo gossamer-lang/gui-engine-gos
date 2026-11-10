@@ -1771,6 +1771,62 @@ fn repaints_match_first_paints(opacity: f64) {
 }
 
 #[test]
+fn scrolled_rows_from_the_layer_reach_a_window_surface_in_its_channel_order() {
+    let budget = Budget::new(64 * 1024 * 1024);
+    let kept = create(&options(12, 40, 100), budget.clone()).unwrap();
+    let fresh = create(&options(12, 40, 100), budget).unwrap();
+    let kept_view = widget::View::new("kept", kept, "Kept");
+    let fresh_view = widget::View::new("fresh", fresh, "Fresh");
+    let size = crate::geometry::Size::new(480, 320);
+    let (w, h) = (size.width, size.height);
+    let mut retained = crate::render::retained::Retained::new();
+    let mut surface = vec![0u8; (w * h * 4) as usize];
+    let show = |retained: &mut crate::render::retained::Retained, surface: &mut Vec<u8>| {
+        let recording = retained.recording(w, h);
+        let theme = crate::style::Theme::default();
+        let states = crate::widgets::state::StateStore::new();
+        let mut cx = crate::widgets::cx::PaintCx::new(&recording, &theme, &states);
+        widget::paint_terminal(&kept_view, &crate::widgets::cx::Node::leaf(size), &mut cx);
+        let scene = cx.canvas.take_scene().unwrap();
+        let damage = retained.damage(w, h, &scene);
+        let target = crate::render::retained::Target {
+            pixels: surface,
+            width: w,
+            height: h,
+            stride: w * 4,
+            offsets: (2, 1, 0),
+        };
+        retained.raster(&scene, &damage, target);
+        retained.commit(scene);
+    };
+    for round in 0..6 {
+        for i in 0..if round == 0 { 20 } else { round % 2 + 1 } {
+            let line = format!(
+                "\x1b[3{}mline {round} {i}\x1b[0m \x1b[44mblue\x1b[0m\r\n",
+                i % 8
+            );
+            feed(kept, line.as_bytes()).unwrap();
+            feed(fresh, line.as_bytes()).unwrap();
+        }
+        loop {
+            let faces = crate::text::fonts::generation();
+            show(&mut retained, &mut surface);
+            let first = paint(&fresh_view, size);
+            if crate::text::fonts::generation() != faces {
+                continue;
+            }
+            let mut want = first.pixels.clone();
+            crate::render::swap_red_blue_in_place(&mut want);
+            assert!(surface == want, "round {round}");
+            break;
+        }
+    }
+    assert!(with_entry(kept, |entry| entry.layer.holds()).unwrap());
+    close(kept);
+    close(fresh);
+}
+
+#[test]
 fn scrolled_output_draws_its_rows_from_the_layer() {
     let id = create(&options(12, 40, 100), Budget::new(64 * 1024 * 1024)).unwrap();
     let view = widget::View::new("term", id, "Term");

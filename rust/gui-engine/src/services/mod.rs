@@ -212,12 +212,21 @@ pub(crate) fn bounded_json(
 /// written and synced, then renamed over the destination, so a crash
 /// leaves either the old or the new contents.
 pub fn write_atomic(file: &str, bytes: &[u8]) -> Result<(), errors::Error> {
+    write_atomic_with(file, |out| out.write_all(bytes))
+}
+
+/// `write_atomic` for contents `write` streams out, which need not exist in
+/// memory whole. An error from `write` leaves `file` as it was.
+pub fn write_atomic_with(
+    file: &str,
+    write: impl FnOnce(&mut dyn std::io::Write) -> std::io::Result<()>,
+) -> Result<(), errors::Error> {
     let dir = paths::parent(file).unwrap_or_default();
     if !dir.is_empty() {
         fs::create_dir_all(&dir)?;
     }
     let tmp = format!("{}.tmp-{}", file, std::process::id());
-    if let Err(e) = stage(&tmp, bytes) {
+    if let Err(e) = stage(&tmp, write) {
         let _ = fs::remove_file(&tmp);
         return Err(errors::wrap(e, format!("writing {tmp}")));
     }
@@ -229,12 +238,16 @@ pub fn write_atomic(file: &str, bytes: &[u8]) -> Result<(), errors::Error> {
         .map_err(|e| errors::wrap(e, format!("syncing the directory of {file}")))
 }
 
-// Writes all of `bytes` to a new `file` and flushes it to storage.
-fn stage(file: &str, bytes: &[u8]) -> std::io::Result<()> {
+// Writes what `write` streams out to a new `file` and flushes it to storage.
+fn stage(
+    file: &str,
+    write: impl FnOnce(&mut dyn std::io::Write) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     use std::io::Write;
-    let mut f = fs::File::create(file)?;
-    f.write_all(bytes)?;
-    f.sync_all()
+    let mut out = std::io::BufWriter::new(fs::File::create(file)?);
+    write(&mut out)?;
+    out.flush()?;
+    out.get_ref().sync_all()
 }
 
 // Flushes a rename in `dir` to storage.

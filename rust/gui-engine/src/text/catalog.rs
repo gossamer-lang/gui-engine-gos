@@ -72,6 +72,12 @@ struct CacheDocument {
     files: Vec<CachedFile>,
 }
 
+// A `CacheDocument` written from summaries held elsewhere, in the same form.
+#[derive(serde::Serialize)]
+struct CacheDocumentRef<'a> {
+    files: &'a [CachedFile],
+}
+
 // The tables a summary reads.
 const SUMMARY_TABLES: [&str; 7] = ["head", "maxp", "hhea", "OS/2", "post", "name", "cmap"];
 
@@ -291,28 +297,34 @@ pub fn load_cancellable(
         && let Some(dir) = paths::parent(cache)
         && fs::create_dir_all(dir).is_ok()
     {
-        // No unbounded serialize-then-check allocation: the source document is
-        // already bounded and the writer stops at its independent disk cap.
-        let document = CacheDocument {
-            files: entries.clone(),
-        };
-        struct Limited(Vec<u8>);
-        impl std::io::Write for Limited {
+        // The cache streams to disk, never whole in memory, and stops at its
+        // own disk cap.
+        let document = CacheDocumentRef { files: &entries };
+        struct Limited<'a> {
+            out: &'a mut dyn std::io::Write,
+            written: usize,
+        }
+        impl std::io::Write for Limited<'_> {
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                if self.0.len().saturating_add(bytes.len()) > 8 * 1024 * 1024 {
+                if self.written.saturating_add(bytes.len()) > 8 * 1024 * 1024 {
                     return Err(std::io::Error::other("font cache exceeds disk byte budget"));
                 }
-                self.0.extend_from_slice(bytes);
-                Ok(bytes.len())
+                let n = self.out.write(bytes)?;
+                self.written += n;
+                Ok(n)
             }
             fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
+                self.out.flush()
             }
         }
-        let mut bytes = Limited(Vec::new());
-        if serde_json::to_writer(&mut bytes, &document).is_ok() && active() {
-            let _ = services::write_atomic(cache, &bytes.0);
-        }
+        let _ = services::write_atomic_with(cache, |out| {
+            serde_json::to_writer(&mut Limited { out, written: 0 }, &document)?;
+            if active() {
+                Ok(())
+            } else {
+                Err(std::io::Error::other("font catalog cancelled or expired"))
+            }
+        });
     }
     let mut records: Vec<FontRecord> = entries.into_iter().flat_map(|entry| entry.faces).collect();
     share_coverage(&mut records);

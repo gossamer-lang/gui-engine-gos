@@ -6,7 +6,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::{Canvas, Coverage, revision_hasher};
+use super::{Canvas, Coverage, revision_hasher, swap_red_blue};
 use crate::geometry::Rect;
 use crate::style::color::Color;
 
@@ -1055,6 +1055,7 @@ fn copy_surface(band: &mut Band, job: &Job, inside: Rect, done: &mut Banded) -> 
     }
     let rgba = surface.rgba.read();
     let (ro, go, bo) = band.offsets;
+    let (sr, sg, sb) = surface.offsets();
     for part in &job.parts {
         let part = part.intersect(inside);
         if !nonempty(part) {
@@ -1066,33 +1067,22 @@ fn copy_surface(band: &mut Band, job: &Job, inside: Rect, done: &mut Banded) -> 
             let dst = (row - band.y) as usize * band.stride + part.x as usize * 4;
             let into = band.pixels[dst..dst + len].as_chunks_mut::<4>().0;
             let from = rgba[src..src + len].as_chunks::<4>().0;
-            match (ro, go, bo) {
-                (0, 1, 2) => into.copy_from_slice(from),
-                (2, 1, 0) => {
-                    swap_red_blue(into, from);
-                }
-                _ => {
-                    for (d, s) in into.iter_mut().zip(from) {
-                        d[ro] = s[0];
-                        d[go] = s[1];
-                        d[bo] = s[2];
-                        d[3] = s[3];
-                    }
+            if (ro, go, bo) == (sr, sg, sb) {
+                into.copy_from_slice(from);
+            } else if (ro, bo) == (sb, sr) && go == sg {
+                swap_red_blue(into, from);
+            } else {
+                for (d, s) in into.iter_mut().zip(from) {
+                    d[ro] = s[sr];
+                    d[go] = s[sg];
+                    d[bo] = s[sb];
+                    d[3] = s[3];
                 }
             }
         }
         done.damage_pixels += (part.width * part.height) as u64;
     }
     true
-}
-
-/// Copies pixels exchanging their first and third bytes, as whole words,
-/// which vectorizes where a byte shuffle does not.
-fn swap_red_blue(into: &mut [[u8; 4]], from: &[[u8; 4]]) {
-    for (d, s) in into.iter_mut().zip(from) {
-        let p = u32::from_le_bytes(*s);
-        *d = ((p & 0xff00_ff00) | ((p & 0xff) << 16) | ((p >> 16) & 0xff)).to_le_bytes();
-    }
 }
 
 /// The frame rectangles that differ when `b` draws a surface's content in

@@ -118,6 +118,9 @@ pub struct Surface {
     /// differ; `None` when they may differ anywhere.
     previous: u64,
     changed: Option<Arc<[Rect]>>,
+    /// The pixels hold blue, green and red in that order, as window surfaces
+    /// take them, so a frame copies them unchanged.
+    swapped: bool,
     rgba: Arc<parking_lot::RwLock<Vec<u8>>>,
 }
 
@@ -156,12 +159,19 @@ impl Surface {
         self.turn.stored(y)
     }
 
+    /// The red, green and blue offsets within each of the pixels.
+    pub(crate) fn offsets(&self) -> (usize, usize, usize) {
+        if self.swapped { (2, 1, 0) } else { (0, 1, 2) }
+    }
+
     /// Rewrites the content through a canvas over the current pixels, which
     /// are blank when the size changes, and shows it turned by `turn`, giving
     /// it a new identity. `changed` names the shown rectangles the rewrite
     /// can change, or `None` for any; it holds only while the size, opacity
     /// and turn stay. A scene
     /// that drew the old content keeps its identity, so it reads as changed.
+    /// `draw` leaves every pixel it writes with blue, green and red in that
+    /// order, as [`swap_red_blue`] puts what a canvas drew.
     pub fn rewrite(
         &mut self,
         width: i64,
@@ -185,6 +195,7 @@ impl Surface {
         drop(pixels);
         self.width = width;
         self.height = height;
+        self.swapped = true;
         let same = kept && self.opaque == opaque && self.turn == turn;
         self.opaque = opaque;
         self.turn = turn;
@@ -376,7 +387,7 @@ impl Canvas {
             clip,
             self.opacity,
             (x, y, surface.width, surface.height),
-            &rgba,
+            (&rgba, surface.offsets()),
             |row| surface.stored_row(row),
         )
     }
@@ -1209,7 +1220,7 @@ fn image_rgba(
         clip,
         opacity,
         (x, y, width, height),
-        rgba,
+        (rgba, (0, 1, 2)),
         |row| row,
     )
 }
@@ -1222,7 +1233,7 @@ fn image_rgba_rows(
     clip: Rect,
     opacity: i64,
     (x, y, width, height): (i64, i64, i64, i64),
-    rgba: &[u8],
+    (rgba, (ro, go, bo)): (&[u8], (usize, usize, usize)),
     stored: impl Fn(i64) -> i64,
 ) {
     if width <= 0 || height <= 0 || stride <= 0 || rgba.len() < (width * height * 4) as usize {
@@ -1244,18 +1255,22 @@ fn image_rgba_rows(
         let into = dst[d..d + len].as_chunks_mut::<4>().0;
         let from = rgba[src..src + len].as_chunks::<4>().0;
         if opacity >= 255 && from.iter().all(|s| s[3] == 255) {
-            into.copy_from_slice(from);
+            match (ro, go, bo) {
+                (0, 1, 2) => into.copy_from_slice(from),
+                _ => swap_red_blue(into, from),
+            }
             continue;
         }
         for (p, s) in into.iter_mut().zip(from) {
+            let (r, g, b) = (s[ro], s[go], s[bo]);
             let a = clamp255(opacity * i64::from(s[3]) / 255);
             if a == 255 {
-                *p = [s[0], s[1], s[2], 255];
+                *p = [r, g, b, 255];
             } else if a > 0 {
                 *p = [
-                    mix(p[0], s[0], a),
-                    mix(p[1], s[1], a),
-                    mix(p[2], s[2], a),
+                    mix(p[0], r, a),
+                    mix(p[1], g, a),
+                    mix(p[2], b, a),
                     mix(p[3], 255, a),
                 ];
             }
@@ -1665,30 +1680,73 @@ pub fn blend_coverage(
     let y1 = mini(y + h, clip.y + clip.height);
     let x0 = maxi(x, clip.x);
     let x1 = mini(x + w, clip.x + clip.width);
-    let mut row = y0;
-    while row < y1 {
-        let mut col = x0;
-        let mut ci = (row - y) * w + (col - x);
-        let mut o = row * stride + col * 4;
-        while col < x1 {
-            let a = clamp255(opacity * cov[ci as usize] as i64 / 255);
-            if a >= 255 {
-                fb[o as usize] = color.r;
-                fb[(o + 1) as usize] = color.g;
-                fb[(o + 2) as usize] = color.b;
-                fb[(o + 3) as usize] = 255
-            } else if a > 0 {
-                fb[o as usize] = mix(fb[o as usize], color.r, a);
-                fb[(o + 1) as usize] = mix(fb[(o + 1) as usize], color.g, a);
-                fb[(o + 2) as usize] = mix(fb[(o + 2) as usize], color.b, a);
-                fb[(o + 3) as usize] = mix(fb[(o + 3) as usize], 255, a)
-            }
-            col += 1;
-            ci += 1;
-            o += 4;
-        }
-        row += 1;
+    if x1 <= x0 {
+        return;
     }
+    let span = (x1 - x0) as usize;
+    let src = [
+        u32::from(color.r),
+        u32::from(color.g),
+        u32::from(color.b),
+        255,
+    ];
+    for row in y0..y1 {
+        let ci = ((row - y) * w + (x0 - x)) as usize;
+        let o = (row * stride + x0 * 4) as usize;
+        let pixels = fb[o..o + span * 4].as_chunks_mut::<4>().0;
+        let coverage = &cov[ci..ci + span];
+        if opacity == 255 {
+            for (px, &c) in pixels.iter_mut().zip(coverage) {
+                if c != 0 {
+                    over(px, src, u32::from(c));
+                }
+            }
+        } else {
+            for (px, &c) in pixels.iter_mut().zip(coverage) {
+                if c != 0 {
+                    over(px, src, clamp255(opacity * i64::from(c) / 255) as u32);
+                }
+            }
+        }
+    }
+}
+
+// `src` over the pixel `px` at alpha `a` (0..=255): each channel is
+// `(src * a + px * (255 - a)) / 255`, so alpha 0 keeps the pixel and 255
+// replaces it. Most of a glyph's box is uncovered, which callers skip.
+#[inline(always)]
+fn over(px: &mut [u8; 4], src: [u32; 4], a: u32) {
+    let keep = 255 - a;
+    for (d, s) in px.iter_mut().zip(src) {
+        *d = div255(s * a + u32::from(*d) * keep) as u8;
+    }
+}
+
+/// Copies pixels exchanging their first and third bytes, red and blue, as
+/// whole words, which vectorizes where a byte shuffle does not.
+pub(crate) fn swap_red_blue(into: &mut [[u8; 4]], from: &[[u8; 4]]) {
+    for (d, s) in into.iter_mut().zip(from) {
+        *d = swapped(*s);
+    }
+}
+
+/// Exchanges the first and third bytes, red and blue, of every pixel.
+pub fn swap_red_blue_in_place(pixels: &mut [u8]) {
+    for p in pixels.as_chunks_mut::<4>().0 {
+        *p = swapped(*p);
+    }
+}
+
+#[inline(always)]
+fn swapped(p: [u8; 4]) -> [u8; 4] {
+    let p = u32::from_le_bytes(p);
+    ((p & 0xff00_ff00) | ((p & 0xff) << 16) | ((p >> 16) & 0xff)).to_le_bytes()
+}
+
+// `x / 255` for `x` up to 255 * 255, exact over that range.
+#[inline(always)]
+fn div255(x: u32) -> u32 {
+    (x + 1 + (x >> 8)) >> 8
 }
 
 /// The bare fill, opaque and unclipped, for callers that own the whole
@@ -1754,6 +1812,44 @@ mod tests {
     use super::{Canvas, blend_rect, clear, fill_rect};
     use crate::geometry::Rect;
     use crate::style::color::Color;
+
+    #[test]
+    fn coverage_blends_every_channel_as_the_exact_rounded_down_mix() {
+        for a in 0..=255u32 {
+            for s in 0..=255u32 {
+                for d in 0..=255u32 {
+                    let want = (s * a + d * (255 - a)) / 255;
+                    assert_eq!(super::div255(s * a + d * (255 - a)), want, "{a} {s} {d}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn coverage_fades_by_opacity_and_keeps_pixels_it_does_not_cover() {
+        let mut fb = vec![10u8; 4 * 4 * 4];
+        let cov = [0, 128, 255, 64];
+        let color = Color::rgb(250, 100, 0);
+        let clip = Rect::new(0, 0, 4, 4);
+        super::blend_coverage(&mut fb, 16, clip, 255, 0, 1, 4, 1, &cov, color);
+        super::blend_coverage(&mut fb, 16, clip, 100, 0, 2, 4, 1, &cov, color);
+        super::blend_coverage(&mut fb, 16, clip, 300, 0, 3, 4, 1, &cov, color);
+        let mix = |d: i64, s: i64, a: i64| ((s * a + d * (255 - a)) / 255) as u8;
+        for (row, opacity) in [(1, 255), (2, 100), (3, 300)] {
+            for (col, &c) in cov.iter().enumerate() {
+                let a = (opacity * i64::from(c) / 255).clamp(0, 255);
+                let at = row * 16 + col * 4;
+                let want = [
+                    mix(10, 250, a),
+                    mix(10, 100, a),
+                    mix(10, 0, a),
+                    mix(10, 255, a),
+                ];
+                assert_eq!(fb[at..at + 4], want, "{row} {col}");
+            }
+        }
+        assert!(fb[..16].iter().all(|&b| b == 10));
+    }
 
     #[test]
     fn shrinking_averages_area_and_ignores_transparent_color() {

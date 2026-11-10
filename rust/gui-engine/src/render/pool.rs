@@ -53,12 +53,20 @@ fn pool() -> &'static Pool {
     POOL.get_or_init(Pool::default)
 }
 
-/// The threads the machine runs at once, as the process first found it.
-/// Asking the system reads files on Linux (the cgroup's CPU quota), too
-/// slow to repeat for every frame.
+/// The threads a frame rasterizes on: one per physical core the process may
+/// use, less one left to the program's other work, such as a terminal
+/// parsing the output the frame shows. Raster is bound by memory, which a
+/// core's second hardware thread does not add to. Asking the system reads
+/// files on Linux (the cgroup's CPU quota), too slow to repeat every frame.
 pub(crate) fn parallelism() -> usize {
     static PARALLELISM: OnceLock<usize> = OnceLock::new();
-    *PARALLELISM.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+    *PARALLELISM.get_or_init(|| {
+        let logical = std::thread::available_parallelism().map_or(1, |n| n.get());
+        num_cpus::get_physical()
+            .min(logical)
+            .saturating_sub(1)
+            .max(1)
+    })
 }
 
 /// Runs every task, the first on the calling thread and the others on the

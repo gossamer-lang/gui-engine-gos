@@ -8298,6 +8298,7 @@ mod advance_tests {
         })
     }
 
+    #[cfg(unix)]
     #[test]
     fn output_that_paints_slower_than_a_frame_waits_twice_its_paint_for_the_next() {
         use crate::terminal::{self, Command, Options};

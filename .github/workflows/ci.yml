@@ -16,7 +16,7 @@ env:
   WINDOWING_REPO: gossamer-lang/windowing-gos
   # The windowing release project.toml depends on. The Rust crates check
   # against a checkout of the same tag beside this one.
-  WINDOWING_REF: ${{ vars.WINDOWING_REF || 'v0.1.13' }}
+  WINDOWING_REF: ${{ vars.WINDOWING_REF || 'v0.1.14' }}
   RUSTUP_TOOLCHAIN: 1.95.0
   # Every job draws into SDL's offscreen driver, which needs no display.
   SDL_VIDEO_DRIVER: offscreen
@@ -62,6 +62,11 @@ jobs:
     name: Rust (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
+    env:
+      # On macOS cargo's built-in git speaks TLS through SecureTransport, whose
+      # connections to skia.googlesource.com (a submodule of sdl3-sys's
+      # SDL_image) drop; the git client fetches over its own TLS stack.
+      CARGO_NET_GIT_FETCH_WITH_CLI: ${{ startsWith(matrix.os, 'macos') }}
     strategy:
       fail-fast: false
       matrix:

@@ -11,6 +11,8 @@
 // every command first (`Event::Command`), so text fields implement
 // edit.copy and friends without the application's help.
 
+use std::sync::Arc;
+
 use windowing::{Key, Mods};
 
 use crate::input::{Shortcut, produces_text};
@@ -121,7 +123,8 @@ pub enum KeyResult {
 /// The commands of a window and the chord typed so far.
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct CommandTable {
-    pub commands: Vec<Command>,
+    /// Shared, so each frame and event reads the table without copying it.
+    pub commands: Arc<[Command]>,
     pressed: Vec<(Key, Mods)>,
     /// When the pending chord expires (ms clock), or 0.
     pub chord_deadline: i64,
@@ -178,7 +181,7 @@ pub fn standard_commands() -> Vec<Command> {
 impl CommandTable {
     pub fn new(commands: &[Command]) -> CommandTable {
         CommandTable {
-            commands: commands.to_vec(),
+            commands: commands.into(),
             pressed: vec![],
             chord_deadline: 0,
         }
@@ -186,7 +189,7 @@ impl CommandTable {
 
     /// The command `id`, if registered.
     pub fn get(&self, id: &str) -> Option<Command> {
-        for c in &self.commands {
+        for c in self.commands.iter() {
             if c.id == id {
                 return Some(c.clone());
             }
@@ -203,7 +206,7 @@ impl CommandTable {
 
     /// Replaces the application's commands, keeping a pending chord.
     pub fn set(&mut self, commands: &[Command]) {
-        self.commands = commands.to_vec();
+        self.commands = commands.into();
     }
 
     pub fn reset_chord(&mut self) {
@@ -239,7 +242,7 @@ impl CommandTable {
         let mut fired: Option<Command> = None;
         let mut fired_rank = 1000;
         let mut prefix = false;
-        for c in &self.commands {
+        for c in self.commands.iter() {
             let rank = scope_rank(&c.scope, scopes);
             if rank < 0 {
                 continue;

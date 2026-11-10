@@ -837,10 +837,7 @@ impl Retained {
             .iter()
             .filter(|(_, jobs)| jobs.iter().any(|j| j.cached.is_none()))
             .count();
-        let workers = std::thread::available_parallelism()
-            .map_or(1, |n| n.get())
-            .min(fresh)
-            .max(1);
+        let workers = super::pool::parallelism().min(fresh).max(1);
         let per = work.len().div_ceil(workers).max(1);
         let chunks = work.len().div_ceil(per).max(1);
         let scratch = &mut self.scratch;

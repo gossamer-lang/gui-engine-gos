@@ -6,6 +6,8 @@
 // pointer capture, popups, timers, IME placement, and messages, and the
 // session applies those requests after the pass.
 
+use std::sync::Arc;
+
 use windowing;
 use windowing::{Key, Mods, MouseButton};
 
@@ -462,7 +464,7 @@ pub struct EventCx {
     /// The popup currently receiving the event, when dispatching to one.
     pub popup_level: i64,
     /// The window's commands, for enabled state and labels.
-    pub registry: Vec<Command>,
+    pub registry: Arc<[Command]>,
 }
 
 impl EventCx {
@@ -494,7 +496,7 @@ impl EventCx {
             origin_y: 0,
             active: true,
             popup_level: -1,
-            registry: vec![],
+            registry: Arc::default(),
         }
     }
 
@@ -582,7 +584,7 @@ pub struct PaintCx {
     pub origin_x: i64,
     pub origin_y: i64,
     /// The window's commands, for labels, shortcuts, and enabled state.
-    pub registry: Vec<Command>,
+    pub registry: Arc<[Command]>,
     /// Show mnemonic underlines (Alt is held or menus are keyboard-driven).
     pub mnemonics: bool,
 }
@@ -603,7 +605,7 @@ impl PaintCx {
             now: 0,
             origin_x: 0,
             origin_y: 0,
-            registry: vec![],
+            registry: Arc::default(),
             mnemonics: false,
         }
     }

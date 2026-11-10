@@ -207,6 +207,25 @@ struct Backlog {
     closed: bool,
     /// The parser hands back memory others freed for it before it waits.
     release: bool,
+    /// The parser waits for output.
+    parked: bool,
+    /// When the reader handed output to the waiting parser.
+    signaled: Option<Instant>,
+    /// How long the waiting parser takes to start on output handed to it,
+    /// smoothed; zero until the first wake is measured.
+    wake: Duration,
+}
+
+impl Backlog {
+    // Smooths the wake latency as TCP smooths its round-trip time, an eighth
+    // of each new sample, so one slow wake does not decide a handoff alone.
+    fn woke(&mut self, latency: Duration) {
+        self.wake = if self.wake.is_zero() {
+            latency
+        } else {
+            self.wake - self.wake / 8 + latency / 8
+        };
+    }
 }
 
 /// The state a transport's reader and its parser thread share.
@@ -238,16 +257,18 @@ impl Handoff {
 /// A reader's way to the sink. Output that comes while nothing is parsing
 /// is parsed on the reader, which keeps a reply to typing one thread away.
 /// Output that keeps arriving while its parse takes longer than reading it
-/// goes to a parser thread, so the reader reads the next output during the
-/// parse; where reading takes the longer share, as for plain text, the
-/// parser thread would save little and cost a wake a batch.
+/// and waking the parser goes to a parser thread, so the reader reads the
+/// next output during the parse. Where reading takes the longer share, as
+/// for plain text, or a batch parses faster than the parser wakes, as for
+/// the kilobyte a macOS pseudo-terminal holds, the parser thread would save
+/// nothing and cost a wake a batch.
 pub(crate) struct Output {
     sink: Arc<Sink>,
     notify: Arc<Notify>,
     handoff: Arc<Handoff>,
     parser: Option<std::thread::JoinHandle<()>>,
     /// Output arrived while the reader parsed the last of it, which took
-    /// longer than reading it.
+    /// longer than reading it and waking the parser.
     streaming: bool,
 }
 
@@ -278,11 +299,12 @@ impl Output {
             return false;
         }
         if !state.busy && !self.streaming {
+            let wake = state.wake;
             drop(state);
             let parsing = Instant::now();
             (self.sink)(bytes);
             self.notify.fire();
-            self.streaming = parsing.elapsed() > read && arriving();
+            self.streaming = parsing.elapsed() > read + wake && arriving();
             return true;
         }
         if self.parser.is_none() {
@@ -306,6 +328,9 @@ impl Output {
         }
         state.bytes.extend_from_slice(bytes);
         state.busy = true;
+        if state.parked && state.signaled.is_none() {
+            state.signaled = Some(Instant::now());
+        }
         self.handoff.arrived.notify_one();
         true
     }
@@ -317,7 +342,10 @@ impl Output {
         std::thread::Builder::new()
             .name("gui-term-parse".into())
             .stack_size(STACK)
-            .spawn(move || parse(&handoff, &sink, &notify))
+            .spawn(move || {
+                interactive_thread();
+                parse(&handoff, &sink, &notify)
+            })
             .ok()
     }
 
@@ -340,6 +368,19 @@ impl Drop for Output {
             self.handoff.close();
             let _ = parser.join();
         }
+    }
+}
+
+/// Runs the calling thread, which carries a terminal's output to the screen,
+/// at the priority of the work a person waits on.
+pub(crate) fn interactive_thread() {
+    // macOS schedules threads by quality-of-service class; one the program
+    // starts has the default class, below the main thread it feeds, and on a
+    // machine with few cores waits behind it between pseudo-terminal reads.
+    #[cfg(target_vendor = "apple")]
+    // SAFETY: sets only the calling thread's own class; no pointers.
+    unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
     }
 }
 
@@ -366,11 +407,16 @@ fn parse(handoff: &Handoff, sink: &Sink, notify: &Notify) {
             let bound = windowing::idle::thread_idle();
             let mut state = handoff.state.lock();
             if state.bytes.is_empty() && !(state.closed || state.finishing || state.release) {
+                state.parked = true;
                 match bound {
                     Some(bound) => {
                         handoff.arrived.wait_for(&mut state, bound);
                     }
                     None => handoff.arrived.wait(&mut state),
+                }
+                state.parked = false;
+                if let Some(at) = state.signaled.take() {
+                    state.woke(at.elapsed());
                 }
             }
             continue;
@@ -496,7 +542,59 @@ pub(crate) fn pty_size(
 
 #[cfg(test)]
 mod tests {
-    use super::{Queue, names_another_terminal};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use parking_lot::Mutex;
+
+    use super::{Handoff, Notify, Output, Queue, names_another_terminal};
+
+    // An output whose every parse lasts at least `parse` and records the
+    // thread it ran on.
+    fn timed_output(parse: Duration, handoff: Arc<Handoff>) -> (Output, Arc<Mutex<Vec<String>>>) {
+        let threads = Arc::new(Mutex::new(Vec::new()));
+        let seen = threads.clone();
+        let sink = Box::new(move |_: &[u8]| {
+            std::thread::sleep(parse);
+            let name = std::thread::current()
+                .name()
+                .unwrap_or_default()
+                .to_string();
+            seen.lock().push(name);
+        });
+        let notify = Arc::new(Notify::new(Arc::new(|| {})));
+        (Output::new(sink, notify, handoff), threads)
+    }
+
+    #[test]
+    fn output_that_parses_faster_than_the_parser_wakes_stays_on_the_reader() {
+        let handoff = Arc::new(Handoff::default());
+        handoff.state.lock().woke(Duration::from_secs(3600));
+        let (mut output, threads) = timed_output(Duration::from_millis(2), handoff);
+        for _ in 0..3 {
+            assert!(output.deliver(b"x", Duration::ZERO, || true));
+        }
+        output.finish();
+        let reader = std::thread::current()
+            .name()
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(*threads.lock(), vec![reader; 3]);
+    }
+
+    #[test]
+    fn output_that_parses_longer_than_reading_and_waking_goes_to_the_parser() {
+        let handoff = Arc::new(Handoff::default());
+        let (mut output, threads) = timed_output(Duration::from_millis(2), handoff);
+        for _ in 0..2 {
+            assert!(output.deliver(b"x", Duration::ZERO, || true));
+        }
+        output.finish();
+        let threads = threads.lock();
+        assert_eq!(threads.len(), 2);
+        assert_ne!(threads[0], "gui-term-parse");
+        assert_eq!(threads[1], "gui-term-parse");
+    }
 
     #[test]
     fn input_goes_out_directly_only_with_nothing_before_it() {

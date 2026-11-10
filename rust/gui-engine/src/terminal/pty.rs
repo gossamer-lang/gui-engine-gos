@@ -312,6 +312,7 @@ impl Pty {
                 .name("gui-pty-read".into())
                 .stack_size(STACK)
                 .spawn(move || {
+                    super::transport::interactive_thread();
                     let mut buffer = [0; CHUNK];
                     let mut batch = Vec::with_capacity(BATCH + CHUNK);
                     let mut ended = false;

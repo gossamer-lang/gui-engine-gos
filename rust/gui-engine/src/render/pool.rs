@@ -53,6 +53,14 @@ fn pool() -> &'static Pool {
     POOL.get_or_init(Pool::default)
 }
 
+/// The threads the machine runs at once, as the process first found it.
+/// Asking the system reads files on Linux (the cgroup's CPU quota), too
+/// slow to repeat for every frame.
+pub(crate) fn parallelism() -> usize {
+    static PARALLELISM: OnceLock<usize> = OnceLock::new();
+    *PARALLELISM.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+}
+
 /// Runs every task, the first on the calling thread and the others on the
 /// pool's workers, answering their results in order once all have finished.
 /// A panic in a task resumes on the caller after every task has finished.

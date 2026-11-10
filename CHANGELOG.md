@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.10 - Lighter repaints, fewer terminal wakes
+
+- Terminal output that parses faster than its parser thread wakes is parsed on the thread that read it: the parser thread measures how long a wake takes, and a reader hands it output only when parsing takes longer than reading and that wake. On macOS, whose pseudo-terminal hands over about a kilobyte at a time, output no longer wakes the parser for each read.
+- macOS: a terminal's reading and parsing threads run at the user-interactive quality of service.
+- A frame no longer asks the system how many processors it has, which on Linux reads the cgroup's CPU quota from files: the raster pool asks once.
+- A frame and an event share the window's command table instead of copying it.
+- Builds on windowing-gos 0.1.14.
+
 ## 0.2.9 - Quieter when idle, faster when scrolling
 
 - A caret stops blinking and stays lit 10 seconds after the last input or terminal output, and blinks again on the next, so an untouched window asks almost nothing of the system.

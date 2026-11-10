@@ -95,8 +95,7 @@ fn convert(
             .filter(|r| r.width > 0 && r.height > 0)
             .collect();
         let area: i64 = damage.iter().map(|r| r.width * r.height).sum();
-        let workers = std::thread::available_parallelism()
-            .map_or(1, |n| n.get())
+        let workers = super::pool::parallelism()
             .min((area / PIXELS_PER_WORKER) as usize)
             .max(1);
         let rows = (height as usize).div_ceil(workers).max(1);

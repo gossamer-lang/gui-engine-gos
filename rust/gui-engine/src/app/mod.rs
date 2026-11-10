@@ -3941,7 +3941,7 @@ impl Session {
         if self.windows.is_empty() {
             commands::standard_commands()
         } else {
-            self.windows[0].commands.commands.clone()
+            self.windows[0].commands.commands.to_vec()
         }
     }
 
@@ -4722,7 +4722,7 @@ impl Session {
             frames: win.frames,
             causes: win.layout_causes.clone(),
             theme: win.theme.clone(),
-            commands: win.commands.commands.clone(),
+            commands: win.commands.commands.to_vec(),
             scopes: self.focused_scopes(w),
             semantics: tree::semantics(
                 &win.view,

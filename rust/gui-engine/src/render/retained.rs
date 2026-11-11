@@ -6,7 +6,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::{Canvas, Coverage, revision_hasher, swap_red_blue};
+use super::{Canvas, Coverage, Surface, revision_hasher, swap_red_blue};
 use crate::geometry::Rect;
 use crate::style::color::Color;
 
@@ -92,9 +92,14 @@ impl Command {
     }
 
     pub(crate) fn replay(&self, canvas: &mut Canvas, dx: i64, dy: i64) {
+        self.replay_within(canvas, dx, dy, self.clip);
+    }
+
+    /// Like `replay`, but paints only inside `within` (frame coordinates).
+    pub(crate) fn replay_within(&self, canvas: &mut Canvas, dx: i64, dy: i64, within: Rect) {
         let old = canvas.clip;
         let opacity = canvas.opacity;
-        canvas.push_clip(self.clip.offset(dx, dy));
+        canvas.push_clip(self.clip.intersect(within).offset(dx, dy));
         canvas.opacity = self.opacity;
         match &self.paint {
             Primitive::Rect(x, y, w, h, c) => canvas.rect(x + dx, y + dy, *w, *h, *c),
@@ -594,6 +599,12 @@ pub struct Retained {
     /// the thread ends, until another thread reclaims them.
     scratch: Vec<Vec<u8>>,
     pub stats: Stats,
+    /// The window shows rings in their own layers. The scrolling part of a
+    /// ring surface is left transparent so its layers show through, and
+    /// scrolling or changing rows there causes no damage (see [`ring_hole`]).
+    pub rings: bool,
+    /// Whether the kept pixels were painted with rings turned on.
+    rings_painted: bool,
 }
 impl Default for Retained {
     fn default() -> Self {
@@ -616,6 +627,8 @@ impl Retained {
             clock: 0,
             valid: false,
             partial: false,
+            rings: false,
+            rings_painted: false,
             scratch: vec![],
             stats: Stats::default(),
         }
@@ -685,9 +698,16 @@ impl Retained {
             self.tiles.clear();
             self.seen.clear();
         }
+        // Turning rings on or off changes the pixels, so repaint everything.
+        if self.rings != self.rings_painted {
+            self.rings_painted = self.rings;
+            self.valid = false;
+            self.tiles.clear();
+        }
         if !self.valid {
             return vec![screen];
         }
+        let rings = self.rings;
         let prefix = self
             .scene
             .commands
@@ -706,9 +726,11 @@ impl Retained {
         let new = &scene.commands[prefix..scene.commands.len() - suffix];
         // Commands that stay in the same place of the same order paint the
         // same pixels, unless one that differs covers them.
+        // A ring that only scrolled or changed rows in its scrolling part
+        // causes no damage: its own layers show the change.
         if old.len() == new.len() {
             for (a, b) in old.iter().zip(new) {
-                if a == b {
+                if a == b || (rings && ring_unchanged(a, b)) {
                     continue;
                 }
                 if let Some(changed) = rewritten(a, b) {
@@ -721,7 +743,36 @@ impl Retained {
                 add_damage(&mut damage, b.bounds.intersect(screen));
             }
         } else {
-            for c in old.iter().chain(new) {
+            // Collect the ring commands first, so matching them stays cheap
+            // even when the scene has thousands of commands.
+            let (old_rings, new_rings): (Vec<&Command>, Vec<&Command>) = if rings {
+                (
+                    old.iter().filter(|c| ring_hole(c).is_some()).collect(),
+                    new.iter().filter(|c| ring_hole(c).is_some()).collect(),
+                )
+            } else {
+                (vec![], vec![])
+            };
+            let unchanged_ring = |c: &Command, others: &[&Command], old_first: bool| {
+                ring_hole(c).is_some()
+                    && others.iter().any(|o| {
+                        if old_first {
+                            ring_unchanged(c, o)
+                        } else {
+                            ring_unchanged(o, c)
+                        }
+                    })
+            };
+            for c in old {
+                if rings && unchanged_ring(c, &new_rings, true) {
+                    continue;
+                }
+                add_damage(&mut damage, c.bounds.intersect(screen));
+            }
+            for c in new {
+                if rings && unchanged_ring(c, &old_rings, false) {
+                    continue;
+                }
                 add_damage(&mut damage, c.bounds.intersect(screen));
             }
         }
@@ -824,10 +875,11 @@ impl Retained {
                 (band, jobs)
             })
             .collect();
+        let rings = self.rings;
         let raster = |(work, scratch): (&mut [(Band, Vec<Job>)], &mut Vec<u8>)| -> Banded {
             let mut done = Banded::default();
             for (band, jobs) in work {
-                band_raster(band, jobs, tiles, clock, scratch, &mut done);
+                band_raster(band, jobs, tiles, clock, scratch, rings, &mut done);
             }
             done
         };
@@ -971,13 +1023,14 @@ fn band_raster(
     tiles: &[Tile],
     clock: u64,
     scratch: &mut Vec<u8>,
+    rings: bool,
     done: &mut Banded,
 ) {
     let (ro, go, bo) = band.offsets;
     let inside = Rect::new(0, band.y, band.width, band.rows);
     for job in jobs {
         let tile = job.tile;
-        if job.cached.is_none() && copy_surface(band, job, inside, done) {
+        if job.cached.is_none() && copy_surface(band, job, inside, rings, done) {
             continue;
         }
         let keep = job.kept.is_some();
@@ -987,6 +1040,21 @@ fn band_raster(
                 let pixels = job.kept.take().unwrap_or_else(|| std::mem::take(scratch));
                 let mut canvas = Canvas::over(tile.width, tile.height, pixels);
                 for c in &job.commands {
+                    // Leave the ring's scrolling part transparent so its
+                    // layers show through, but still paint anything on top.
+                    // Paint the surface's fixed rows above and below it.
+                    if rings && let Some((hole, surface)) = ring_hole(c) {
+                        let top = hole.y - surface.turn().top;
+                        let bottom = hole.y + hole.height;
+                        let above = Rect::new(hole.x, top, hole.width, hole.y - top);
+                        let below =
+                            Rect::new(hole.x, bottom, hole.width, top + surface.height() - bottom);
+                        for rows in [above, below].into_iter().filter(|r| nonempty(*r)) {
+                            c.replay_within(&mut canvas, -tile.x, -tile.y, rows);
+                        }
+                        clear(&mut canvas, hole.intersect(c.clip).offset(-tile.x, -tile.y));
+                        continue;
+                    }
                     c.replay(&mut canvas, -tile.x, -tile.y);
                 }
                 done.rasterized_pixels += (tile.width * tile.height) as u64;
@@ -1041,8 +1109,9 @@ fn band_raster(
 
 /// Copies a tile's damage straight from an opaque surface on top of all else
 /// that reaches the tile, which then needs no raster of its own. Answers
-/// whether it did.
-fn copy_surface(band: &mut Band, job: &Job, inside: Rect, done: &mut Banded) -> bool {
+/// whether it did. With `rings`, a ring's scrolling part is made transparent
+/// instead of copied.
+fn copy_surface(band: &mut Band, job: &Job, inside: Rect, rings: bool, done: &mut Banded) -> bool {
     let Some(top) = job.commands.last() else {
         return false;
     };
@@ -1053,6 +1122,7 @@ fn copy_surface(band: &mut Band, job: &Job, inside: Rect, done: &mut Banded) -> 
     if !surface.opaque || top.opacity < 255 || shown.intersect(job.tile) != job.tile {
         return false;
     }
+    let hole = ring_hole(top).filter(|_| rings).map(|(hole, _)| hole);
     let rgba = surface.rgba.read();
     let (ro, go, bo) = band.offsets;
     let (sr, sg, sb) = surface.offsets();
@@ -1066,6 +1136,11 @@ fn copy_surface(band: &mut Band, job: &Job, inside: Rect, done: &mut Banded) -> 
             let src = (surface.stored_row(row - y) * surface.width + part.x - x) as usize * 4;
             let dst = (row - band.y) as usize * band.stride + part.x as usize * 4;
             let into = band.pixels[dst..dst + len].as_chunks_mut::<4>().0;
+            // The hole is as wide as the surface, so each row is wholly in or out.
+            if hole.is_some_and(|h| row >= h.y && row < h.y + h.height) {
+                into.fill([0; 4]);
+                continue;
+            }
             let from = rgba[src..src + len].as_chunks::<4>().0;
             if (ro, go, bo) == (sr, sg, sb) {
                 into.copy_from_slice(from);
@@ -1097,6 +1172,63 @@ fn rewritten(a: &Command, b: &Command) -> Option<Vec<Rect>> {
     }
     let changed = now.changed_since(was)?;
     Some(changed.iter().map(|r| r.offset(*x, *y)).collect())
+}
+
+// Smallest scrolling area, in pixels, that gets its own ring layers. This is
+// a guard against giving tiny surfaces layers, not a measured break-even;
+// today only a terminal's text is drawn this way.
+const RING_AREA: i64 = 256 * 256;
+
+/// If `c` draws a ring, returns the window area its scrolling rows cover, and
+/// the surface. A ring is an opaque surface with scrolling rows, drawn whole
+/// and at full opacity. Its fixed rows above and below are painted as usual.
+pub(crate) fn ring_hole(c: &Command) -> Option<(Rect, &Surface)> {
+    let Primitive::Surface(x, y, surface) = &c.paint else {
+        return None;
+    };
+    let turn = surface.turn();
+    let shown = Rect::new(*x, *y, surface.width(), surface.height());
+    let whole = c.clip.intersect(shown) == shown;
+    let hole = Rect::new(*x, *y + turn.top, surface.width(), turn.len);
+    (surface.is_opaque()
+        && c.opacity >= 255
+        && whole
+        && turn.len > 0
+        && turn.top >= 0
+        && turn.top + turn.len <= surface.height()
+        && hole.width * hole.height >= RING_AREA)
+        .then_some((hole, surface))
+}
+
+/// Whether replacing ring `a` with ring `b` leaves the window's surface
+/// unchanged: the hole is in the same place, and `b` changed only rows in its
+/// scrolling part, which the ring's layers show.
+fn ring_unchanged(a: &Command, b: &Command) -> bool {
+    let (Some((was, old)), Some((hole, new))) = (ring_hole(a), ring_hole(b)) else {
+        return false;
+    };
+    let turn = new.turn();
+    let stretch = Rect::new(0, turn.top, new.width(), turn.len);
+    was == hole
+        && a.bounds == b.bounds
+        && a.clip == b.clip
+        && old.storage() == new.storage()
+        && new.identity().1 == old.identity().0
+        && new
+            .written()
+            .is_some_and(|rows| rows.iter().all(|r| stretch.intersect(*r) == *r))
+}
+
+/// Makes `rect` of `canvas` transparent.
+fn clear(canvas: &mut Canvas, rect: Rect) {
+    let r = rect.intersect(Rect::new(0, 0, canvas.width, canvas.height));
+    if !nonempty(r) {
+        return;
+    }
+    for row in r.y..r.y + r.height {
+        let at = ((row * canvas.width + r.x) * 4) as usize;
+        canvas.pixels[at..at + (r.width * 4) as usize].fill(0);
+    }
 }
 
 fn add_damage(regions: &mut Vec<Rect>, mut rect: Rect) {
@@ -1162,6 +1294,76 @@ mod tests {
         let mut c = Canvas::recording(width, height, 1024 * 1024);
         picture(&mut c, revision);
         c.take_scene().unwrap()
+    }
+    fn pixel(c: &Canvas, x: i64, y: i64) -> [u8; 4] {
+        let at = ((y * c.width + x) * 4) as usize;
+        [
+            c.pixels[at],
+            c.pixels[at + 1],
+            c.pixels[at + 2],
+            c.pixels[at + 3],
+        ]
+    }
+    #[test]
+    fn a_ring_turn_damages_nothing_and_its_stretch_stays_clear_under_what_paints_above() {
+        use crate::render::Turn;
+        let (width, height, line) = (300, 260, 20);
+        let turn = Turn {
+            top: 10,
+            len: 240,
+            shift: 0,
+        };
+        let mut surface = Surface::default();
+        surface.rewrite(width, height, true, turn, None, |c, _| {
+            c.fill(Color::rgb(1, 2, 3))
+        });
+        surface.set_written(None);
+        let scene = |s: &Surface| {
+            let mut c = Canvas::recording(400, 300, 1024 * 1024);
+            c.fill(Color::rgb(200, 200, 200));
+            c.surface(50, 20, s);
+            c.rect(60, 100, 10, 10, Color::rgb(255, 0, 0));
+            c.take_scene().unwrap()
+        };
+        let mut r = Retained::new();
+        r.rings = true;
+        let mut frame = Canvas::new(400, 300);
+        assert_eq!(
+            show(&mut r, &mut frame, scene(&surface)),
+            vec![Rect::new(0, 0, 400, 300)]
+        );
+        // The scrolling rows are transparent, except where something is
+        // drawn on top. Fixed rows and everything else paint as usual.
+        assert_eq!(pixel(&frame, 55, 40), [0, 0, 0, 0]);
+        assert_eq!(pixel(&frame, 62, 102), [255, 0, 0, 255]);
+        assert_eq!(pixel(&frame, 55, 25)[3], 255);
+        assert_eq!(pixel(&frame, 10, 10), [200, 200, 200, 255]);
+        // Scrolling and writing a scrolling row causes no damage.
+        let turned = Turn {
+            shift: line,
+            ..turn
+        };
+        surface.rewrite(width, height, true, turned, None, |c, _| {
+            c.rect(0, 10, width, line, Color::rgb(9, 9, 9))
+        });
+        surface.set_written(Some(vec![Rect::new(0, 10, width, line)]));
+        let damage = show(&mut r, &mut frame, scene(&surface));
+        assert!(damage.is_empty(), "{damage:?}");
+        assert_eq!(pixel(&frame, 55, 40), [0, 0, 0, 0]);
+        // Writing a fixed row does cause damage.
+        surface.rewrite(width, height, true, turned, None, |c, _| {
+            c.rect(0, 0, width, 10, Color::rgb(9, 9, 9))
+        });
+        surface.set_written(Some(vec![Rect::new(0, 0, width, 10)]));
+        assert!(!show(&mut r, &mut frame, scene(&surface)).is_empty());
+        // With rings off, everything is painted into the frame again.
+        r.rings = false;
+        assert_eq!(
+            show(&mut r, &mut frame, scene(&surface)),
+            vec![Rect::new(0, 0, 400, 300)]
+        );
+        assert_eq!(pixel(&frame, 55, 40)[3], 255);
+        assert_eq!(pixel(&frame, 62, 102), [255, 0, 0, 255]);
     }
     #[test]
     fn incremental_pixels_match_immediate_paint_after_moves_removals_and_resize() {

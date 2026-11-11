@@ -184,6 +184,13 @@ impl WindowState {
     fn output_interval(&self) -> i64 {
         self.output_frame_ms.max(2 * self.output_paint_ms)
     }
+
+    // Whether the window showed terminal output less than one frame interval
+    // ago. If so, more output waits for the next frame.
+    fn output_recent(&self, now: i64) -> bool {
+        self.output_presented
+            .is_some_and(|at| now - at < self.output_interval())
+    }
 }
 
 /// A pending timer.
@@ -1454,15 +1461,19 @@ impl Session {
                 self.run_job(&services::jobs::Job::SyntaxLines(request));
             }
             self.drain_inbox();
-            // A window that waits to paint output paints all there is when its
-            // frame is due, so output meanwhile need not wake the loop.
+            // Keep terminal wakes off while a window will show new output at
+            // its next frame anyway: when it showed output less than a frame
+            // ago, or when output is waiting now and this pass will show it.
+            // While output streams, the loop then wakes once per frame instead
+            // of once per write. A paste needs every wake, so it is never held.
             let now = self.now();
+            let waiting = paced && crate::terminal::output_waiting(&self.budget);
             let held = paced
-                && self.windows.iter().any(|w| {
-                    w.output_dirty
-                        && w.output_presented
-                            .is_some_and(|at| now - at < w.output_interval())
-                });
+                && !crate::terminal::any_pasting(&self.budget)
+                && self
+                    .windows
+                    .iter()
+                    .any(|w| w.output_recent(now) || (waiting && w.output_presented.is_some()));
             held_any |= held;
             let (terminals_changed, terminal_events) = crate::terminal::pump(&self.budget, held);
             if terminals_changed {
@@ -1539,7 +1550,13 @@ impl Session {
         for request in crate::text::document_syntax::take_requests() {
             self.run_job(&services::jobs::Job::SyntaxLines(request));
         }
-        Ok(held_any && !self.windows.iter().any(|w| w.output_dirty))
+        // Wakes kept off for an upcoming frame are turned back on at that frame.
+        let now = self.now();
+        Ok(held_any
+            && !self
+                .windows
+                .iter()
+                .any(|w| w.output_dirty || w.output_recent(now)))
     }
 
     // The next event, waiting no longer than the next timer. Runs of
@@ -1629,11 +1646,14 @@ impl Session {
                 .any(|w| w.key == timer.window && w.occluded)
     }
 
-    // When the earliest window holding unpainted terminal output may paint it.
+    // When the next window should paint terminal output: either output it has
+    // not shown yet, or, after a recent output frame, any output that arrived
+    // while its terminals' wakes were off.
     fn output_due(&self) -> Option<i64> {
+        let now = self.now();
         self.windows
             .iter()
-            .filter(|w| w.output_dirty)
+            .filter(|w| w.output_dirty || w.output_recent(now))
             .map(|w| {
                 w.output_presented
                     .map_or(self.now(), |at| at + w.output_interval())
@@ -7551,11 +7571,18 @@ mod dialog_scope_tests {
             s.step().unwrap();
             assert!(s.windows[0].output_dirty);
             assert!(crate::terminal::output_wake_taken(id));
-            // A repaint for another reason paints the waiting frame. The loop
-            // would then wait with no frame due, so the wake must be taken back.
+            // A repaint for another reason shows the waiting output. The wake
+            // stays off, but a frame is scheduled, and at that frame the wake
+            // is turned back on.
             s.windows[0].dirty = true;
             s.settle_paced(true).unwrap();
             assert!(!s.windows[0].output_dirty);
+            assert!(crate::terminal::output_wake_taken(id));
+            let due = s
+                .output_due()
+                .expect("a frame is due to take the wake back");
+            s.clock_held = Some(due);
+            s.settle_paced(true).unwrap();
             assert!(!crate::terminal::output_wake_taken(id));
             crate::terminal::close(id);
             s.shutdown();

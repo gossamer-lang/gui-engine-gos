@@ -268,17 +268,34 @@ impl Filter {
     /// Whether `pass` hands `input` on as it is: from the ground state, each
     /// ESC in it comes before a byte that begins no string and no new escape.
     fn passes_whole(&self, input: &[u8]) -> bool {
+        const ONES: u64 = u64::from_le_bytes([1; 8]);
+        const HIGHS: u64 = u64::from_le_bytes([0x80; 8]);
         if self.state != FilterState::Ground {
             return false;
         }
-        let mut from = 0;
-        while let Some(at) = next_escape(input, from) {
-            match input.get(at + 1) {
-                Some(b']' | b'P' | b'_' | b'X' | b'^' | 0x1b) | None => return false,
-                Some(_) => from = at + 2,
+        // An ESC holds the input back when a string, another ESC or the end
+        // of the input follows it.
+        let holds = |at: usize| {
+            input[at] == 0x1b
+                && matches!(
+                    input.get(at + 1),
+                    Some(b']' | b'P' | b'_' | b'X' | b'^' | 0x1b) | None
+                )
+        };
+        // Every ESC of a word is checked in one pass over the input. A borrow
+        // can flag bytes above an ESC that are not one, which `holds` skips.
+        let (words, _) = input.as_chunks::<8>();
+        for (n, word) in words.iter().enumerate() {
+            let x = u64::from_le_bytes(*word) ^ (ONES * 0x1b);
+            let mut escapes = x.wrapping_sub(ONES) & !x & HIGHS;
+            while escapes != 0 {
+                if holds(n * 8 + escapes.trailing_zeros() as usize / 8) {
+                    return false;
+                }
+                escapes &= escapes - 1;
             }
         }
-        true
+        !(words.len() * 8..input.len()).any(holds)
     }
 
     /// The bytes of `input` the parser may see, in order: OSC, DCS and APC

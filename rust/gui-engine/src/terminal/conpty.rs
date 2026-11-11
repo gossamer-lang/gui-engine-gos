@@ -144,7 +144,7 @@ impl Pty {
         let input = Arc::new(Queue::new(INPUT));
         let ending = Arc::new(Ending::default());
         let closing = Arc::new(AtomicBool::new(false));
-        let handoff = Arc::new(Handoff::default());
+        let handoff = Arc::new(Handoff::new());
         let mut pty = Self {
             master: Some(pair.master),
             process,
@@ -163,7 +163,7 @@ impl Pty {
         let end = ending.clone();
         let stop = closing.clone();
         let wake = notify.clone();
-        let mut output = Output::new(sink, notify.clone(), handoff);
+        let mut output = Output::new(sink, notify.clone(), handoff)?;
         pty.reader = Some(
             thread::Builder::new()
                 .name("gui-conpty-read".into())
@@ -171,16 +171,22 @@ impl Pty {
                 .spawn(move || {
                     let mut buffer = vec![0; BATCH];
                     loop {
-                        let waiting = std::time::Instant::now();
                         match reader.read(&mut buffer) {
                             Ok(0) => break,
                             // Closing flushes output synchronously; it is read
                             // and discarded so the close can finish.
                             Ok(_) if stop.load(Ordering::Acquire) => (),
-                            // A read that fills the buffer left output behind it.
+                            // A full buffer means more output is waiting;
+                            // otherwise the next read will block.
                             Ok(n) => {
-                                output
-                                    .deliver(&buffer[..n], waiting.elapsed(), || n == buffer.len());
+                                output.push(&buffer[..n]);
+                                if n == buffer.len() {
+                                    output.wake();
+                                } else {
+                                    output.idle();
+                                    // The next read waits for output.
+                                    output.rested();
+                                }
                             }
                             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => (),
                             Err(_) => break,
@@ -259,6 +265,12 @@ impl Pty {
         super::transport::drain(&self.ending, &self.notify)
     }
 
+    /// The program's state, like `drain`, but leaves the wake off: more
+    /// output does not wake the owner until the next `drain`.
+    pub fn peek(&self) -> Drain {
+        super::transport::peek(&self.ending)
+    }
+
     /// The input bytes a write could queue now.
     pub fn input_room(&self) -> usize {
         self.input.room()
@@ -269,8 +281,9 @@ impl Pty {
         self.input.want_room();
     }
 
-    /// The reader waits in a pipe read nothing wakes, so it hands back memory
-    /// freed for it once output next arrives; the parser thread does now.
+    /// Asks the parser thread to return memory that other threads freed for
+    /// it, such as rows dropped when history is compacted. The parser
+    /// allocated those rows, so it is the thread that must return them.
     pub fn release_memory(&self) {
         self.handoff.release();
     }

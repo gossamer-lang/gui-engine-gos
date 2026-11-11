@@ -3,13 +3,13 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
 
 pub(crate) const STACK: usize = 256 * 1024;
 pub(crate) const CHUNK: usize = 8192;
-/// The most output one pass of a reader collects before queueing it.
+/// The most output that can wait for the parser. When this much is waiting,
+/// the reader stops reading until the parser catches up.
 pub(crate) const BATCH: usize = 64 * 1024;
 pub(crate) const INPUT: usize = 64 * 1024;
 pub(crate) const CHUNK_LIMIT: usize = 64;
@@ -183,6 +183,11 @@ impl Notify {
 /// How the program stands; rearms the owner's wake.
 pub(crate) fn drain(ending: &Ending, notify: &Notify) -> Drain {
     notify.pending.store(false, Ordering::Release);
+    peek(ending)
+}
+
+/// The program's state, leaving the owner's wake off.
+pub(crate) fn peek(ending: &Ending) -> Drain {
     let state = ending.state.lock();
     Drain {
         eof: state.0,
@@ -190,17 +195,14 @@ pub(crate) fn drain(ending: &Ending, notify: &Notify) -> Drain {
     }
 }
 
-/// Where a transport hands the output it reads, on its reader's thread or
-/// its parser's, so output is parsed while the session's thread paints.
+/// Receives the terminal's output, on the parser thread.
 pub(crate) type Sink = Box<dyn Fn(&[u8]) + Send + Sync>;
 
-/// Output read while the parser thread still parses what came before it.
-#[derive(Default)]
+/// Output read and not yet taken by the parser.
 struct Backlog {
+    /// At most `BATCH` bytes. The capacity is reserved up front, so reading
+    /// never allocates.
     bytes: Vec<u8>,
-    /// The parser holds output it has not finished, so later output goes
-    /// behind it rather than to the reader's own parse.
-    busy: bool,
     /// The parser takes the backlog that is left, then ends.
     finishing: bool,
     /// The transport closes; output not yet parsed is dropped.
@@ -209,27 +211,9 @@ struct Backlog {
     release: bool,
     /// The parser waits for output.
     parked: bool,
-    /// When the reader handed output to the waiting parser.
-    signaled: Option<Instant>,
-    /// How long the waiting parser takes to start on output handed to it,
-    /// smoothed; zero until the first wake is measured.
-    wake: Duration,
-}
-
-impl Backlog {
-    // Smooths the wake latency as TCP smooths its round-trip time, an eighth
-    // of each new sample, so one slow wake does not decide a handoff alone.
-    fn woke(&mut self, latency: Duration) {
-        self.wake = if self.wake.is_zero() {
-            latency
-        } else {
-            self.wake - self.wake / 8 + latency / 8
-        };
-    }
 }
 
 /// The state a transport's reader and its parser thread share.
-#[derive(Default)]
 pub(crate) struct Handoff {
     state: Mutex<Backlog>,
     arrived: Condvar,
@@ -237,6 +221,20 @@ pub(crate) struct Handoff {
 }
 
 impl Handoff {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Mutex::new(Backlog {
+                bytes: Vec::with_capacity(BATCH),
+                finishing: false,
+                closed: false,
+                release: false,
+                parked: false,
+            }),
+            arrived: Condvar::new(),
+            room: Condvar::new(),
+        }
+    }
+
     /// Drops the backlog and ends the parser; a reader waiting for room
     /// stops waiting.
     pub(crate) fn close(&self) {
@@ -254,100 +252,122 @@ impl Handoff {
     }
 }
 
-/// A reader's way to the sink. Output that comes after a pause is parsed on
-/// the reader, which keeps a reply to typing one thread away. Once output is
-/// waiting by the time the reader has parsed the last of it, the stream goes
-/// to a parser thread, so the reader goes straight back to reading: a
-/// pseudo-terminal holds little (a kilobyte on macOS), and the program
-/// writing to it waits while the reader parses. The stream stays with the
-/// parser until output pauses for longer than waking the parser takes.
+/// Passes output from the reader thread to the parser thread. While output
+/// streams, the reader only reads and copies. A pseudo-terminal holds very
+/// little (a kilobyte on macOS), and the program writing to it is stalled
+/// until the reader reads again, so the reader must get back to `read`
+/// quickly. The parser takes everything waiting at once, so the cost of
+/// waking it and starting a parse is paid once per burst, not once per read.
 pub(crate) struct Output {
-    sink: Arc<Sink>,
-    notify: Arc<Notify>,
     handoff: Arc<Handoff>,
     parser: Option<std::thread::JoinHandle<()>>,
-    /// Output goes to the parser thread.
-    streaming: bool,
+    sink: Arc<Sink>,
+    notify: Arc<Notify>,
+    /// Reads pushed since output was last handed over.
+    reads: usize,
+    /// Whether the reader had to wait for output since it last handed
+    /// output over.
+    rested: bool,
+    /// A buffer for output the reader parses itself. It is swapped with the
+    /// backlog, so both keep their capacity and reading never allocates.
+    taken: Vec<u8>,
 }
 
 impl Output {
-    pub(crate) fn new(sink: Sink, notify: Arc<Notify>, handoff: Arc<Handoff>) -> Self {
-        Self {
-            sink: Arc::new(sink),
-            notify,
-            handoff,
-            parser: None,
-            streaming: false,
-        }
-    }
-
-    /// Parses `bytes`, which the reader waited `waited` for, here or on the
-    /// parser thread, in the order read; `arriving` answers, after a parse
-    /// here, whether more output waits. While the parser is behind by a
-    /// batch the reader waits for it, so a slow parse still holds the program
-    /// back. False once the transport closed.
-    pub(crate) fn deliver(
-        &mut self,
-        bytes: &[u8],
-        waited: Duration,
-        arriving: impl FnOnce() -> bool,
-    ) -> bool {
-        let mut state = self.handoff.state.lock();
-        if state.closed {
-            return false;
-        }
-        // Output that came sooner than the idle parser could have woken for
-        // it is the same stream going on; until a wake is measured, so is
-        // all output.
-        if self.streaming && !state.busy && !state.wake.is_zero() && waited > state.wake {
-            self.streaming = false;
-        }
-        if !state.busy && !self.streaming {
-            drop(state);
-            (self.sink)(bytes);
-            self.notify.fire();
-            self.streaming = arriving();
-            return true;
-        }
-        if self.parser.is_none() {
-            match self.spawn_parser() {
-                Some(parser) => self.parser = Some(parser),
-                None => {
-                    // Without a parser thread the reader parses output itself.
-                    drop(state);
-                    (self.sink)(bytes);
-                    self.notify.fire();
-                    return true;
-                }
-            }
-        }
-        while !state.closed && !state.bytes.is_empty() && state.bytes.len() + bytes.len() > BATCH {
-            self.handoff.room.wait(&mut state);
-        }
-        if state.closed {
-            return false;
-        }
-        state.bytes.extend_from_slice(bytes);
-        state.busy = true;
-        if state.parked && state.signaled.is_none() {
-            state.signaled = Some(Instant::now());
-        }
-        self.handoff.arrived.notify_one();
-        true
-    }
-
-    fn spawn_parser(&self) -> Option<std::thread::JoinHandle<()>> {
-        let sink = self.sink.clone();
-        let notify = self.notify.clone();
-        let handoff = self.handoff.clone();
-        std::thread::Builder::new()
+    /// Starts the parser thread, which passes output to `sink` and calls
+    /// `notify` after each batch.
+    pub(crate) fn new(
+        sink: Sink,
+        notify: Arc<Notify>,
+        handoff: Arc<Handoff>,
+    ) -> Result<Self, String> {
+        let sink = Arc::new(sink);
+        let (shared, parse_sink, parse_notify) = (handoff.clone(), sink.clone(), notify.clone());
+        let parser = std::thread::Builder::new()
             .name("gui-term-parse".into())
             .stack_size(STACK)
             .spawn(move || {
                 interactive_thread();
-                parse(&handoff, &sink, &notify)
+                parse(&shared, &parse_sink, &parse_notify)
             })
-            .ok()
+            .map_err(|e| e.to_string())?;
+        Ok(Self {
+            handoff,
+            parser: Some(parser),
+            sink,
+            notify,
+            reads: 0,
+            rested: true,
+            taken: Vec::with_capacity(BATCH),
+        })
+    }
+
+    /// Queues `bytes` for the parser without waking it; `idle` or `wake`
+    /// does that. If `BATCH` bytes are already waiting, wakes the parser and
+    /// waits until it makes room, so a slow parser slows the program down.
+    /// Returns false once the transport is closed.
+    pub(crate) fn push(&mut self, mut bytes: &[u8]) -> bool {
+        let mut state = self.handoff.state.lock();
+        loop {
+            if state.closed {
+                return false;
+            }
+            let room = (BATCH - state.bytes.len()).min(bytes.len());
+            state.bytes.extend_from_slice(&bytes[..room]);
+            bytes = &bytes[room..];
+            if bytes.is_empty() {
+                self.reads += 1;
+                return true;
+            }
+            self.handoff.arrived.notify_one();
+            self.handoff.room.wait(&mut state);
+        }
+    }
+
+    /// Wakes the parser for the output pushed since the last wake.
+    // Only the Windows reader uses this: its reads block, so it hands output
+    // over while more may be waiting. The Unix reader uses `idle`.
+    #[cfg(any(windows, test))]
+    pub(crate) fn wake(&mut self) {
+        // The parser checks for output and starts waiting while holding the
+        // backlog's lock, which every push also took, so no wake is lost.
+        if std::mem::take(&mut self.reads) > 0 {
+            self.handoff.arrived.notify_one();
+        }
+    }
+
+    /// Records that the reader had to wait for this output.
+    pub(crate) fn rested(&mut self) {
+        self.rested = true;
+    }
+
+    /// Called when the reader has nothing more to read. Usually wakes the
+    /// parser for the queued output. One case is parsed here instead: a
+    /// single read after a wait (such as the echo of a keystroke) while the
+    /// parser is idle. Parsing it here skips waking the parser, so it reaches
+    /// the screen sooner. Returns true if it parsed here; the reader then
+    /// reads once more before waiting, and anything that arrived meanwhile
+    /// is treated as a stream and goes to the parser.
+    pub(crate) fn idle(&mut self) -> bool {
+        let reads = std::mem::take(&mut self.reads);
+        let rested = std::mem::replace(&mut self.rested, false);
+        if reads == 0 {
+            return false;
+        }
+        let mut state = self.handoff.state.lock();
+        if !(rested && reads == 1 && state.parked) || state.bytes.is_empty() {
+            drop(state);
+            self.handoff.arrived.notify_one();
+            return false;
+        }
+        // The parser is idle with all earlier output parsed, and only this
+        // reader adds output, so parsing here keeps the output in order.
+        std::mem::swap(&mut self.taken, &mut state.bytes);
+        drop(state);
+        (self.sink)(&self.taken);
+        self.notify.fire();
+        self.taken.clear();
+        true
     }
 
     /// Parses the output handed off and not yet parsed, then ends the parser.
@@ -395,10 +415,7 @@ fn parse(handoff: &Handoff, sink: &Sink, notify: &Notify) {
             return;
         }
         if state.bytes.is_empty() {
-            // Nothing is left to parse: the reader parses what comes next
-            // itself, and the stream's buffers go back.
-            state.busy = false;
-            state.bytes = Vec::new();
+            // Nothing left to parse: free the parse buffer before waiting.
             taken = Vec::new();
             if state.finishing {
                 return;
@@ -416,13 +433,11 @@ fn parse(handoff: &Handoff, sink: &Sink, notify: &Notify) {
                     None => handoff.arrived.wait(&mut state),
                 }
                 state.parked = false;
-                if let Some(at) = state.signaled.take() {
-                    state.woke(at.elapsed());
-                }
             }
             continue;
         }
-        std::mem::swap(&mut taken, &mut state.bytes);
+        taken.extend_from_slice(&state.bytes);
+        state.bytes.clear();
         handoff.room.notify_one();
         drop(state);
         sink(&taken);
@@ -543,84 +558,209 @@ pub(crate) fn pty_size(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    use std::time::Duration;
+    use std::sync::{Arc, mpsc};
 
     use parking_lot::Mutex;
 
-    use super::{Handoff, Notify, Output, Queue, names_another_terminal};
+    use super::{BATCH, Handoff, Notify, Output, Queue, Sink, names_another_terminal};
 
-    // An output whose every parse lasts at least `parse` and records the
-    // thread it ran on.
-    fn timed_output(parse: Duration, handoff: Arc<Handoff>) -> (Output, Arc<Mutex<Vec<String>>>) {
-        let threads = Arc::new(Mutex::new(Vec::new()));
-        let seen = threads.clone();
-        let sink = Box::new(move |_: &[u8]| {
-            std::thread::sleep(parse);
+    fn output(sink: Sink) -> (Output, Arc<Handoff>) {
+        let handoff = Arc::new(Handoff::new());
+        let notify = Arc::new(Notify::new(Arc::new(|| {})));
+        (Output::new(sink, notify, handoff.clone()).unwrap(), handoff)
+    }
+
+    impl super::Backlog {
+        // The parser waits, with all output parsed.
+        fn waits_empty(&self) -> bool {
+            self.parked && self.bytes.is_empty()
+        }
+    }
+
+    // A sink that records each batch it parses and the thread it ran on.
+    type Parsed = Arc<Mutex<Vec<(Vec<u8>, String)>>>;
+
+    fn recording() -> (Sink, Parsed) {
+        let batches = Arc::new(Mutex::new(Vec::new()));
+        let seen = batches.clone();
+        let sink = Box::new(move |bytes: &[u8]| {
             let name = std::thread::current()
                 .name()
                 .unwrap_or_default()
                 .to_string();
-            seen.lock().push(name);
+            seen.lock().push((bytes.to_vec(), name));
         });
-        let notify = Arc::new(Notify::new(Arc::new(|| {})));
-        (Output::new(sink, notify, handoff), threads)
+        (sink, batches)
     }
 
-    fn reader_name() -> String {
-        std::thread::current()
+    // A sink whose first parse tells `entered` it began, then waits for
+    // `open` before it records anything.
+    struct Gate {
+        entered: mpsc::Receiver<()>,
+        open: mpsc::Sender<()>,
+        batches: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
+    fn gated() -> (Sink, Gate) {
+        let (enter, entered) = mpsc::channel();
+        let (open, gate) = mpsc::channel::<()>();
+        let gate = Mutex::new(Some((enter, gate)));
+        let batches = Arc::new(Mutex::new(Vec::new()));
+        let seen = batches.clone();
+        let sink = Box::new(move |bytes: &[u8]| {
+            if let Some((enter, gate)) = gate.lock().take() {
+                let _ = enter.send(());
+                let _ = gate.recv();
+            }
+            seen.lock().push(bytes.to_vec());
+        });
+        (
+            sink,
+            Gate {
+                entered,
+                open,
+                batches,
+            },
+        )
+    }
+
+    #[test]
+    fn output_is_parsed_whole_and_in_order_on_the_parser_thread() {
+        let (sink, batches) = recording();
+        let (mut output, _) = output(sink);
+        let mut sent = Vec::new();
+        for n in 0..200u32 {
+            let chunk = n.to_string().into_bytes();
+            assert!(output.push(&chunk));
+            if n % 7 == 0 {
+                output.wake();
+            }
+            sent.extend_from_slice(&chunk);
+        }
+        output.finish();
+        let batches = batches.lock();
+        let parsed: Vec<u8> = batches
+            .iter()
+            .flat_map(|(bytes, _)| bytes.clone())
+            .collect();
+        assert_eq!(parsed, sent);
+        assert!(batches.iter().all(|(_, name)| name == "gui-term-parse"));
+    }
+
+    #[test]
+    fn output_before_a_pause_is_parsed_on_the_reader_while_the_parser_waits() {
+        let (sink, batches) = recording();
+        let (mut output, handoff) = output(sink);
+        for chunk in [b"ab", b"cd"] {
+            // The parser parks once it finds nothing to parse.
+            while !handoff.state.lock().waits_empty() {
+                std::thread::yield_now();
+            }
+            assert!(output.push(chunk));
+            assert!(output.idle());
+            assert!(!output.idle());
+            output.rested();
+        }
+        output.finish();
+        let reader = std::thread::current()
             .name()
             .unwrap_or_default()
-            .to_string()
+            .to_string();
+        assert_eq!(
+            *batches.lock(),
+            vec![(b"ab".to_vec(), reader.clone()), (b"cd".to_vec(), reader)]
+        );
     }
 
     #[test]
-    fn output_after_pauses_longer_than_the_parser_wakes_stays_on_the_reader() {
-        let handoff = Arc::new(Handoff::default());
-        handoff.state.lock().woke(Duration::from_micros(1));
-        let (mut output, threads) = timed_output(Duration::from_millis(2), handoff);
-        for _ in 0..3 {
-            assert!(output.deliver(b"x", Duration::from_millis(50), || true));
+    fn output_after_a_parse_on_the_reader_or_of_several_reads_goes_to_the_parser() {
+        let (sink, batches) = recording();
+        let (mut output, handoff) = output(sink);
+        let parked = || {
+            while !handoff.state.lock().waits_empty() {
+                std::thread::yield_now();
+            }
+        };
+        parked();
+        assert!(output.push(b"a"));
+        assert!(output.idle());
+        // Output came while the reader parsed: the stream goes on.
+        assert!(output.push(b"b"));
+        assert!(!output.idle());
+        output.rested();
+        parked();
+        for chunk in [b"c", b"d"] {
+            assert!(output.push(chunk));
         }
+        assert!(!output.idle());
         output.finish();
-        assert_eq!(*threads.lock(), vec![reader_name(); 3]);
+        let reader = std::thread::current()
+            .name()
+            .unwrap_or_default()
+            .to_string();
+        let parser = "gui-term-parse".to_string();
+        assert_eq!(
+            *batches.lock(),
+            vec![
+                (b"a".to_vec(), reader),
+                (b"b".to_vec(), parser.clone()),
+                (b"cd".to_vec(), parser)
+            ]
+        );
     }
 
     #[test]
-    fn output_waiting_after_a_parse_on_the_reader_goes_to_the_parser() {
-        let handoff = Arc::new(Handoff::default());
-        let (mut output, threads) = timed_output(Duration::from_millis(2), handoff);
-        for _ in 0..2 {
-            assert!(output.deliver(b"x", Duration::ZERO, || true));
+    fn output_read_during_a_parse_is_taken_in_one_batch() {
+        let (sink, gate) = gated();
+        let (mut output, _) = output(sink);
+        assert!(output.push(b"a"));
+        output.wake();
+        gate.entered.recv().unwrap();
+        // The parser is busy, so output at a pause still goes to it.
+        for chunk in [b"b", b"c", b"d"] {
+            assert!(output.push(chunk));
+            output.idle();
         }
+        gate.open.send(()).unwrap();
         output.finish();
-        let threads = threads.lock();
-        assert_eq!(threads.len(), 2);
-        assert_ne!(threads[0], "gui-term-parse");
-        assert_eq!(threads[1], "gui-term-parse");
+        assert_eq!(*gate.batches.lock(), vec![b"a".to_vec(), b"bcd".to_vec()]);
     }
 
     #[test]
-    fn a_stream_stays_with_the_parser_after_it_catches_up() {
-        let handoff = Arc::new(Handoff::default());
-        handoff.state.lock().woke(Duration::from_secs(3600));
-        let (parsed, done) = std::sync::mpsc::channel();
-        let sink = Box::new(move |_: &[u8]| {
-            let name = std::thread::current()
-                .name()
-                .unwrap_or_default()
-                .to_string();
-            let _ = parsed.send(name);
-        });
-        let notify = Arc::new(Notify::new(Arc::new(|| {})));
-        let mut output = Output::new(sink, notify, handoff);
-        assert!(output.deliver(b"x", Duration::ZERO, || true));
-        assert_eq!(done.recv().ok(), Some(reader_name()));
-        for _ in 0..3 {
-            assert!(output.deliver(b"x", Duration::ZERO, || false));
-            assert_eq!(done.recv().ok().as_deref(), Some("gui-term-parse"));
-        }
+    fn a_parser_behind_holds_the_reader_to_a_batch() {
+        let (sink, gate) = gated();
+        let (mut output, _) = output(sink);
+        let sent: Vec<u8> = (0..3 * BATCH + 5).map(|n| n as u8).collect();
+        assert!(output.push(&sent[..1]));
+        output.wake();
+        gate.entered.recv().unwrap();
+        let reader = {
+            let sent = sent.clone();
+            std::thread::spawn(move || (output.push(&sent[1..]), output))
+        };
+        gate.open.send(()).unwrap();
+        let (pushed, output) = reader.join().unwrap();
+        assert!(pushed);
         output.finish();
+        let batches = gate.batches.lock();
+        assert!(batches.iter().all(|batch| batch.len() <= BATCH));
+        assert_eq!(batches.concat(), sent);
+    }
+
+    #[test]
+    fn closing_releases_a_reader_waiting_for_room() {
+        let (sink, gate) = gated();
+        let (mut output, handoff) = output(sink);
+        assert!(output.push(b"a"));
+        output.wake();
+        gate.entered.recv().unwrap();
+        let reader = std::thread::spawn(move || (output.push(&vec![0; 2 * BATCH]), output));
+        handoff.close();
+        let (pushed, mut output) = reader.join().unwrap();
+        assert!(!pushed);
+        assert!(!output.push(b"b"));
+        gate.open.send(()).unwrap();
+        drop(output);
     }
 
     #[test]

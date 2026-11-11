@@ -122,6 +122,12 @@ pub struct Surface {
     /// take them, so a frame copies them unchanged.
     swapped: bool,
     rgba: Arc<parking_lot::RwLock<Vec<u8>>>,
+    /// The last rewrite kept the previous pixels (same size), so the rows it
+    /// changed can be listed.
+    kept: bool,
+    /// The stored rows the last rewrite changed, in stored coordinates (not
+    /// affected by the turn). `None` means any row may have changed.
+    written: Option<Arc<[Rect]>>,
 }
 
 impl Surface {
@@ -164,6 +170,38 @@ impl Surface {
         if self.swapped { (2, 1, 0) } else { (0, 1, 2) }
     }
 
+    /// Records which stored rows the last rewrite changed. Ignored (left as
+    /// `None`) if that rewrite started from blank pixels.
+    pub fn set_written(&mut self, rects: Option<Vec<Rect>>) {
+        self.written = rects.filter(|_| self.kept).map(Into::into);
+    }
+
+    /// The id of this content, and the id of the content before it.
+    pub(crate) fn identity(&self) -> (u64, u64) {
+        (self.id, self.previous)
+    }
+
+    /// An id for the pixel storage, which stays the same across rewrites.
+    pub(crate) fn storage(&self) -> u64 {
+        Arc::as_ptr(&self.rgba) as usize as u64
+    }
+
+    pub(crate) fn turn(&self) -> Turn {
+        self.turn
+    }
+
+    pub(crate) fn is_opaque(&self) -> bool {
+        self.opaque
+    }
+
+    pub(crate) fn written(&self) -> Option<&[Rect]> {
+        self.written.as_deref()
+    }
+
+    pub(crate) fn pixels(&self) -> parking_lot::RwLockReadGuard<'_, Vec<u8>> {
+        self.rgba.read()
+    }
+
     /// Rewrites the content through a canvas over the current pixels, which
     /// are blank when the size changes, and shows it turned by `turn`, giving
     /// it a new identity. `changed` names the shown rectangles the rewrite
@@ -201,6 +239,8 @@ impl Surface {
         self.turn = turn;
         self.previous = self.id;
         self.changed = changed.filter(|_| same).map(Into::into);
+        self.kept = kept;
+        self.written = None;
         self.id = NEXT_PIXELS.fetch_add(1, Ordering::Relaxed);
     }
 }

@@ -1004,10 +1004,27 @@ pub(crate) fn animation_due() -> Option<i64> {
         .min()
 }
 
-/// Takes what the terminals of `budget` did since the last pump. When `held`,
-/// a window already waits to paint output: the transports' wakes stay taken,
-/// so more output does not wake the session before that frame, which takes
-/// the programs' ends and events.
+/// Whether any terminal of `budget` has parsed output since the last pump.
+pub(crate) fn output_waiting(budget: &Budget) -> bool {
+    TERMINALS
+        .lock()
+        .values()
+        .any(|e| e.budget == *budget && e.output_shown)
+}
+
+/// Whether a paste into a terminal of `budget` is still being sent. Each wake
+/// from the terminal sends the next part.
+pub(crate) fn any_pasting(budget: &Budget) -> bool {
+    TERMINALS
+        .lock()
+        .values()
+        .any(|e| e.budget == *budget && e.paste.is_some())
+}
+
+/// Collects what the terminals of `budget` did since the last pump. When
+/// `held`, the next frame will show new output anyway, so the terminals'
+/// wakes stay off and more output does not wake the loop before then. Exits
+/// and other events are still collected.
 pub(crate) fn pump(budget: &Budget, held: bool) -> (bool, Vec<UiMsg>) {
     let mut changed = false;
     let mut events = Vec::new();
@@ -1019,13 +1036,12 @@ pub(crate) fn pump(budget: &Budget, held: bool) -> (bool, Vec<UiMsg>) {
         }
         changed |= std::mem::take(&mut entry.output_shown);
         entry.pumped = entry.revision;
-        if !held
-            && entry
-                .transport
-                .as_ref()
-                .is_some_and(Transport::has_pending_output)
+        if entry
+            .transport
+            .as_ref()
+            .is_some_and(Transport::has_pending_output)
         {
-            changed |= take_ending(*id, entry, &mut events);
+            changed |= take_ending(*id, entry, &mut events, !held);
         }
         // The transport's one wake also says the program took queued input,
         // and the drain above rearms it: a paste goes on after the drain, so
@@ -1041,12 +1057,18 @@ pub(crate) fn pump(budget: &Budget, held: bool) -> (bool, Vec<UiMsg>) {
 // Takes the end of terminal `id`'s output, its program's exit and the events
 // its output raised, answering whether the screen changed. The transport
 // parsed the output itself.
-fn take_ending(id: i64, entry: &mut Entry, events: &mut Vec<UiMsg>) -> bool {
+// With `rearm`, the terminal's wake is turned back on, so more output wakes
+// the loop. Otherwise it stays off.
+fn take_ending(id: i64, entry: &mut Entry, events: &mut Vec<UiMsg>, rearm: bool) -> bool {
     let Some(transport) = &entry.transport else {
         return false;
     };
     let mut changed = false;
-    let drained = transport.drain();
+    let drained = if rearm {
+        transport.drain()
+    } else {
+        transport.peek()
+    };
     for (title, body) in entry.engine.take_toasts() {
         events.push(UiMsg::Terminal(id, Event::Notify(title, body)));
     }
@@ -1158,8 +1180,8 @@ impl Compactor {
                     break;
                 };
                 if entry.revision != revision || !entry.engine.compact_history_step() {
-                    // The rows compacted away belong to the reader, which
-                    // made them, to hand back.
+                    // The parser thread allocated the compacted rows, so it
+                    // returns their memory.
                     if let Some(transport) = &entry.transport {
                         transport.release_memory();
                     }

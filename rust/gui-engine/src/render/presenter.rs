@@ -1,6 +1,22 @@
 //! GPU composition with software fallback, sharing the exact raster reference.
-use super::retained::{Primitive, Retained, Scene, Target};
+use super::retained::{Primitive, Retained, Scene, Target, ring_hole};
 use crate::{errors, geometry::Rect};
+
+// Rings get their own layers where the window supports it. GUI_RINGS=0 turns
+// this off, so rings are painted into the window's surface like elsewhere.
+fn rings_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("GUI_RINGS").as_deref() != Ok("0"))
+}
+
+fn native_rect(r: Rect) -> windowing::display::Rect {
+    windowing::display::Rect {
+        x: r.x,
+        y: r.y,
+        width: r.width,
+        height: r.height,
+    }
+}
 
 // Software is the permanent default. Only recognized explicit opt-ins may
 // create a GPU; typos/empty values must never silently enable acceleration.
@@ -202,11 +218,17 @@ impl WindowRenderer {
                 return Ok(damage);
             }
         };
+        self.retained.rings = self.gpu.is_none() && rings_enabled() && window.shows_rings();
         let mut damage = self.retained.damage(width, height, &scene);
         if full {
             damage = vec![screen];
         }
         if damage.is_empty() {
+            // Nothing else changed, but a ring may have scrolled or changed
+            // rows, so its layers still need updating.
+            if self.retained.rings && scene.commands.iter().any(|c| ring_hole(c).is_some()) {
+                self.software(window, &scene, None)?;
+            }
             self.retained.commit(scene);
             self.retained.stats.gpu_layer_bytes = self.gpu.as_ref().map_or(0, |g| g.cache_bytes());
             return Ok(damage);
@@ -223,12 +245,12 @@ impl WindowRenderer {
             self.gpu = None;
             self.retry = 60;
             let damage = vec![screen];
-            self.software(window, &scene, &damage)?;
+            self.software(window, &scene, Some(&damage))?;
             self.retained.commit(scene);
             return Ok(damage);
         }
         self.retry = self.retry.saturating_sub(1);
-        self.software(window, &scene, &damage)?;
+        self.software(window, &scene, Some(&damage))?;
         self.retained.commit(scene);
         Ok(damage)
     }
@@ -302,18 +324,25 @@ impl WindowRenderer {
         Ok(())
     }
 
-    // Paints `damage` of `scene` straight into the window's surface.
+    // Paints `damage` of `scene` into the window's surface. Where the window
+    // supports rings, also shows the scene's rings below the surface. With
+    // `damage` of `None`, only the rings are updated.
     fn software(
         &mut self,
         window: windowing::Window,
         scene: &Scene,
-        damage: &[Rect],
+        damage: Option<&[Rect]>,
     ) -> Result<(), errors::Error> {
+        let shows_rings = self.retained.rings;
         let retained = &mut self.retained;
-        window.paint_surface(&native(damage), |pixels, width, height, stride, format| {
+        let paint = |pixels: &mut [u8],
+                     width: i64,
+                     height: i64,
+                     stride: i64,
+                     format: windowing::surface::PixelFormat| {
             retained.raster(
                 scene,
-                damage,
+                damage.unwrap_or(&[]),
                 Target {
                     pixels,
                     width,
@@ -322,7 +351,55 @@ impl WindowRenderer {
                     offsets: format.rgb_offsets(),
                 },
             )
-        })?;
+        };
+        if !shows_rings {
+            if let Some(damage) = damage {
+                window.paint_surface(&native(damage), paint)?;
+            }
+            return Ok(());
+        }
+        let found: Vec<(Rect, &super::Surface)> =
+            scene.commands.iter().filter_map(ring_hole).collect();
+        let held: Vec<_> = found.iter().map(|(_, s)| s.pixels()).collect();
+        // The rows each ring changed, relative to the ring's first row.
+        let written: Vec<Option<Vec<windowing::display::Rect>>> = found
+            .iter()
+            .map(|(_, s)| {
+                let turn = s.turn();
+                let stretch = Rect::new(0, turn.top, s.width(), turn.len);
+                s.written().map(|rows| {
+                    rows.iter()
+                        .map(|r| r.intersect(stretch))
+                        .filter(|r| r.width > 0 && r.height > 0)
+                        .map(|r| native_rect(r.offset(0, -turn.top)))
+                        .collect()
+                })
+            })
+            .collect();
+        let rings: Vec<windowing::surface::Ring> = found
+            .iter()
+            .zip(&held)
+            .zip(&written)
+            .filter_map(|(((hole, s), pixels), written)| {
+                let turn = s.turn();
+                let stride = s.width() * 4;
+                let rows = pixels
+                    .get((turn.top * stride) as usize..((turn.top + turn.len) * stride) as usize)?;
+                let (id, previous) = s.identity();
+                Some(windowing::surface::Ring {
+                    key: s.storage(),
+                    rect: native_rect(*hole),
+                    pixels: rows,
+                    stride,
+                    shift: turn.shift,
+                    id,
+                    previous,
+                    written: written.as_deref(),
+                })
+            })
+            .collect();
+        let damage = damage.map(native);
+        window.paint_surface_rings(damage.as_deref(), &rings, paint)?;
         Ok(())
     }
     pub fn gpu_capture(&mut self) -> Result<Option<Vec<u8>>, errors::Error> {

@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 
+use parking_lot_core::SpinWait;
 use portable_pty::{Child, CommandBuilder, MasterPty};
 
 use super::Command;
@@ -24,8 +25,6 @@ pub struct Pty {
     input: Arc<Queue>,
     ending: Arc<Ending>,
     cancel: UnixStream,
-    /// Wakes the reader to hand back memory freed while it waited.
-    release: UnixStream,
     handoff: Arc<Handoff>,
     stopping: Arc<AtomicBool>,
     reader: Option<JoinHandle<()>>,
@@ -163,32 +162,32 @@ enum Wake {
     Ready,
     /// The cancel descriptor is readable.
     Cancelled,
-    /// The release descriptor is readable.
-    Released,
 }
 
-/// Waits until `fd` is ready for `events`, `cancel` is readable or, when
-/// given, `release` is. The thread hands back the memory it freed first.
-fn readiness(fd: i32, cancel: i32, release: Option<i32>, events: i16) -> Result<Wake, String> {
+/// Waits until `fd` is ready for `events` or `cancel` is readable. If `owed`
+/// is set, first returns this thread's freed memory to the runtime, and
+/// clears `owed` once that is done.
+fn readiness(fd: i32, cancel: i32, events: i16, owed: &mut bool) -> Result<Wake, String> {
     let pollfd = |fd, events| libc::pollfd {
         fd,
         events,
         revents: 0,
     };
-    let mut fds = [
-        pollfd(fd, events),
-        pollfd(cancel, libc::POLLIN),
-        pollfd(release.unwrap_or(-1), libc::POLLIN),
-    ];
-    let count = if release.is_some() { 3 } else { 2 };
+    let mut fds = [pollfd(fd, events), pollfd(cancel, libc::POLLIN)];
     loop {
-        let bound = windowing::idle::thread_idle().map_or(-1, |due| {
-            i32::try_from(due.as_micros().div_ceil(1000)).unwrap_or(i32::MAX)
-        });
-        // SAFETY: `fds` holds `count` initialized pollfd records; the PTY
+        let mut bound = -1;
+        if *owed {
+            match windowing::idle::thread_idle() {
+                Some(due) => {
+                    bound = i32::try_from(due.as_micros().div_ceil(1000)).unwrap_or(i32::MAX);
+                }
+                None => *owed = false,
+            }
+        }
+        // SAFETY: `fds` holds two initialized pollfd records; the PTY
         // descriptor stays open until both IO threads have joined and the
-        // cancel and release descriptors are owned by the calling thread.
-        let result = unsafe { libc::poll(fds.as_mut_ptr(), count, bound) };
+        // cancel descriptor is owned by the calling thread.
+        let result = unsafe { libc::poll(fds.as_mut_ptr(), 2, bound) };
         if result == 0 {
             continue;
         }
@@ -202,23 +201,8 @@ fn readiness(fd: i32, cancel: i32, release: Option<i32>, events: i16) -> Result<
         if fds[1].revents != 0 {
             return Ok(Wake::Cancelled);
         }
-        if fds[0].revents != 0 {
-            return Ok(Wake::Ready);
-        }
-        return Ok(Wake::Released);
+        return Ok(Wake::Ready);
     }
-}
-
-/// Whether `fd` has output to read now.
-fn readable(fd: i32) -> bool {
-    let mut pollfd = libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // SAFETY: `pollfd` is one initialized record; the PTY descriptor stays
-    // open until the reader that calls this has joined.
-    unsafe { libc::poll(&mut pollfd, 1, 0) > 0 }
 }
 
 fn would_block(error: &std::io::Error) -> bool {
@@ -271,9 +255,6 @@ impl Pty {
         }
         let (cancel, signal) = UnixStream::pair().map_err(|e| e.to_string())?;
         let write_signal = signal.try_clone().map_err(|e| e.to_string())?;
-        let (release, released) = UnixStream::pair().map_err(|e| e.to_string())?;
-        release.set_nonblocking(true).map_err(|e| e.to_string())?;
-        released.set_nonblocking(true).map_err(|e| e.to_string())?;
         let child = pair
             .slave
             .spawn_command(builder)
@@ -285,13 +266,12 @@ impl Pty {
         let input = Arc::new(Queue::new(INPUT));
         let ending = Arc::new(Ending::default());
         let stopping = Arc::new(AtomicBool::new(false));
-        let handoff = Arc::new(Handoff::default());
+        let handoff = Arc::new(Handoff::new());
         let mut pty = Self {
             master: Some(pair.master),
             input: input.clone(),
             ending: ending.clone(),
             cancel,
-            release,
             handoff: handoff.clone(),
             stopping: stopping.clone(),
             reader: None,
@@ -306,7 +286,7 @@ impl Pty {
         let end = ending.clone();
         let stop = stopping.clone();
         let wake = notify.clone();
-        let mut output = Output::new(sink, notify.clone(), handoff);
+        let mut output = Output::new(sink, notify.clone(), handoff)?;
         pty.reader = Some(
             thread::Builder::new()
                 .name("gui-pty-read".into())
@@ -314,54 +294,47 @@ impl Pty {
                 .spawn(move || {
                     super::transport::interactive_thread();
                     let mut buffer = [0; CHUNK];
-                    let mut batch = Vec::with_capacity(BATCH + CHUNK);
-                    let mut ended = false;
-                    // When the reader last finished with output.
-                    let mut waiting = std::time::Instant::now();
-                    while !stop.load(Ordering::Acquire) {
-                        match readiness(
-                            fd,
-                            signal.as_raw_fd(),
-                            Some(released.as_raw_fd()),
-                            libc::POLLIN,
-                        ) {
-                            Ok(Wake::Ready) => (),
-                            // The next wait hands the memory back.
-                            Ok(Wake::Released) => {
-                                let _ = (&released).read(&mut buffer);
-                                continue;
-                            }
-                            Ok(Wake::Cancelled) | Err(_) => break,
+                    // A streaming program refills the terminal almost at
+                    // once, and on macOS each read gets only a kilobyte, so
+                    // waiting in poll after every read would cost as much as
+                    // the read. The reader spins briefly first, and hands
+                    // output to the parser only when it is about to wait.
+                    let mut spin = SpinWait::new();
+                    // The reader allocates only when it parses, so it has
+                    // memory to return only after a parse. The parser
+                    // returns everything else.
+                    let mut owed = false;
+                    let ended = loop {
+                        if stop.load(Ordering::Acquire) {
+                            break false;
                         }
-                        let waited = waiting.elapsed();
-                        batch.clear();
-                        ended = loop {
-                            match reader.read(&mut buffer) {
-                                Ok(0) => break true,
-                                Ok(n) => {
-                                    batch.extend_from_slice(&buffer[..n]);
-                                    // macOS hands over a kilobyte per read and
-                                    // refills only once the reader took it, so
-                                    // a second read finds nothing; elsewhere
-                                    // the terminal refills during the copy and
-                                    // draining it batches the output.
-                                    let drained = cfg!(target_os = "macos") && n < buffer.len();
-                                    if drained || batch.len() >= BATCH {
-                                        break false;
-                                    }
+                        match reader.read(&mut buffer) {
+                            Ok(0) => break true,
+                            Ok(n) => {
+                                spin.reset();
+                                if !output.push(&buffer[..n]) {
+                                    break false;
                                 }
-                                Err(error) if would_block(&error) => break false,
-                                Err(_) => break true,
                             }
-                        };
-                        if !batch.is_empty() && !output.deliver(&batch, waited, || readable(fd)) {
-                            break;
+                            Err(error) if would_block(&error) => {
+                                if spin.spin() {
+                                    continue;
+                                }
+                                spin.reset();
+                                if output.idle() {
+                                    owed = true;
+                                    continue;
+                                }
+                                if readiness(fd, signal.as_raw_fd(), libc::POLLIN, &mut owed)
+                                    != Ok(Wake::Ready)
+                                {
+                                    break false;
+                                }
+                                output.rested();
+                            }
+                            Err(_) => break true,
                         }
-                        waiting = std::time::Instant::now();
-                        if ended {
-                            break;
-                        }
-                    }
+                    };
                     // The program's last output is parsed before its end is
                     // known; a cancelled reader drops what is left.
                     if ended {
@@ -384,7 +357,7 @@ impl Pty {
                     while let Some(bytes) = input.pop() {
                         let mut offset = 0;
                         while offset < bytes.len() && !stop.load(Ordering::Acquire) {
-                            if readiness(fd, write_signal.as_raw_fd(), None, libc::POLLOUT)
+                            if readiness(fd, write_signal.as_raw_fd(), libc::POLLOUT, &mut true)
                                 != Ok(Wake::Ready)
                             {
                                 return;
@@ -487,6 +460,12 @@ impl Pty {
         super::transport::drain(&self.ending, &self.notify)
     }
 
+    /// The program's state, like `drain`, but leaves the wake off: more
+    /// output does not wake the owner until the next `drain`.
+    pub fn peek(&self) -> Drain {
+        super::transport::peek(&self.ending)
+    }
+
     /// The input bytes a write could queue now.
     pub fn input_room(&self) -> usize {
         self.input.room()
@@ -501,10 +480,10 @@ impl Pty {
         self.notify.is_pending()
     }
 
-    /// Has the reader hand back the memory others freed for it while it
-    /// waits for output, as a compaction of its history does.
+    /// Asks the parser thread to return memory that other threads freed for
+    /// it, such as rows dropped when history is compacted. The parser
+    /// allocated those rows, so it is the thread that must return them.
     pub fn release_memory(&self) {
-        let _ = (&self.release).write(&[1]);
         self.handoff.release();
     }
 

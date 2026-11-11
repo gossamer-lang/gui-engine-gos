@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.12 - Less CPU for streaming output
+
+- A terminal's reader thread now only reads while output streams. It copies each read into a buffer of up to 64 KiB and goes straight back to reading. When a read finds nothing, it spins briefly, then hands the whole buffer to the parser thread before it waits. The parser and the window are woken once per burst of output instead of once per read. On macOS, where each read gets only a kilobyte, the program writing output no longer stalls while the reader parses.
+- A single read after a pause, such as the echo of a keystroke, is parsed on the reader thread when the parser is idle, so it reaches the screen without waking the parser.
+- The reader returns freed memory to the allocator only after it parsed output itself, not before every wait. Compacting the history wakes only the parser thread, which allocates nearly all of the rows.
+- While output streams, the event loop wakes once per frame instead of once per write as well as once per frame. A paste still sends each part as soon as the terminal takes the last.
+- macOS: a scrolling terminal is shown in layers of its own below the window's surface. Scrolling no longer copies the screen; each frame copies only the rows that changed. A line of output every 16 ms takes less than half the CPU it did. `GUI_RINGS=0` turns this off.
+- A stream dense with escape sequences is checked for strings the parser must not see in one pass over it, instead of a new search after each escape.
+- Builds on windowing-gos 0.1.16 and wezterm-lite 0.1.10, which parses unicode and colored output faster.
+
 ## 0.2.11 - Lighter frames, a parser that keeps up
 
 - Terminal output that keeps coming goes to the parser thread once output is waiting after a read's parse, and stays there until output pauses for longer than the parser takes to wake, where it used to come back to the reader after each batch and wake the parser again. On macOS the reader makes one read per wake instead of a second that finds nothing.

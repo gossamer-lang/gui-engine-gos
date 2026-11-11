@@ -234,6 +234,16 @@ pub(super) fn paint(
                 canvas.clip = Rect::new(0, 0, width, height);
             },
         );
+        // Record which stored rows this paint changed. If the layer was
+        // valid, that is just the rows drawn again, wherever they are stored.
+        layer.surface.set_written(valid.then(|| {
+            drawn
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| d.is_some())
+                .map(|(i, _)| Rect::new(0, pad + slot(i) as i64 * line, width, line))
+                .collect()
+        }));
     }
     for (i, (key, drawn)) in keys.iter().zip(drawn).enumerate() {
         let s = slot(i);

@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 
 use parking_lot_core::SpinWait;
-use portable_pty::{Child, CommandBuilder, MasterPty};
+use portable_pty::{Child, CommandBuilder, MasterPty, PtyPair};
 
 use super::Command;
 use super::transport::{
@@ -212,26 +212,81 @@ fn would_block(error: &std::io::Error) -> bool {
     )
 }
 
-impl Pty {
-    /// Starts `command` on a new pseudo-terminal of `rows` x `cols`; `wake`
-    /// runs on an IO thread when output, end of stream or exit arrives.
-    pub fn spawn(
-        command: &Command,
-        rows: u16,
-        cols: u16,
-        cell: (u16, u16),
-        budget: &Budget,
-        wake: Arc<dyn Fn() + Send + Sync>,
-        sink: Sink,
-    ) -> Result<Self, String> {
-        check_command(&command.program, &command.args)?;
-        let slot = Slot::acquire()?;
-        let notify = Arc::new(Notify::new(wake));
-        let dimensions = pty_size(rows, cols, cell)?;
-        let lease = budget.reserve(3 * INPUT + 4 * STACK + 4 * CHUNK + 3 * BATCH + 64 * 1024)?;
-        let pair = portable_pty::native_pty_system()
-            .openpty(dimensions)
+// The search the program's start makes (portable-pty's), so a program it
+// would not find is refused when the terminal opens: a relative path that
+// begins with `.` or `..` is taken from the working directory, any other
+// relative path is looked for along PATH, and the file must be executable.
+fn resolve(builder: &CommandBuilder, program: &str) -> Result<(), String> {
+    use std::ffi::{CString, OsStr};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::{Component, Path, PathBuf};
+
+    let runnable = |path: &Path| {
+        !path.is_dir()
+            && CString::new(path.as_os_str().as_bytes())
+                // SAFETY: `path` is a NUL-terminated string that outlives the call.
+                .is_ok_and(|path| unsafe { libc::access(path.as_ptr(), libc::X_OK) } == 0)
+    };
+    let exe = Path::new(program);
+    if exe.is_absolute() {
+        return if runnable(exe) {
+            Ok(())
+        } else {
+            Err(format!("{program} is not an executable program"))
+        };
+    }
+    let dir: PathBuf = builder
+        .get_cwd()
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_dir())
+        .or_else(|| builder.get_env("HOME").map(PathBuf::from))
+        .unwrap_or_default();
+    if matches!(
+        exe.components().next(),
+        Some(Component::CurDir | Component::ParentDir)
+    ) {
+        return if runnable(&dir.join(exe)) {
+            Ok(())
+        } else {
+            Err(format!("{program} is not an executable program"))
+        };
+    }
+    let path = builder.get_env("PATH").unwrap_or(OsStr::new(""));
+    if std::env::split_paths(path).any(|entry| runnable(&dir.join(entry).join(exe))) {
+        Ok(())
+    } else {
+        Err(format!("{program} was not found on PATH"))
+    }
+}
+
+/// A pseudo-terminal opened for a program that has not started yet, so the
+/// program can start at a size set after the opening.
+pub struct Opened {
+    pair: PtyPair,
+    builder: CommandBuilder,
+    slot: Slot,
+    lease: Lease,
+    wake: Arc<dyn Fn() + Send + Sync>,
+    sink: Sink,
+}
+
+impl Opened {
+    /// Starts the program on a screen of `rows` x `cols`. The size is set
+    /// before the program exists, so it reads it at its start and is never
+    /// told of a change.
+    pub fn start(self, rows: u16, cols: u16, cell: (u16, u16)) -> Result<Pty, String> {
+        let Self {
+            pair,
+            builder,
+            slot,
+            lease,
+            wake,
+            sink,
+        } = self;
+        pair.master
+            .resize(pty_size(rows, cols, cell)?)
             .map_err(|e| e.to_string())?;
+        let notify = Arc::new(Notify::new(wake));
         let fd = pair
             .master
             .as_raw_fd()
@@ -247,12 +302,6 @@ impl Pty {
         }
         let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
         let mut writer = pair.master.take_writer().map_err(|e| e.to_string())?;
-        let mut builder = CommandBuilder::new(&command.program);
-        builder.args(&command.args);
-        super::transport::environment(&mut builder, command);
-        if !command.cwd.is_empty() {
-            builder.cwd(&command.cwd);
-        }
         let (cancel, signal) = UnixStream::pair().map_err(|e| e.to_string())?;
         let write_signal = signal.try_clone().map_err(|e| e.to_string())?;
         let child = pair
@@ -267,7 +316,7 @@ impl Pty {
         let ending = Arc::new(Ending::default());
         let stopping = Arc::new(AtomicBool::new(false));
         let handoff = Arc::new(Handoff::new());
-        let mut pty = Self {
+        let mut pty = Pty {
             master: Some(pair.master),
             input: input.clone(),
             ending: ending.clone(),
@@ -419,6 +468,59 @@ impl Pty {
                 .map_err(|e| e.to_string())?,
         );
         Ok(pty)
+    }
+}
+
+impl Pty {
+    /// Opens a pseudo-terminal of `rows` x `cols` for `command`, refusing a
+    /// program the start would not find; `wake` runs on an IO thread when
+    /// output, end of stream or exit arrives once it starts.
+    pub fn open(
+        command: &Command,
+        rows: u16,
+        cols: u16,
+        cell: (u16, u16),
+        budget: &Budget,
+        wake: Arc<dyn Fn() + Send + Sync>,
+        sink: Sink,
+    ) -> Result<Opened, String> {
+        check_command(&command.program, &command.args)?;
+        let slot = Slot::acquire()?;
+        let dimensions = pty_size(rows, cols, cell)?;
+        let lease = budget.reserve(3 * INPUT + 4 * STACK + 4 * CHUNK + 3 * BATCH + 64 * 1024)?;
+        let mut builder = CommandBuilder::new(&command.program);
+        builder.args(&command.args);
+        super::transport::environment(&mut builder, command);
+        if !command.cwd.is_empty() {
+            builder.cwd(&command.cwd);
+        }
+        resolve(&builder, &command.program)?;
+        let pair = portable_pty::native_pty_system()
+            .openpty(dimensions)
+            .map_err(|e| e.to_string())?;
+        Ok(Opened {
+            pair,
+            builder,
+            slot,
+            lease,
+            wake,
+            sink,
+        })
+    }
+
+    /// Starts `command` on a new pseudo-terminal of `rows` x `cols`, as
+    /// `open` and `Opened::start` do together.
+    #[cfg(test)]
+    pub fn spawn(
+        command: &Command,
+        rows: u16,
+        cols: u16,
+        cell: (u16, u16),
+        budget: &Budget,
+        wake: Arc<dyn Fn() + Send + Sync>,
+        sink: Sink,
+    ) -> Result<Self, String> {
+        Self::open(command, rows, cols, cell, budget, wake, sink)?.start(rows, cols, cell)
     }
 
     /// Queues input for the program without blocking.

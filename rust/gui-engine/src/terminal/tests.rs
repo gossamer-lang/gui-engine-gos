@@ -6,7 +6,128 @@ fn options(rows: i64, cols: i64, scrollback: i64) -> Options {
         cols,
         scrollback,
         byte_limit: 16 * 1024 * 1024,
+        start_at_view_size: false,
     }
+}
+
+#[cfg(unix)]
+fn shell(script: &str) -> Command {
+    Command {
+        program: "/bin/sh".into(),
+        args: vec!["-c".into(), script.into()],
+        ..Command::default()
+    }
+}
+
+#[cfg(unix)]
+fn waiting_for_size(rows: i64, cols: i64) -> Options {
+    Options {
+        start_at_view_size: true,
+        ..options(rows, cols, 10)
+    }
+}
+
+#[cfg(unix)]
+fn pump_until_text(budget: &Budget, id: i64, wanted: &str) {
+    while !snapshot(id).unwrap().text.contains(wanted) {
+        pump(budget, false);
+        std::thread::yield_now();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_program_waiting_for_its_size_starts_at_the_size_resize_sets_and_reads_earlier_input() {
+    let budget = Budget::new(64 * 1024 * 1024);
+    let id = create(&waiting_for_size(4, 30), budget.clone()).unwrap();
+    spawn(id, &shell("stty size; read x; echo got:$x; read y")).unwrap();
+    let waiting = snapshot(id).unwrap();
+    assert!(waiting.running);
+    assert_eq!(
+        waiting.pid, 0,
+        "the program started before its size was set"
+    );
+    input(id, b"early\n").unwrap();
+    assert!(spawn(id, &shell("true")).is_err());
+    assert!(pump(&budget, false).1.is_empty());
+    assert_eq!(snapshot(id).unwrap().pid, 0);
+    resize(id, 6, 33).unwrap();
+    assert_ne!(snapshot(id).unwrap().pid, 0);
+    pump_until_text(&budget, id, "got:early");
+    assert!(snapshot(id).unwrap().text.contains("6 33"));
+    close(id);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_program_no_view_sizes_starts_at_the_screens_size_once_its_wait_is_over() {
+    let budget = Budget::new(64 * 1024 * 1024);
+    let id = create(&waiting_for_size(5, 31), budget.clone()).unwrap();
+    spawn(id, &shell("stty size; read x")).unwrap();
+    let due = start_due().unwrap();
+    assert!(due > Instant::now());
+    with(id, |entry| {
+        entry.starting.as_mut().unwrap().due = Instant::now();
+        Ok(())
+    })
+    .unwrap();
+    pump_until_text(&budget, id, "5 31");
+    assert!(with(id, |entry| Ok(entry.starting.is_none())).unwrap());
+    close(id);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_program_waiting_for_its_size_is_refused_at_once_when_it_cannot_be_found() {
+    let budget = Budget::new(64 * 1024 * 1024);
+    let id = create(&waiting_for_size(4, 30), budget.clone()).unwrap();
+    for program in [
+        "gui-engine-no-such-program",
+        "/nonexistent/program",
+        "./nope",
+        "/tmp",
+    ] {
+        let command = Command {
+            program: program.into(),
+            ..Command::default()
+        };
+        assert!(spawn(id, &command).is_err(), "{program} was accepted");
+    }
+    assert!(!snapshot(id).unwrap().running);
+    close(id);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_program_that_cannot_start_once_sized_is_reported_from_the_pump() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let budget = Budget::new(64 * 1024 * 1024);
+    let dir = std::env::temp_dir().join(format!("gui-start-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let program = dir.join("vanishing");
+    std::fs::write(&program, "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let id = create(&waiting_for_size(4, 30), budget.clone()).unwrap();
+    let command = Command {
+        program: program.to_str().unwrap().into(),
+        ..Command::default()
+    };
+    spawn(id, &command).unwrap();
+    std::fs::remove_file(&program).unwrap();
+    resize(id, 6, 33).unwrap();
+    let (changed, events) = pump(&budget, false);
+    assert!(changed);
+    assert!(
+        events
+            .iter()
+            .any(|m| matches!(m, UiMsg::Terminal(t, Event::NotStarted(_)) if *t == id)),
+        "{events:?}"
+    );
+    assert!(!snapshot(id).unwrap().running);
+    assert!(input(id, b"x").is_err());
+    close(id);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -728,6 +849,45 @@ mod session {
             );
             close(id);
             assert_eq!(budget.usage().0, before);
+            s.shutdown();
+        })
+    }
+
+    #[test]
+    fn a_program_waiting_for_its_view_starts_at_the_size_the_view_gives_it() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| {
+                crate::services::remove_test_config(&config);
+            });
+            let mut s = crate::app::start("Terminal", "dev.gossamer.gui-terminal-sized").unwrap();
+            let id = create(
+                &waiting_for_size(8, 40),
+                crate::app::effects::current_budget(),
+            )
+            .unwrap();
+            s.set_shell(
+                |_| {},
+                move |_| Widget::Terminal(widget::View::new("term", id, "Shell")),
+                |_| Vec::new(),
+            );
+            spawn(id, &shell("printf 'born:'; stty size; read x")).unwrap();
+            assert_eq!(snapshot(id).unwrap().pid, 0);
+            s.open_window("main", "Terminal", 420, 240).unwrap();
+            step_until(&mut s, || snapshot(id).unwrap().text.contains("born:"));
+            step_until(&mut s, || {
+                let text = snapshot(id).unwrap().text;
+                text.lines()
+                    .any(|l| l.starts_with("born:") && l.trim_end().len() > 5)
+            });
+            let shown = snapshot(id).unwrap();
+            assert_ne!(
+                (shown.rows, shown.cols),
+                (8, 40),
+                "the view kept the opening size"
+            );
+            let born = format!("born:{} {}", shown.rows, shown.cols);
+            assert!(shown.text.contains(&born), "{born} not in {}", shown.text);
             s.shutdown();
         })
     }
@@ -1527,6 +1687,7 @@ fn a_terminal_that_settles_has_its_history_compacted_off_the_session_thread() {
             cols: 80,
             scrollback: 10_000,
             byte_limit: 64 * 1024 * 1024,
+            ..Options::default()
         },
         budget.clone(),
     )
@@ -1567,6 +1728,7 @@ fn a_long_history_opens_within_its_byte_limit_and_keeps_the_newest_rows() {
             cols: 82,
             scrollback: 100_000,
             byte_limit: limit,
+            ..Options::default()
         },
         budget.clone(),
     )
@@ -1594,6 +1756,7 @@ fn a_long_history_opens_within_its_byte_limit_and_keeps_the_newest_rows() {
         cols: 512,
         scrollback: 0,
         byte_limit: 1024 * 1024,
+        ..Options::default()
     };
     assert_eq!(
         create(&small, budget).unwrap_err(),

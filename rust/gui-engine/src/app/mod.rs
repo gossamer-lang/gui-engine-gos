@@ -1668,6 +1668,13 @@ impl Session {
         {
             best = due;
         }
+        if let Some(start) = crate::terminal::start_due() {
+            let left = start.saturating_duration_since(std::time::Instant::now());
+            let due = self.now() + left.as_micros().div_ceil(1000) as i64;
+            if best < 0 || due < best {
+                best = due;
+            }
+        }
         for t in &self.timers {
             if self.visual_timer_paused(t) {
                 continue;
@@ -5442,6 +5449,7 @@ impl Session {
         tree::sync_models(&root, &mut st, &theme);
         self.windows[w as usize].states = st;
         let mut lcx = LayoutCx::new(&theme, &self.windows[w as usize].states, size);
+        lcx.registry = self.windows[w as usize].commands.commands.clone();
         self.windows[w as usize].node = root.layout(Constraints::tight(size), &mut lcx);
         self.check_unique_ids(w);
         self.check_named_commands(w);
@@ -5453,6 +5461,7 @@ impl Session {
                 max_height: UNBOUNDED,
             };
             let mut probe = LayoutCx::new(&theme, &self.windows[w as usize].states, size);
+            probe.registry = self.windows[w as usize].commands.commands.clone();
             self.windows[w as usize].content_height = root.layout(loose, &mut probe).size().height;
         }
         self.windows[w as usize].node_inspected = self.inspector;
@@ -8275,6 +8284,7 @@ mod advance_tests {
                 cols: 40,
                 scrollback: 100,
                 byte_limit: 1 << 20,
+                ..Options::default()
             };
             let id = terminal::create(&options, effects::current_budget()).unwrap();
             s.set_shell(
@@ -8338,6 +8348,7 @@ mod advance_tests {
                 cols: 40,
                 scrollback: 100,
                 byte_limit: 1 << 20,
+                ..Options::default()
             };
             let id = terminal::create(&options, effects::current_budget()).unwrap();
             s.set_shell(

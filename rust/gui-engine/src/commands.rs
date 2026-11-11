@@ -105,6 +105,24 @@ impl Command {
             self.shortcuts[0].label()
         }
     }
+
+    /// The command as the palette names it: its category first, as in
+    /// "View: Zoom In", so a group's commands sort together and a command
+    /// reads apart from like-named ones of another group.
+    pub fn palette_label(&self) -> String {
+        if self.category.is_empty() {
+            return self.label.clone();
+        }
+        crate::localization::message(
+            "commands",
+            "{category}: {command}",
+            1,
+            &crate::hmap! {
+                "category" => self.category.clone(),
+                "command" => self.label.clone(),
+            },
+        )
+    }
 }
 
 /// What a key press did to the shortcut state.

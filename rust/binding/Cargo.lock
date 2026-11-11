@@ -754,7 +754,7 @@ dependencies = [
 
 [[package]]
 name = "gui-engine"
-version = "0.2.13"
+version = "0.2.14"
 dependencies = [
  "anyhow",
  "encoding_rs",
@@ -793,7 +793,7 @@ dependencies = [
 
 [[package]]
 name = "gui-engine-binding"
-version = "0.2.13"
+version = "0.2.14"
 dependencies = [
  "gos-windowing",
  "gossamer-binding",

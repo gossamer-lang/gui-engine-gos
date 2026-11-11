@@ -25,6 +25,7 @@ mod pty;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
 
 use encoding_rs::{Decoder, Encoding};
 use parking_lot::Mutex;
@@ -36,13 +37,17 @@ use crate::widgets::cx::UiMsg;
 use engine::Engine;
 
 #[cfg(windows)]
-use conpty::Pty as Transport;
+use conpty::{Opened, Pty as Transport};
 #[cfg(unix)]
-use pty::Pty as Transport;
+use pty::{Opened, Pty as Transport};
 
 const HANDLE_LIMIT: usize = 256;
 const ENTRY_BYTES: usize = 16 * 1024;
 const FEED_LIMIT: usize = 1024 * 1024;
+/// How long a program waits for a view to size its screen before it starts
+/// at the size the screen has: longer than a new window takes to show, short
+/// enough that a terminal no view shows still starts promptly.
+const START_WAIT: Duration = Duration::from_millis(250);
 
 static NEXT: AtomicI64 = AtomicI64::new(1);
 static TERMINALS: LazyLock<Mutex<HashMap<i64, Entry>>> =
@@ -61,6 +66,11 @@ pub struct Options {
     /// can always follow its view; it is a ceiling, and the session is
     /// charged only for the size in use.
     pub byte_limit: i64,
+    /// The program waits to start until a view or `resize` sizes the
+    /// screen, so it starts at that size instead of being told of a new one
+    /// at once (which makes a shell draw its prompt twice). Without a view it
+    /// starts at the screen's size after a short wait.
+    pub start_at_view_size: bool,
 }
 
 impl Default for Options {
@@ -70,6 +80,7 @@ impl Default for Options {
             cols: 80,
             scrollback: 2000,
             byte_limit: 64 * 1024 * 1024,
+            start_at_view_size: false,
         }
     }
 }
@@ -105,6 +116,9 @@ pub enum Event {
     Exited(i64),
     /// The program could not be waited for.
     Failed(String),
+    /// The program could not start once the screen was sized, so the
+    /// terminal runs none (`Options::start_at_view_size`).
+    NotStarted(String),
     /// The screen could not take the size of its view within its byte limit,
     /// and keeps the size it has.
     Refused(String),
@@ -168,6 +182,14 @@ pub struct Snapshot {
 struct Entry {
     engine: Engine,
     transport: Option<Transport>,
+    /// A program waiting for a view to size the screen before it starts.
+    starting: Option<Starting>,
+    /// Programs wait for a view to size the screen before they start.
+    start_at_view_size: bool,
+    /// A view or `resize` has sized the screen since it opened.
+    sized: bool,
+    /// Why the waiting program could not start, for the next pump.
+    start_failure: Option<String>,
     budget: Budget,
     _lease: Lease,
     selection: Option<(Cell, Cell)>,
@@ -236,6 +258,17 @@ struct Entry {
     flash_until: i64,
     /// The pointer is dragging the scrollbar's thumb.
     scrollbar_drag: bool,
+}
+
+/// A program opened on its pseudo-terminal, waiting for the screen's size.
+struct Starting {
+    opened: Opened,
+    /// When it starts at the size the screen has, should no view size it.
+    due: Instant,
+    /// Input sent before the start, which the program reads first.
+    input: Vec<u8>,
+    /// Wakes the session, which hears of a start that fails.
+    wake: Arc<dyn Fn() + Send + Sync>,
 }
 
 /// A stretch of a terminal's buffer, its end excluded, in rows counted from
@@ -351,6 +384,10 @@ pub fn create(options: &Options, budget: Budget) -> Result<i64, String> {
         Entry {
             engine,
             transport: None,
+            starting: None,
+            start_at_view_size: options.start_at_view_size,
+            sized: false,
+            start_failure: None,
             budget,
             _lease: lease,
             selection: None,
@@ -512,7 +549,7 @@ pub fn spawn(id: i64, command: &Command) -> Result<(), String> {
         None => Arc::new(|| {}),
     };
     with(id, |entry| {
-        if entry.transport.is_some() {
+        if entry.transport.is_some() || entry.starting.is_some() {
             return Err("the terminal already runs a program".into());
         }
         let (rows, cols) = entry.engine.size();
@@ -525,19 +562,45 @@ pub fn spawn(id: i64, command: &Command) -> Result<(), String> {
                 take_output(entry, bytes);
             }
         });
-        entry.transport = Some(Transport::spawn(
-            command,
-            rows,
-            cols,
-            cell,
-            &entry.budget,
-            wake,
-            sink,
-        )?);
+        let opened = Transport::open(command, rows, cols, cell, &entry.budget, wake.clone(), sink)?;
         entry.exit = None;
         entry.exit_reported = false;
+        entry.start_failure = None;
+        if entry.start_at_view_size && !entry.sized {
+            entry.starting = Some(Starting {
+                opened,
+                due: Instant::now() + START_WAIT,
+                input: Vec::new(),
+                wake,
+            });
+            return Ok(());
+        }
+        entry.transport = Some(opened.start(rows, cols, cell)?);
         Ok(())
     })
+}
+
+/// Starts the program waiting for the screen's size at the size the screen
+/// has, with the input sent meanwhile. A program that cannot start is
+/// reported from the next pump.
+fn start_waiting(entry: &mut Entry) {
+    let Some(starting) = entry.starting.take() else {
+        return;
+    };
+    let (rows, cols) = entry.engine.size();
+    match starting.opened.start(rows, cols, entry.engine.cell()) {
+        Ok(transport) => {
+            if !starting.input.is_empty() {
+                let _ = transport.write(&starting.input);
+            }
+            entry.transport = Some(transport);
+            feed_paste(entry);
+        }
+        Err(why) => {
+            entry.start_failure = Some(why);
+            (starting.wake)();
+        }
+    }
 }
 
 /// Parses `bytes` as program output: a recorded stream, or output an
@@ -569,10 +632,9 @@ pub(crate) fn typed(id: i64, bytes: &[u8]) -> Result<bool, String> {
 }
 
 fn send(entry: &mut Entry, bytes: &[u8]) -> Result<(), String> {
-    let transport = entry
-        .transport
-        .as_ref()
-        .ok_or("the terminal runs no program")?;
+    if entry.transport.is_none() && entry.starting.is_none() {
+        return Err("the terminal runs no program".into());
+    }
     let bytes = match &entry.charset {
         Some(charset) => charset.encode(bytes),
         None => bytes.to_vec(),
@@ -588,8 +650,13 @@ fn send(entry: &mut Entry, bytes: &[u8]) -> Result<(), String> {
         }
         paste.after.extend_from_slice(&bytes);
         feed_paste(entry);
-    } else {
+    } else if let Some(transport) = &entry.transport {
         transport.write(&bytes)?;
+    } else if let Some(starting) = &mut entry.starting {
+        if starting.input.len() + bytes.len() > transport::INPUT {
+            return Err("terminal input exceeds 64 KiB".into());
+        }
+        starting.input.extend_from_slice(&bytes);
     }
     settle_input(entry);
     Ok(())
@@ -601,10 +668,9 @@ pub fn paste(id: i64, text: &str) -> Result<(), String> {
         if entry.paste.is_some() {
             return Err("an earlier paste is still being sent".into());
         }
-        entry
-            .transport
-            .as_ref()
-            .ok_or("the terminal runs no program")?;
+        if entry.transport.is_none() && entry.starting.is_none() {
+            return Err("the terminal runs no program".into());
+        }
         let (body, end) = entry.engine.paste(text)?;
         let (body, end) = match &entry.charset {
             Some(charset) => (charset.encode(&body), charset.encode(&end)),
@@ -813,13 +879,16 @@ pub fn resize(id: i64, rows: i64, cols: i64) -> Result<(), String> {
     let cols = dimension(cols, 512, "columns")?;
     with(id, |entry| {
         let cell = entry.engine.cell();
-        resize_entry(entry, rows, cols, cell)
+        let resized = resize_entry(entry, rows, cols, cell);
+        entry.sized = true;
+        start_waiting(entry);
+        resized
     })
 }
 
 /// Resizes the screen to its view, whose cells are `cell` pixels, keeping a
 /// refusal to report from the pump: the screen then keeps its size, and the
-/// application hears why.
+/// application hears why. A program waiting for the size starts then.
 fn follow_view(entry: &mut Entry, rows: u16, cols: u16, cell: (u16, u16)) {
     match resize_entry(entry, rows, cols, cell) {
         Ok(()) => entry.refused = None,
@@ -829,6 +898,8 @@ fn follow_view(entry: &mut Entry, rows: u16, cols: u16, cell: (u16, u16)) {
         }
         Err(_) => {}
     }
+    entry.sized = true;
+    start_waiting(entry);
 }
 
 fn resize_entry(entry: &mut Entry, rows: u16, cols: u16, cell: (u16, u16)) -> Result<(), String> {
@@ -946,7 +1017,8 @@ pub fn snapshot(id: i64) -> Result<Snapshot, String> {
             alternate_screen: engine.alternate_screen(),
             text: entry.engine.text(),
             title: entry.engine.notifications().title.clone(),
-            running: entry.transport.is_some() && entry.exit.is_none(),
+            running: (entry.transport.is_some() || entry.starting.is_some())
+                && entry.exit.is_none(),
             exit: match &entry.exit {
                 Some(Ok(code)) => Some(i64::from(*code)),
                 _ => None,
@@ -993,14 +1065,21 @@ pub(crate) fn close_budget(budget: &Budget) {
     drop(closed);
 }
 
-/// Parses output waiting for `budget`'s terminals on the session's thread,
-/// answering whether any screen changed and the events applications hear.
 /// When the next animated image any terminal shows changes frame.
 pub(crate) fn animation_due() -> Option<i64> {
     TERMINALS
         .lock()
         .values()
         .filter_map(|entry| entry.animation_due)
+        .min()
+}
+
+/// When the first program waiting for its view starts without one.
+pub(crate) fn start_due() -> Option<Instant> {
+    TERMINALS
+        .lock()
+        .values()
+        .filter_map(|entry| entry.starting.as_ref().map(|s| s.due))
         .min()
 }
 
@@ -1029,7 +1108,15 @@ pub(crate) fn pump(budget: &Budget, held: bool) -> (bool, Vec<UiMsg>) {
     let mut changed = false;
     let mut events = Vec::new();
     let mut terminals = TERMINALS.lock();
+    let now = Instant::now();
     for (id, entry) in terminals.iter_mut().filter(|(_, e)| e.budget == *budget) {
+        if entry.starting.as_ref().is_some_and(|s| s.due <= now) {
+            start_waiting(entry);
+        }
+        if let Some(why) = entry.start_failure.take() {
+            changed = true;
+            events.push(UiMsg::Terminal(*id, Event::NotStarted(why)));
+        }
         if let Some(why) = entry.refusal.take() {
             changed = true;
             events.push(UiMsg::Terminal(*id, Event::Refused(why)));

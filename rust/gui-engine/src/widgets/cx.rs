@@ -78,6 +78,9 @@ pub struct LayoutCx {
     /// The window's size, for widgets that size to it.
     pub window: Size,
     pub animating: Vec<String>,
+    /// The window's commands, for widgets that list them; empty outside a
+    /// window's layout.
+    pub registry: Arc<[Command]>,
 }
 
 impl LayoutCx {
@@ -87,6 +90,7 @@ impl LayoutCx {
             states: states.clone(),
             window,
             animating: vec![],
+            registry: Arc::default(),
         }
     }
 

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 
-use portable_pty::{CommandBuilder, MasterPty};
+use portable_pty::{CommandBuilder, MasterPty, PtyPair};
 use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle, WAIT_OBJECT_0};
 use windows_sys::Win32::System::IO::CancelSynchronousIo;
 use windows_sys::Win32::System::Threading::{
@@ -96,33 +96,36 @@ fn terminate(process: &OwnedHandle) -> Result<(), String> {
     }
 }
 
-impl Pty {
-    /// Starts `command` on a new pseudo-console of `rows` x `cols`; `wake`
-    /// runs on an IO thread when output, end of stream or exit arrives.
-    pub fn spawn(
-        command: &Command,
-        rows: u16,
-        cols: u16,
-        cell: (u16, u16),
-        budget: &Budget,
-        wake: Arc<dyn Fn() + Send + Sync>,
-        sink: Sink,
-    ) -> Result<Self, String> {
-        check_command(&command.program, &command.args)?;
-        let slot = Slot::acquire()?;
-        let notify = Arc::new(Notify::new(wake));
-        let lease = budget.reserve(3 * INPUT + 5 * STACK + 4 * CHUNK + 3 * BATCH + 64 * 1024)?;
-        let pair = portable_pty::native_pty_system()
-            .openpty(pty_size(rows, cols, cell)?)
+/// A pseudo-console opened for a program that has not started yet, so the
+/// program can start at a size set after the opening.
+pub struct Opened {
+    pair: PtyPair,
+    builder: CommandBuilder,
+    slot: Slot,
+    lease: Lease,
+    wake: Arc<dyn Fn() + Send + Sync>,
+    sink: Sink,
+}
+
+impl Opened {
+    /// Starts the program on a screen of `rows` x `cols`. The size is set
+    /// before the program exists, so it reads it at its start and is never
+    /// told of a change.
+    pub fn start(self, rows: u16, cols: u16, cell: (u16, u16)) -> Result<Pty, String> {
+        let Self {
+            pair,
+            builder,
+            slot,
+            lease,
+            wake,
+            sink,
+        } = self;
+        pair.master
+            .resize(pty_size(rows, cols, cell)?)
             .map_err(|e| e.to_string())?;
+        let notify = Arc::new(Notify::new(wake));
         let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
         let mut writer = pair.master.take_writer().map_err(|e| e.to_string())?;
-        let mut builder = CommandBuilder::new(&command.program);
-        builder.args(&command.args);
-        super::transport::environment(&mut builder, command);
-        if !command.cwd.is_empty() {
-            builder.cwd(&command.cwd);
-        }
         let mut child = pair
             .slave
             .spawn_command(builder)
@@ -145,7 +148,7 @@ impl Pty {
         let ending = Arc::new(Ending::default());
         let closing = Arc::new(AtomicBool::new(false));
         let handoff = Arc::new(Handoff::new());
-        let mut pty = Self {
+        let mut pty = Pty {
             master: Some(pair.master),
             process,
             pid,
@@ -237,6 +240,57 @@ impl Pty {
                 .map_err(|e| e.to_string())?,
         );
         Ok(pty)
+    }
+}
+
+impl Pty {
+    /// Opens a pseudo-console of `rows` x `cols` for `command`; `wake` runs
+    /// on an IO thread when output, end of stream or exit arrives once it
+    /// starts.
+    pub fn open(
+        command: &Command,
+        rows: u16,
+        cols: u16,
+        cell: (u16, u16),
+        budget: &Budget,
+        wake: Arc<dyn Fn() + Send + Sync>,
+        sink: Sink,
+    ) -> Result<Opened, String> {
+        check_command(&command.program, &command.args)?;
+        let slot = Slot::acquire()?;
+        let lease = budget.reserve(3 * INPUT + 5 * STACK + 4 * CHUNK + 3 * BATCH + 64 * 1024)?;
+        let pair = portable_pty::native_pty_system()
+            .openpty(pty_size(rows, cols, cell)?)
+            .map_err(|e| e.to_string())?;
+        let mut builder = CommandBuilder::new(&command.program);
+        builder.args(&command.args);
+        super::transport::environment(&mut builder, command);
+        if !command.cwd.is_empty() {
+            builder.cwd(&command.cwd);
+        }
+        Ok(Opened {
+            pair,
+            builder,
+            slot,
+            lease,
+            wake,
+            sink,
+        })
+    }
+
+    /// Starts `command` on a new pseudo-console of `rows` x `cols`, as `open`
+    /// and `Opened::start` do together.
+    #[cfg(test)]
+    pub fn spawn(
+        command: &Command,
+        rows: u16,
+        cols: u16,
+        cell: (u16, u16),
+        budget: &Budget,
+        wake: Arc<dyn Fn() + Send + Sync>,
+        sink: Sink,
+    ) -> Result<Self, String> {
+        Self::open(command, rows, cols, cell, budget, wake, sink)?.start(rows, cols, cell)
     }
 
     /// Queues input for the program without blocking.

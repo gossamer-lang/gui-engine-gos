@@ -231,9 +231,9 @@ pub fn palette_request(commands: &[Command]) -> DialogRequest {
     let mut options = vec![];
     for c in commands {
         let label = if c.enabled {
-            c.label.clone()
+            c.palette_label()
         } else {
-            format!("{} (unavailable)", c.label)
+            format!("{} (unavailable)", c.palette_label())
         };
         let shortcut = c.shortcut_label();
         options.push((

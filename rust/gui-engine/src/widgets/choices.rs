@@ -162,13 +162,22 @@ pub fn layout_choice(ch: &Choice, c: Constraints, cx: &mut LayoutCx) -> Node {
             n.parts = tokens;
             n
         }
-        Choice::Commands(_) => {
+        Choice::Commands(p) => {
             let width = if c.has_bounded_width() {
                 c.max_width.min(theme.px(560))
             } else {
                 theme.px(420)
             };
-            let height = h + theme.row_height() * VISIBLE_ROWS + theme.px(8);
+            // The widget ends below the last row its list shows, so the space
+            // under a short list belongs to what lies beneath; without the
+            // window's commands it holds a full list.
+            let rows = if cx.registry.is_empty() {
+                VISIBLE_ROWS
+            } else {
+                let filter = cx.states.choice_state(&p.id).filter;
+                (palette_items(&cx.registry, &filter).len() as i64).clamp(1, VISIBLE_ROWS)
+            };
+            let height = h + theme.px(4) + theme.row_height() * rows + theme.px(8);
             Node::leaf(c.constrain(Size::new(width, height)))
         }
     }
@@ -456,18 +465,20 @@ pub fn paint_choice(ch: &Choice, node: &Node, cx: &mut PaintCx) {
                 cx.canvas
                     .rect(tx + cr.x, ty + cr.y, theme.px(2), cr.height, theme.text)
             }
-            let list = cx.abs(Rect::new(
-                0,
-                h + theme.px(4),
-                r.width,
-                r.height - h - theme.px(4),
-            ));
             let items = palette_items(&cx.registry, &st.filter);
             let mut shown_state = st;
             shown_state.items = items.clone().into();
             if shown_state.highlighted_index() < 0 && !items.is_empty() {
                 shown_state.highlighted = items[0].key.clone()
             };
+            // The list is as tall as the rows it shows, within the widget.
+            let rows = (items.len() as i64).clamp(1, shown_state.visible_rows());
+            let list = cx.abs(Rect::new(
+                0,
+                h + theme.px(4),
+                r.width,
+                (r.height - h - theme.px(4)).min(rows * theme.row_height() + theme.px(8)),
+            ));
             completion::paint_list(
                 &shown_state,
                 list,
@@ -490,7 +501,7 @@ pub fn palette_items(registry: &[crate::commands::Command], query: &str) -> Vec<
         if !c.visible {
             continue;
         };
-        let mut it = CompletionItem::new(&c.id, &c.label);
+        let mut it = CompletionItem::new(&c.id, &c.palette_label());
         it.detail = c.shortcut_label();
         it.category = c.category.clone();
         it.disabled = !c.enabled;
@@ -936,7 +947,7 @@ fn palette_event(p: &Palette, node: &Node, ev: &Event, st: &mut StateStore, cx: 
         Event::Text(t) => {
             cs.filter += t;
             cs.set_items(&palette_items(&cx.registry, &cs.filter));
-            cx.redraw = true;
+            cx.relayout = true;
             cx.consume()
         }
         Event::KeyDown { key, .. } => match key {
@@ -944,6 +955,7 @@ fn palette_event(p: &Palette, node: &Node, ev: &Event, st: &mut StateStore, cx: 
                 if let Some(it) = cs.current() {
                     cx.run_command(&it.key);
                     cs.filter = "".to_string();
+                    cx.relayout = true;
                 } else if let Some(it) = cs.items.iter().find(|i| i.key == cs.highlighted) {
                     cx.announce(&crate::localization::message(
                         "choices",
@@ -964,15 +976,16 @@ fn palette_event(p: &Palette, node: &Node, ev: &Event, st: &mut StateStore, cx: 
                         )
                         .to_string();
                     cs.set_items(&palette_items(&cx.registry, &cs.filter));
-                    cx.redraw = true;
+                    cx.relayout = true;
                 }
                 cx.consume()
             }
             Key::Escape => {
                 if !cs.filter.is_empty() {
                     cs.filter = "".to_string();
+                    cs.highlighted = String::new();
                     cs.set_items(&palette_items(&cx.registry, ""));
-                    cx.redraw = true;
+                    cx.relayout = true;
                     cx.consume()
                 }
             }
@@ -1267,6 +1280,28 @@ mod tests {
     use crate::style::Theme;
     use crate::widgets::completion::{ChoiceState, CompletionItem};
     use crate::widgets::state::{StateStore, WState};
+
+    #[test]
+    fn palette_names_commands_by_category_and_matches_the_category_too() {
+        let reg = vec![
+            Command::new("t.koi8", "KOI8-R").category("Set Encoding"),
+            Command::new("t.split", "Split Right").category("Terminal"),
+            Command::new("bare", "Uncategorized"),
+        ];
+        let all = palette_items(&reg, "");
+        let labels: Vec<&str> = all.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "Set Encoding: KOI8-R",
+                "Terminal: Split Right",
+                "Uncategorized"
+            ]
+        );
+        let found = palette_items(&reg, "encoding");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].key, "t.koi8");
+    }
 
     #[test]
     fn palette_lists_enabled_matches_first() {

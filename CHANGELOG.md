@@ -1,9 +1,9 @@
 # Changelog
 
-## 0.2.13 - A cursor that blinks without repainting
+## 0.2.13 - Cursor blinks without repaint
 
-- macOS: a focused terminal's blinking cursor is shown in a layer of its own, so a blink repaints nothing and needs no second window buffer. A blinking cursor takes about 0.3% CPU instead of 2.3%, and a window at rest keeps one buffer. The cursor looks exactly as before, and a menu or the bell flash drawn over it still covers it.
-- `PaintCx::fill_overlay` and `Canvas::overlay` draw a fill that may be shown this way; elsewhere it paints as a plain rectangle.
+- macOS: a blinking cursor gets its own layer, so a blink no longer repaints the window.
+- `PaintCx::fill_overlay` draws a fill that can be shown this way.
 - Builds on windowing-gos 0.1.17.
 
 ## 0.2.12 - Less CPU for streaming output

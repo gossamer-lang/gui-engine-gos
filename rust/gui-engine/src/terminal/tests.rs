@@ -6,7 +6,6 @@ fn options(rows: i64, cols: i64, scrollback: i64) -> Options {
         cols,
         scrollback,
         byte_limit: 16 * 1024 * 1024,
-        start_at_view_size: false,
     }
 }
 
@@ -19,12 +18,17 @@ fn shell(script: &str) -> Command {
     }
 }
 
+// Runs `body` with the budget of a running session, where a program waits
+// for its view to size its screen before it starts.
 #[cfg(unix)]
-fn waiting_for_size(rows: i64, cols: i64) -> Options {
-    Options {
-        start_at_view_size: true,
-        ..options(rows, cols, 10)
-    }
+fn in_session(name: &'static str, body: impl FnOnce(&Budget) + Send + 'static) {
+    crate::testing::on_ui_thread(move || {
+        let config = crate::services::private_test_config();
+        let _defer = scopeguard::guard((), |_| crate::services::remove_test_config(&config));
+        let mut s = crate::app::start(name, &format!("dev.gossamer.gui-terminal-{name}")).unwrap();
+        body(&crate::app::effects::current_budget());
+        s.shutdown();
+    })
 }
 
 #[cfg(unix)]
@@ -38,63 +42,66 @@ fn pump_until_text(budget: &Budget, id: i64, wanted: &str) {
 #[cfg(unix)]
 #[test]
 fn a_program_waiting_for_its_size_starts_at_the_size_resize_sets_and_reads_earlier_input() {
-    let budget = Budget::new(64 * 1024 * 1024);
-    let id = create(&waiting_for_size(4, 30), budget.clone()).unwrap();
-    spawn(id, &shell("stty size; read x; echo got:$x; read y")).unwrap();
-    let waiting = snapshot(id).unwrap();
-    assert!(waiting.running);
-    assert_eq!(
-        waiting.pid, 0,
-        "the program started before its size was set"
-    );
-    input(id, b"early\n").unwrap();
-    assert!(spawn(id, &shell("true")).is_err());
-    assert!(pump(&budget, false).1.is_empty());
-    assert_eq!(snapshot(id).unwrap().pid, 0);
-    resize(id, 6, 33).unwrap();
-    assert_ne!(snapshot(id).unwrap().pid, 0);
-    pump_until_text(&budget, id, "got:early");
-    assert!(snapshot(id).unwrap().text.contains("6 33"));
-    close(id);
+    in_session("sized-by-resize", |budget| {
+        let id = create(&options(4, 30, 10), budget.clone()).unwrap();
+        spawn(id, &shell("stty size; read x; echo got:$x; read y")).unwrap();
+        let waiting = snapshot(id).unwrap();
+        assert!(waiting.running);
+        assert_eq!(
+            waiting.pid, 0,
+            "the program started before its size was set"
+        );
+        input(id, b"early\n").unwrap();
+        assert!(spawn(id, &shell("true")).is_err());
+        assert!(pump(budget, false).1.is_empty());
+        assert_eq!(snapshot(id).unwrap().pid, 0);
+        resize(id, 6, 33).unwrap();
+        assert_ne!(snapshot(id).unwrap().pid, 0);
+        pump_until_text(budget, id, "got:early");
+        assert!(snapshot(id).unwrap().text.contains("6 33"));
+        close(id);
+    })
 }
 
 #[cfg(unix)]
 #[test]
 fn a_program_no_view_sizes_starts_at_the_screens_size_once_its_wait_is_over() {
-    let budget = Budget::new(64 * 1024 * 1024);
-    let id = create(&waiting_for_size(5, 31), budget.clone()).unwrap();
-    spawn(id, &shell("stty size; read x")).unwrap();
-    let due = start_due().unwrap();
-    assert!(due > Instant::now());
-    with(id, |entry| {
-        entry.starting.as_mut().unwrap().due = Instant::now();
-        Ok(())
+    in_session("start-wait", |budget| {
+        let id = create(&options(5, 31, 10), budget.clone()).unwrap();
+        spawn(id, &shell("stty size; read x")).unwrap();
+        let due = start_due().unwrap();
+        assert!(due > Instant::now());
+        with(id, |entry| {
+            entry.starting.as_mut().unwrap().due = Instant::now();
+            Ok(())
+        })
+        .unwrap();
+        pump_until_text(budget, id, "5 31");
+        assert!(with(id, |entry| Ok(entry.starting.is_none())).unwrap());
+        close(id);
     })
-    .unwrap();
-    pump_until_text(&budget, id, "5 31");
-    assert!(with(id, |entry| Ok(entry.starting.is_none())).unwrap());
-    close(id);
 }
 
 #[cfg(unix)]
 #[test]
 fn a_program_waiting_for_its_size_is_refused_at_once_when_it_cannot_be_found() {
-    let budget = Budget::new(64 * 1024 * 1024);
-    let id = create(&waiting_for_size(4, 30), budget.clone()).unwrap();
-    for program in [
-        "gui-engine-no-such-program",
-        "/nonexistent/program",
-        "./nope",
-        "/tmp",
-    ] {
-        let command = Command {
-            program: program.into(),
-            ..Command::default()
-        };
-        assert!(spawn(id, &command).is_err(), "{program} was accepted");
-    }
-    assert!(!snapshot(id).unwrap().running);
-    close(id);
+    in_session("start-refused", |budget| {
+        let id = create(&options(4, 30, 10), budget.clone()).unwrap();
+        for program in [
+            "gui-engine-no-such-program",
+            "/nonexistent/program",
+            "./nope",
+            "/tmp",
+        ] {
+            let command = Command {
+                program: program.into(),
+                ..Command::default()
+            };
+            assert!(spawn(id, &command).is_err(), "{program} was accepted");
+        }
+        assert!(!snapshot(id).unwrap().running);
+        close(id);
+    })
 }
 
 #[cfg(unix)]
@@ -105,7 +112,7 @@ fn the_pump_reports_the_foreground_job_and_its_directory_as_they_change() {
     let dir = std::env::temp_dir().canonicalize().unwrap();
     let command = Command {
         cwd: dir.to_string_lossy().into_owned(),
-        ..shell("set -m; printf idle; read x; sh -c 'printf busy; read z'; read y")
+        ..shell("set -m; printf idle; read x; cat; read y")
     };
     spawn(id, &command).unwrap();
     let mut heard = Vec::new();
@@ -123,43 +130,55 @@ fn the_pump_reports_the_foreground_job_and_its_directory_as_they_change() {
     };
     let cwd = dir.to_string_lossy().into_owned();
     pump_until_heard(&Event::Foreground(String::new(), cwd.clone()));
+    // `cat` prints nothing until it reads a line, which shows it in front.
     input(id, b"\n").unwrap();
-    pump_until_heard(&Event::Foreground("sh".into(), cwd.clone()));
-    assert_eq!(heard.len(), 2, "{heard:?}");
+    input(id, b"line\n").unwrap();
+    // Output written between the shell's fork and its exec of `cat` names
+    // the forked shell, so the job may be heard as `sh` on the way.
+    pump_until_heard(&Event::Foreground("cat".into(), cwd.clone()));
+    assert_eq!(
+        heard.first(),
+        Some(&Event::Foreground(String::new(), cwd.clone()))
+    );
+    assert_eq!(
+        heard.last(),
+        Some(&Event::Foreground("cat".into(), cwd.clone()))
+    );
     close(id);
 }
 
 #[cfg(unix)]
 #[test]
 fn a_program_that_cannot_start_once_sized_is_reported_from_the_pump() {
-    use std::os::unix::fs::PermissionsExt;
+    in_session("start-failed", |budget| {
+        use std::os::unix::fs::PermissionsExt;
 
-    let budget = Budget::new(64 * 1024 * 1024);
-    let dir = std::env::temp_dir().join(format!("gui-start-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let program = dir.join("vanishing");
-    std::fs::write(&program, "#!/bin/sh\n").unwrap();
-    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let id = create(&waiting_for_size(4, 30), budget.clone()).unwrap();
-    let command = Command {
-        program: program.to_str().unwrap().into(),
-        ..Command::default()
-    };
-    spawn(id, &command).unwrap();
-    std::fs::remove_file(&program).unwrap();
-    resize(id, 6, 33).unwrap();
-    let (changed, events) = pump(&budget, false);
-    assert!(changed);
-    assert!(
-        events
-            .iter()
-            .any(|m| matches!(m, UiMsg::Terminal(t, Event::NotStarted(_)) if *t == id)),
-        "{events:?}"
-    );
-    assert!(!snapshot(id).unwrap().running);
-    assert!(input(id, b"x").is_err());
-    close(id);
-    let _ = std::fs::remove_dir_all(&dir);
+        let dir = std::env::temp_dir().join(format!("gui-start-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let program = dir.join("vanishing");
+        std::fs::write(&program, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let id = create(&options(4, 30, 10), budget.clone()).unwrap();
+        let command = Command {
+            program: program.to_str().unwrap().into(),
+            ..Command::default()
+        };
+        spawn(id, &command).unwrap();
+        std::fs::remove_file(&program).unwrap();
+        resize(id, 6, 33).unwrap();
+        let (changed, events) = pump(budget, false);
+        assert!(changed);
+        assert!(
+            events
+                .iter()
+                .any(|m| matches!(m, UiMsg::Terminal(t, Event::NotStarted(_)) if *t == id)),
+            "{events:?}"
+        );
+        assert!(!snapshot(id).unwrap().running);
+        assert!(input(id, b"x").is_err());
+        close(id);
+        let _ = std::fs::remove_dir_all(&dir);
+    })
 }
 
 #[test]
@@ -893,11 +912,7 @@ mod session {
                 crate::services::remove_test_config(&config);
             });
             let mut s = crate::app::start("Terminal", "dev.gossamer.gui-terminal-sized").unwrap();
-            let id = create(
-                &waiting_for_size(8, 40),
-                crate::app::effects::current_budget(),
-            )
-            .unwrap();
+            let id = create(&options(8, 40, 10), crate::app::effects::current_budget()).unwrap();
             s.set_shell(
                 |_| {},
                 move |_| Widget::Terminal(widget::View::new("term", id, "Shell")),
@@ -972,16 +987,29 @@ mod session {
         crate::testing::on_ui_thread(|| {
             let config = crate::services::private_test_config();
             let _defer = scopeguard::guard((), |_| crate::services::remove_test_config(&config));
-            let script = "stty raw -echo; printf 'ready\\r\\n'; \
-                          v=$(head -c 300000 | tail -c 5); printf 'got:%s\\r\\n' \"$v\"; read x";
-            let (mut s, id, _) = shown_program("large-paste", script);
+            // The program reads nothing until the gate opens, so the paste
+            // is still going out when the typing arrives behind it.
+            let dir = std::env::temp_dir().join(format!("gui-paste-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let gate = dir.join("gate");
+            let path = std::ffi::CString::new(gate.to_str().unwrap()).unwrap();
+            // SAFETY: `path` is a NUL-terminated path in a directory this test owns.
+            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+            let script = format!(
+                "stty raw -echo; printf 'ready\\r\\n'; read g < '{}'; \
+                 v=$(head -c 300000 | tail -c 5); printf 'got:%s\\r\\n' \"$v\"; read x",
+                gate.display()
+            );
+            let (mut s, id, _) = shown_program("large-paste", &script);
             paste(id, &"a".repeat(299_995)).unwrap();
             assert!(pasting(id));
             input(id, b"XYZ12").unwrap();
+            std::fs::write(&gate, "\n").unwrap();
             step_until(&mut s, || snapshot(id).unwrap().text.contains("got:XYZ12"));
             assert!(!pasting(id));
             close(id);
             s.shutdown();
+            let _ = std::fs::remove_dir_all(&dir);
         })
     }
 
@@ -1719,7 +1747,6 @@ fn a_terminal_that_settles_has_its_history_compacted_off_the_session_thread() {
             cols: 80,
             scrollback: 10_000,
             byte_limit: 64 * 1024 * 1024,
-            ..Options::default()
         },
         budget.clone(),
     )
@@ -1760,7 +1787,6 @@ fn a_long_history_opens_within_its_byte_limit_and_keeps_the_newest_rows() {
             cols: 82,
             scrollback: 100_000,
             byte_limit: limit,
-            ..Options::default()
         },
         budget.clone(),
     )
@@ -1788,7 +1814,6 @@ fn a_long_history_opens_within_its_byte_limit_and_keeps_the_newest_rows() {
         cols: 512,
         scrollback: 0,
         byte_limit: 1024 * 1024,
-        ..Options::default()
     };
     assert_eq!(
         create(&small, budget).unwrap_err(),

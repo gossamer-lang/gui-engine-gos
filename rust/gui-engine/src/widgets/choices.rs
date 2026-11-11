@@ -53,11 +53,15 @@ pub struct Picker {
     pub error: String,
 }
 
-/// A command search list shown inline.
+/// A search list shown inline: over the window's commands, which it runs,
+/// or over `items`, the one chosen reported as `UiMsg::Chosen(id, key)`.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Palette {
     pub id: String,
     pub placeholder: String,
+    /// The entries a quick pick offers, in the order it lists them.
+    #[serde(default)]
+    pub items: Option<SharedItems>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -171,11 +175,11 @@ pub fn layout_choice(ch: &Choice, c: Constraints, cx: &mut LayoutCx) -> Node {
             // The widget ends below the last row its list shows, so the space
             // under a short list belongs to what lies beneath; without the
             // window's commands it holds a full list.
-            let rows = if cx.registry.is_empty() {
+            let rows = if cx.registry.is_empty() && p.items.is_none() {
                 VISIBLE_ROWS
             } else {
                 let filter = cx.states.choice_state(&p.id).filter;
-                (palette_items(&cx.registry, &filter).len() as i64).clamp(1, VISIBLE_ROWS)
+                (entries(p, &cx.registry, &filter).len() as i64).clamp(1, VISIBLE_ROWS)
             };
             let line = theme.border_width().max(1);
             let height = h + line + theme.row_height() * rows + line;
@@ -466,14 +470,19 @@ pub fn paint_choice(ch: &Choice, node: &Node, cx: &mut PaintCx) {
                     .rect(tx + cr.x, ty + cr.y, theme.px(2), cr.height, theme.text)
             }
             cx.canvas.rect(a.x, a.y + h, r.width, line, theme.border);
-            let items = palette_items(&cx.registry, &st.filter);
+            let items = entries(p, &cx.registry, &st.filter);
             let mut shown_state = st;
             shown_state.items = items.clone().into();
             if shown_state.highlighted_index() < 0 && !items.is_empty() {
                 shown_state.highlighted = items[0].key.clone()
             };
             let list = cx.abs(palette_list(r, &theme));
-            paint_palette_rows(&shown_state, list, cx);
+            let empty = if p.items.is_some() {
+                crate::localization::tr("Nothing matches")
+            } else {
+                crate::localization::tr("No matching commands")
+            };
+            paint_palette_rows(&shown_state, list, &empty, cx);
         }
     }
 }
@@ -487,7 +496,7 @@ fn palette_list(r: Rect, theme: &Theme) -> Rect {
 
 // The palette's rows from `state.first`, each a full-width band, its name at
 // the left and its shortcut at the right.
-fn paint_palette_rows(state: &completion::ChoiceState, list: Rect, cx: &mut PaintCx) {
+fn paint_palette_rows(state: &completion::ChoiceState, list: Rect, empty: &str, cx: &mut PaintCx) {
     let theme = cx.theme.clone();
     let row = theme.row_height();
     let pad = theme.px(12);
@@ -495,11 +504,7 @@ fn paint_palette_rows(state: &completion::ChoiceState, list: Rect, cx: &mut Pain
     let body = theme.font(TextRole::Body);
     let small = theme.font(TextRole::Small);
     if state.items.is_empty() {
-        let l = layout::layout(
-            &crate::localization::tr("No matching commands"),
-            &body,
-            LayoutOptions::single_line(),
-        );
+        let l = layout::layout(empty, &body, LayoutOptions::single_line());
         layout::draw(
             &mut cx.canvas,
             &l,
@@ -588,6 +593,33 @@ fn palette_hit(
         return String::new();
     }
     state.items[i as usize].key.clone()
+}
+
+// The entries palette `p` lists for `query`: its own items, or the window's
+// commands.
+fn entries(p: &Palette, registry: &[crate::commands::Command], query: &str) -> Vec<CompletionItem> {
+    match &p.items {
+        Some(items) => pick_items(items, query),
+        None => palette_items(registry, query),
+    }
+}
+
+/// The items of a quick pick that hold `query` anywhere, ignoring case, in
+/// their own order.
+pub fn pick_items(items: &[CompletionItem], query: &str) -> Vec<CompletionItem> {
+    items
+        .iter()
+        .filter_map(|item| {
+            if query.is_empty() {
+                return Some(item.clone());
+            }
+            let (score, ranges) = completion::match_label(&item.label, query, MatchMode::Substring);
+            (score > 0.0).then(|| CompletionItem {
+                matches: ranges,
+                ..item.clone()
+            })
+        })
+        .collect()
 }
 
 /// The palette's entries for `query`: the commands whose name, alone or
@@ -1037,9 +1069,18 @@ fn picker_event(p: &Picker, node: &Node, ev: &Event, st: &mut StateStore, cx: &m
     }
 }
 
+// Runs the command palette `p` chose, or reports the item a quick pick did.
+fn choose(p: &Palette, key: &str, cx: &mut EventCx) {
+    if p.items.is_some() {
+        cx.emit(&UiMsg::Chosen(p.id.clone(), key.to_string()))
+    } else {
+        cx.run_command(key)
+    }
+}
+
 fn palette_event(p: &Palette, node: &Node, ev: &Event, st: &mut StateStore, cx: &mut EventCx) {
     let mut cs = st.choice_state(&p.id);
-    let items = palette_items(&cx.registry, &cs.filter);
+    let items = entries(p, &cx.registry, &cs.filter);
     cs.items = items.clone().into();
     if cs.highlighted_index() < 0 && !items.is_empty() {
         cs.highlighted = items[0].key.clone()
@@ -1058,21 +1099,21 @@ fn palette_event(p: &Palette, node: &Node, ev: &Event, st: &mut StateStore, cx: 
             if !key.is_empty() {
                 cs.highlighted = key;
                 if let Some(it) = cs.current() {
-                    cx.run_command(&it.key)
+                    choose(p, &it.key, cx)
                 }
             }
             cx.consume()
         }
         Event::Text(t) => {
             cs.filter += t;
-            cs.set_items(&palette_items(&cx.registry, &cs.filter));
+            cs.set_items(&entries(p, &cx.registry, &cs.filter));
             cx.relayout = true;
             cx.consume()
         }
         Event::KeyDown { key, .. } => match key {
             Key::Return | Key::KpEnter => {
                 if let Some(it) = cs.current() {
-                    cx.run_command(&it.key);
+                    choose(p, &it.key, cx);
                     cs.filter = "".to_string();
                     cx.relayout = true;
                 } else if let Some(it) = cs.items.iter().find(|i| i.key == cs.highlighted) {
@@ -1094,7 +1135,7 @@ fn palette_event(p: &Palette, node: &Node, ev: &Event, st: &mut StateStore, cx: 
                             crate::editing::prev_boundary(&cs.filter, cs.filter.byte_len()),
                         )
                         .to_string();
-                    cs.set_items(&palette_items(&cx.registry, &cs.filter));
+                    cs.set_items(&entries(p, &cx.registry, &cs.filter));
                     cx.relayout = true;
                 }
                 cx.consume()
@@ -1103,7 +1144,7 @@ fn palette_event(p: &Palette, node: &Node, ev: &Event, st: &mut StateStore, cx: 
             Key::Tab => {
                 if let Some(it) = cs.items.iter().find(|i| i.key == cs.highlighted) {
                     cs.filter = it.label.clone();
-                    cs.set_items(&palette_items(&cx.registry, &cs.filter));
+                    cs.set_items(&entries(p, &cx.registry, &cs.filter));
                     cx.relayout = true;
                 }
                 cx.consume()
@@ -1112,7 +1153,7 @@ fn palette_event(p: &Palette, node: &Node, ev: &Event, st: &mut StateStore, cx: 
                 if !cs.filter.is_empty() {
                     cs.filter = "".to_string();
                     cs.highlighted = String::new();
-                    cs.set_items(&palette_items(&cx.registry, ""));
+                    cs.set_items(&entries(p, &cx.registry, ""));
                     cx.relayout = true;
                     cx.consume()
                 }
@@ -1408,6 +1449,29 @@ mod tests {
     use crate::style::Theme;
     use crate::widgets::completion::{ChoiceState, CompletionItem};
     use crate::widgets::state::{StateStore, WState};
+
+    #[test]
+    fn a_quick_pick_keeps_its_order_and_narrows_to_items_holding_the_search() {
+        let items = vec![
+            CompletionItem::new("/srv/web", "/srv/web"),
+            CompletionItem::new("/home/me/dev/waftty", "~/dev/waftty"),
+            CompletionItem::new("/home/me/dev/web", "~/dev/web"),
+        ];
+        let keys = |found: Vec<CompletionItem>| -> Vec<String> {
+            found.into_iter().map(|i| i.key).collect()
+        };
+        assert_eq!(
+            keys(super::pick_items(&items, "")),
+            ["/srv/web", "/home/me/dev/waftty", "/home/me/dev/web"]
+        );
+        assert_eq!(
+            keys(super::pick_items(&items, "WEB")),
+            ["/srv/web", "/home/me/dev/web"]
+        );
+        let found = super::pick_items(&items, "dev/w");
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].matches, vec![(2, 7)]);
+    }
 
     #[test]
     fn palette_names_commands_by_category_and_completes_either_name() {

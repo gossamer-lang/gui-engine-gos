@@ -8284,7 +8284,6 @@ mod advance_tests {
                 cols: 40,
                 scrollback: 100,
                 byte_limit: 1 << 20,
-                ..Options::default()
             };
             let id = terminal::create(&options, effects::current_budget()).unwrap();
             s.set_shell(
@@ -8348,7 +8347,6 @@ mod advance_tests {
                 cols: 40,
                 scrollback: 100,
                 byte_limit: 1 << 20,
-                ..Options::default()
             };
             let id = terminal::create(&options, effects::current_budget()).unwrap();
             s.set_shell(

@@ -66,11 +66,6 @@ pub struct Options {
     /// can always follow its view; it is a ceiling, and the session is
     /// charged only for the size in use.
     pub byte_limit: i64,
-    /// The program waits to start until a view or `resize` sizes the
-    /// screen, so it starts at that size instead of being told of a new one
-    /// at once (which makes a shell draw its prompt twice). Without a view it
-    /// starts at the screen's size after a short wait.
-    pub start_at_view_size: bool,
 }
 
 impl Default for Options {
@@ -80,7 +75,6 @@ impl Default for Options {
             cols: 80,
             scrollback: 2000,
             byte_limit: 64 * 1024 * 1024,
-            start_at_view_size: false,
         }
     }
 }
@@ -117,7 +111,7 @@ pub enum Event {
     /// The program could not be waited for.
     Failed(String),
     /// The program could not start once the screen was sized, so the
-    /// terminal runs none (`Options::start_at_view_size`).
+    /// terminal runs none.
     NotStarted(String),
     /// The screen could not take the size of its view within its byte limit,
     /// and keeps the size it has.
@@ -190,8 +184,6 @@ struct Entry {
     transport: Option<Transport>,
     /// A program waiting for a view to size the screen before it starts.
     starting: Option<Starting>,
-    /// Programs wait for a view to size the screen before they start.
-    start_at_view_size: bool,
     /// A view or `resize` has sized the screen since it opened.
     sized: bool,
     /// Why the waiting program could not start, for the next pump.
@@ -393,7 +385,6 @@ pub fn create(options: &Options, budget: Budget) -> Result<i64, String> {
             engine,
             transport: None,
             starting: None,
-            start_at_view_size: options.start_at_view_size,
             sized: false,
             start_failure: None,
             foreground: None,
@@ -549,8 +540,14 @@ fn take_output(entry: &mut Entry, bytes: &[u8]) {
 }
 
 /// Runs `command` on terminal `id`, which must not already run a program.
+/// In a running session the program starts once a view or `resize` sizes
+/// the screen, so it starts at that size instead of being told of a new one
+/// at once (which makes a shell draw its prompt twice); a terminal no view
+/// shows starts at its own size after a short wait. Outside a session it
+/// starts at once.
 pub fn spawn(id: i64, command: &Command) -> Result<(), String> {
     let waker = crate::app::effects::current_waker();
+    let in_session = waker.is_some();
     let wake: Arc<dyn Fn() + Send + Sync> = match waker {
         Some(waker) => Arc::new(move || {
             let _ = waker.wake();
@@ -575,7 +572,7 @@ pub fn spawn(id: i64, command: &Command) -> Result<(), String> {
         entry.exit = None;
         entry.exit_reported = false;
         entry.start_failure = None;
-        if entry.start_at_view_size && !entry.sized {
+        if in_session && !entry.sized {
             entry.starting = Some(Starting {
                 opened,
                 due: Instant::now() + START_WAIT,

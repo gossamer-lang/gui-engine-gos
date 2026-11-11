@@ -668,7 +668,7 @@ dependencies = [
 
 [[package]]
 name = "gos-windowing"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "block2",
  "getrandom 0.4.3",
@@ -698,7 +698,7 @@ dependencies = [
 
 [[package]]
 name = "gui-engine"
-version = "0.2.12"
+version = "0.2.13"
 dependencies = [
  "anyhow",
  "encoding_rs",

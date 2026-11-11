@@ -693,6 +693,13 @@ impl PaintCx {
         self.canvas.rect(r.x, r.y, r.width, r.height, color)
     }
 
+    /// A fill that changes often on its own, such as a blinking cursor, which
+    /// the window may show in a layer of its own (see `Canvas::overlay`).
+    pub fn fill_overlay(&mut self, local: Rect, color: Color) {
+        let r = self.abs(local);
+        self.canvas.overlay(r.x, r.y, r.width, r.height, color)
+    }
+
     pub fn fill_round(&mut self, local: Rect, radius: i64, color: Color) {
         let r = self.abs(local);
         self.canvas

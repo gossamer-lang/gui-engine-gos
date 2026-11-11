@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.13 - A cursor that blinks without repainting
+
+- macOS: a focused terminal's blinking cursor is shown in a layer of its own, so a blink repaints nothing and needs no second window buffer. A blinking cursor takes about 0.3% CPU instead of 2.3%, and a window at rest keeps one buffer. The cursor looks exactly as before, and a menu or the bell flash drawn over it still covers it.
+- `PaintCx::fill_overlay` and `Canvas::overlay` draw a fill that may be shown this way; elsewhere it paints as a plain rectangle.
+- Builds on windowing-gos 0.1.17.
+
 ## 0.2.12 - Less CPU for streaming output
 
 - A terminal's reader thread now only reads while output streams. It copies each read into a buffer of up to 64 KiB and goes straight back to reading. When a read finds nothing, it spins briefly, then hands the whole buffer to the parser thread before it waits. The parser and the window are woken once per burst of output instead of once per read. On macOS, where each read gets only a kilobyte, the program writing output no longer stalls while the reader parses.

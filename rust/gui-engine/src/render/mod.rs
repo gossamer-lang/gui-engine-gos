@@ -467,8 +467,12 @@ impl Canvas {
     }
 
     pub fn take_scene(&mut self) -> Option<retained::Scene> {
-        let scene = self.recording.take();
-        if self.recording_overflow { None } else { scene }
+        let mut scene = self.recording.take()?;
+        if self.recording_overflow {
+            return None;
+        }
+        scene.lower_covered_overlays();
+        Some(scene)
     }
 
     fn record(&mut self, payload: usize, make: impl FnOnce() -> retained::Primitive) -> bool {
@@ -611,6 +615,16 @@ impl Canvas {
         let c = self.clip;
         let op = self.op(color);
         blend_rect(&mut self.pixels, self.width * 4, c, op, x, y, w, h, color)
+    }
+
+    /// A filled rectangle that changes often on its own, such as a blinking
+    /// cursor: one the window may show in a layer of its own (see
+    /// `retained::Primitive::Overlay`). Paints as `rect` otherwise.
+    pub fn overlay(&mut self, x: i64, y: i64, w: i64, h: i64, color: Color) {
+        if self.record(0, || retained::Primitive::Overlay(x, y, w, h, color)) {
+            return;
+        }
+        self.rect(x, y, w, h, color)
     }
 
     /// A rectangle outline one pixel thick, inside the given bounds.

@@ -24,6 +24,11 @@ pub enum Primitive {
     Layer(i64, i64, i64, i64, Arc<[u8]>, i64, i64),
     /// A widget's own pixels, drawn by reference at their size.
     Surface(i64, i64, super::Surface),
+    /// A filled rectangle that changes often on its own, such as a blinking
+    /// cursor. Where the window shows overlays it gets a layer of its own,
+    /// so showing, hiding or moving it repaints nothing; elsewhere it paints
+    /// as `Rect`.
+    Overlay(i64, i64, i64, i64, Color),
 }
 
 #[derive(Debug, Clone)]
@@ -102,7 +107,9 @@ impl Command {
         canvas.push_clip(self.clip.intersect(within).offset(dx, dy));
         canvas.opacity = self.opacity;
         match &self.paint {
-            Primitive::Rect(x, y, w, h, c) => canvas.rect(x + dx, y + dy, *w, *h, *c),
+            Primitive::Rect(x, y, w, h, c) | Primitive::Overlay(x, y, w, h, c) => {
+                canvas.rect(x + dx, y + dy, *w, *h, *c)
+            }
             Primitive::Circle(x, y, r, c) => canvas.circle(x + dx, y + dy, *r, *c),
             Primitive::CircleStroke(x, y, r, t, c) => {
                 canvas.circle_stroke(x + dx, y + dy, *r, *t, *c)
@@ -136,6 +143,7 @@ impl Primitive {
     fn bounds(&self) -> Rect {
         match self {
             Self::Rect(x, y, w, h, _)
+            | Self::Overlay(x, y, w, h, _)
             | Self::Coverage(x, y, w, h, _, _)
             | Self::Image(x, y, w, h, _, _, _)
             | Self::Shared(x, y, w, h, _, _, _)
@@ -161,7 +169,7 @@ impl Primitive {
         std::mem::discriminant(self).hash(h);
         let color = |c: &Color, h: &mut _| [c.r, c.g, c.b, c.a].hash(h);
         match self {
-            Self::Rect(x, y, w, t, c) => {
+            Self::Rect(x, y, w, t, c) | Self::Overlay(x, y, w, t, c) => {
                 [x, y, w, t].hash(h);
                 color(c, h);
             }
@@ -240,6 +248,24 @@ pub struct Scene {
     pub commands: Vec<Command>,
 }
 impl Scene {
+    /// Turns each overlay that a later command draws over back into a plain
+    /// rect, so whatever covers it (a menu, the bell flash, the scrollbar)
+    /// still covers it; an overlay's layer would otherwise show above it.
+    pub fn lower_covered_overlays(&mut self) {
+        for i in 0..self.commands.len() {
+            let Primitive::Overlay(x, y, w, h, color) = self.commands[i].paint else {
+                continue;
+            };
+            let area = self.commands[i].bounds;
+            if self.commands[i + 1..]
+                .iter()
+                .any(|later| nonempty(later.bounds.intersect(area)))
+            {
+                let (clip, opacity) = (self.commands[i].clip, self.commands[i].opacity);
+                self.commands[i] = Command::new(Primitive::Rect(x, y, w, h, color), clip, opacity);
+            }
+        }
+    }
     pub fn bytes(&self) -> usize {
         self.commands.capacity() * std::mem::size_of::<Command>()
             + self
@@ -599,9 +625,11 @@ pub struct Retained {
     /// the thread ends, until another thread reclaims them.
     scratch: Vec<Vec<u8>>,
     pub stats: Stats,
-    /// The window shows rings in their own layers. The scrolling part of a
-    /// ring surface is left transparent so its layers show through, and
-    /// scrolling or changing rows there causes no damage (see [`ring_hole`]).
+    /// The window shows rings and overlays in their own layers. The scrolling
+    /// part of a ring surface is left transparent so its layers show through,
+    /// and scrolling or changing rows there causes no damage (see
+    /// [`ring_hole`]); overlays paint nothing into the surface at all (see
+    /// [`overlay_of`]).
     pub rings: bool,
     /// Whether the kept pixels were painted with rings turned on.
     rings_painted: bool,
@@ -733,6 +761,16 @@ impl Retained {
                 if a == b || (rings && ring_unchanged(a, b)) {
                     continue;
                 }
+                // An overlay is shown in a layer of its own, so it damages
+                // nothing in the window's surface.
+                if rings && (overlay_of(a).is_some() || overlay_of(b).is_some()) {
+                    for c in [a, b] {
+                        if overlay_of(c).is_none() {
+                            add_damage(&mut damage, c.bounds.intersect(screen));
+                        }
+                    }
+                    continue;
+                }
                 if let Some(changed) = rewritten(a, b) {
                     for rect in changed {
                         add_damage(&mut damage, rect.intersect(b.bounds).intersect(screen));
@@ -764,13 +802,13 @@ impl Retained {
                     })
             };
             for c in old {
-                if rings && unchanged_ring(c, &new_rings, true) {
+                if rings && (unchanged_ring(c, &new_rings, true) || overlay_of(c).is_some()) {
                     continue;
                 }
                 add_damage(&mut damage, c.bounds.intersect(screen));
             }
             for c in new {
-                if rings && unchanged_ring(c, &old_rings, false) {
+                if rings && (unchanged_ring(c, &old_rings, false) || overlay_of(c).is_some()) {
                     continue;
                 }
                 add_damage(&mut damage, c.bounds.intersect(screen));
@@ -798,7 +836,7 @@ impl Retained {
         // Tiles worth keeping get their own pixels up front, while the layer
         // budget has room; the rest draw into a worker's scratch tile.
         let mut room = layer_budget;
-        let mut reaching = tile_commands(scene, width, height);
+        let mut reaching = tile_commands(scene, width, height, self.rings);
         let columns = tile_count(width);
         let mut bands: Vec<Vec<Job>> = vec![];
         for y in (0..height).step_by(TILE as usize) {
@@ -965,12 +1003,16 @@ fn tile_count(extent: i64) -> i64 {
 }
 
 /// The commands of `scene` that reach each tile of a `width` x `height`
-/// frame, row by row, each tile's in scene order.
-fn tile_commands(scene: &Scene, width: i64, height: i64) -> Vec<Vec<&Command>> {
+/// frame, row by row, each tile's in scene order. With `overlays` shown in
+/// layers of their own, overlay commands paint no tile.
+fn tile_commands(scene: &Scene, width: i64, height: i64, overlays: bool) -> Vec<Vec<&Command>> {
     let (columns, rows) = (tile_count(width), tile_count(height));
     let mut reaching = vec![Vec::new(); (columns * rows) as usize];
     let screen = Rect::new(0, 0, width, height);
     for c in &scene.commands {
+        if overlays && overlay_of(c).is_some() {
+            continue;
+        }
         let b = c.bounds.intersect(screen);
         if !nonempty(b) {
             continue;
@@ -1219,6 +1261,17 @@ fn ring_unchanged(a: &Command, b: &Command) -> bool {
             .is_some_and(|rows| rows.iter().all(|r| stretch.intersect(*r) == *r))
 }
 
+/// If `c` draws an overlay, the window area it covers within its clip and
+/// its colour with the command's opacity applied.
+pub(crate) fn overlay_of(c: &Command) -> Option<(Rect, Color)> {
+    let Primitive::Overlay(x, y, w, h, color) = &c.paint else {
+        return None;
+    };
+    let area = Rect::new(*x, *y, *w, *h).intersect(c.clip);
+    let alpha = (i64::from(color.a) * c.opacity / 255).clamp(0, 255) as u8;
+    nonempty(area).then_some((area, Color { a: alpha, ..*color }))
+}
+
 /// Makes `rect` of `canvas` transparent.
 fn clear(canvas: &mut Canvas, rect: Rect) {
     let r = rect.intersect(Rect::new(0, 0, canvas.width, canvas.height));
@@ -1364,6 +1417,54 @@ mod tests {
         );
         assert_eq!(pixel(&frame, 55, 40)[3], 255);
         assert_eq!(pixel(&frame, 62, 102), [255, 0, 0, 255]);
+    }
+    #[test]
+    fn an_overlay_damages_nothing_where_layers_show_it_and_paints_as_a_rect_elsewhere() {
+        let scene = |cursor: bool| {
+            let mut c = Canvas::recording(200, 100, 1024 * 1024);
+            c.fill(Color::rgb(10, 20, 30));
+            c.rect(20, 20, 60, 20, Color::rgb(200, 200, 200));
+            if cursor {
+                c.overlay(30, 22, 8, 16, Color::rgba(250, 250, 250, 160));
+            }
+            c.take_scene().unwrap()
+        };
+        let mut r = Retained::new();
+        r.rings = true;
+        let mut frame = Canvas::new(200, 100);
+        show(&mut r, &mut frame, scene(true));
+        // The overlay paints nothing into the frame, and blinking it off and
+        // on again damages nothing.
+        assert_eq!(pixel(&frame, 32, 30), [200, 200, 200, 255]);
+        assert!(show(&mut r, &mut frame, scene(false)).is_empty());
+        assert!(show(&mut r, &mut frame, scene(true)).is_empty());
+        // Without layers it paints as the rect it is.
+        let mut plain = Retained::new();
+        let mut frame = Canvas::new(200, 100);
+        show(&mut plain, &mut frame, scene(true));
+        let mut expected = Canvas::new(200, 100);
+        expected.fill(Color::rgb(10, 20, 30));
+        expected.rect(20, 20, 60, 20, Color::rgb(200, 200, 200));
+        expected.rect(30, 22, 8, 16, Color::rgba(250, 250, 250, 160));
+        assert_eq!(pixel(&frame, 32, 30), pixel(&expected, 32, 30));
+        assert!(!show(&mut plain, &mut frame, scene(false)).is_empty());
+    }
+    #[test]
+    fn an_overlay_under_a_later_command_paints_into_the_frame() {
+        let mut c = Canvas::recording(200, 100, 1024 * 1024);
+        c.fill(Color::rgb(10, 20, 30));
+        c.overlay(30, 22, 8, 16, Color::rgba(250, 250, 250, 160));
+        c.rect(34, 10, 40, 40, Color::rgb(0, 0, 200));
+        let scene = c.take_scene().unwrap();
+        assert!(matches!(scene.commands[1].paint, Primitive::Rect(..)));
+        let mut r = Retained::new();
+        r.rings = true;
+        let mut frame = Canvas::new(200, 100);
+        show(&mut r, &mut frame, scene);
+        // The uncovered half of the cursor is in the frame, and the later
+        // rect is drawn over the covered half.
+        assert_ne!(pixel(&frame, 31, 30), [10, 20, 30, 255]);
+        assert_eq!(pixel(&frame, 36, 30), [0, 0, 200, 255]);
     }
     #[test]
     fn incremental_pixels_match_immediate_paint_after_moves_removals_and_resize() {

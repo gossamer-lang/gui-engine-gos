@@ -1316,7 +1316,9 @@ fn paint_cursor(
             cx.fill(shape, color.with_alpha(160));
         }
     } else if cx.caret_on || !options.blink {
-        cx.fill(shape, color.with_alpha(160));
+        // The focused cursor blinks, so it is an overlay: on macOS a blink
+        // shows or hides a small layer instead of repainting the window.
+        cx.fill_overlay(shape, color.with_alpha(160));
     }
 }
 

@@ -177,7 +177,8 @@ pub fn layout_choice(ch: &Choice, c: Constraints, cx: &mut LayoutCx) -> Node {
                 let filter = cx.states.choice_state(&p.id).filter;
                 (palette_items(&cx.registry, &filter).len() as i64).clamp(1, VISIBLE_ROWS)
             };
-            let height = h + theme.px(4) + theme.row_height() * rows + theme.px(8);
+            let line = theme.border_width().max(1);
+            let height = h + line + theme.row_height() * rows + line;
             Node::leaf(c.constrain(Size::new(width, height)))
         }
     }
@@ -413,37 +414,36 @@ pub fn paint_choice(ch: &Choice, node: &Node, cx: &mut PaintCx) {
         }
         Choice::Commands(p) => {
             let st = cx.states.choice_state(&p.id);
-            let h = theme.control_height();
-            let field = Rect::new(0, 0, r.width, h);
-            cx.fill_round(field, theme.radius(), theme.field);
             let focused = cx.is_focused(&p.id);
+            let h = theme.control_height();
+            let line = theme.border_width().max(1);
+            // One panel: the prompt line, a rule, and the commands under it.
+            cx.fill_round(r, 0, theme.field);
             cx.stroke_round(
-                field,
-                theme.radius(),
-                if focused {
-                    theme.border_width() * 2
-                } else {
-                    theme.border_width()
-                },
+                r,
+                0,
+                line,
                 if focused { theme.accent } else { theme.border },
             );
-            let a = cx.abs(field);
-            let isz = theme.px(theme.shape.field_icon);
-            cx.icon(
-                &Icon::Search,
-                a.x + theme.px(10),
-                a.y + (h - isz) / 2,
-                isz,
-                theme.text_muted,
+            let a = cx.abs(Rect::new(0, 0, r.width, h));
+            let pad = theme.px(12);
+            let prompt = layout::layout(">", &body, LayoutOptions::single_line());
+            let ty = a.y + (h - prompt.height.ceil() as i64) / 2;
+            layout::draw(
+                &mut cx.canvas,
+                &prompt,
+                (a.x + pad) as f64,
+                ty as f64,
+                &body,
+                theme.accent,
             );
+            let tx = a.x + pad + prompt.width.ceil() as i64 + theme.px(8);
             let shown = if st.filter.is_empty() {
                 &p.placeholder
             } else {
                 &st.filter
             };
             let l = layout::layout(shown, &body, LayoutOptions::single_line());
-            let tx = a.x + theme.px(36);
-            let ty = a.y + (h - l.height.ceil() as i64) / 2;
             layout::draw(
                 &mut cx.canvas,
                 &l,
@@ -465,50 +465,172 @@ pub fn paint_choice(ch: &Choice, node: &Node, cx: &mut PaintCx) {
                 cx.canvas
                     .rect(tx + cr.x, ty + cr.y, theme.px(2), cr.height, theme.text)
             }
+            cx.canvas.rect(a.x, a.y + h, r.width, line, theme.border);
             let items = palette_items(&cx.registry, &st.filter);
             let mut shown_state = st;
             shown_state.items = items.clone().into();
             if shown_state.highlighted_index() < 0 && !items.is_empty() {
                 shown_state.highlighted = items[0].key.clone()
             };
-            // The list is as tall as the rows it shows, within the widget.
-            let rows = (items.len() as i64).clamp(1, shown_state.visible_rows());
-            let list = cx.abs(Rect::new(
-                0,
-                h + theme.px(4),
-                r.width,
-                (r.height - h - theme.px(4)).min(rows * theme.row_height() + theme.px(8)),
-            ));
-            completion::paint_list(
-                &shown_state,
-                list,
-                "",
-                &crate::localization::tr("No matching commands"),
-                cx,
-            );
-            if focused {
-                let rad = theme.radius();
-                cx.focus_ring(field, rad)
-            }
+            let list = cx.abs(palette_list(r, &theme));
+            paint_palette_rows(&shown_state, list, cx);
         }
     }
 }
 
-/// The palette's entries for `query`: matching commands, enabled first.
+// Where the palette's rows sit within widget rectangle `r`: under the prompt
+// line and its rule.
+fn palette_list(r: Rect, theme: &Theme) -> Rect {
+    let top = theme.control_height() + theme.border_width().max(1);
+    Rect::new(0, top, r.width, (r.height - top).max(0))
+}
+
+// The palette's rows from `state.first`, each a full-width band, its name at
+// the left and its shortcut at the right.
+fn paint_palette_rows(state: &completion::ChoiceState, list: Rect, cx: &mut PaintCx) {
+    let theme = cx.theme.clone();
+    let row = theme.row_height();
+    let pad = theme.px(12);
+    let line = theme.border_width().max(1);
+    let body = theme.font(TextRole::Body);
+    let small = theme.font(TextRole::Small);
+    if state.items.is_empty() {
+        let l = layout::layout(
+            &crate::localization::tr("No matching commands"),
+            &body,
+            LayoutOptions::single_line(),
+        );
+        layout::draw(
+            &mut cx.canvas,
+            &l,
+            (list.x + pad) as f64,
+            (list.y + (row - l.height.ceil() as i64) / 2) as f64,
+            &body,
+            theme.text_muted,
+        );
+        return;
+    }
+    let end = (state.first + state.visible_rows()).min(state.items.len() as i64);
+    let mut y = list.y;
+    for it in &state.items[state.first.max(0) as usize..end.max(0) as usize] {
+        let lit = it.key == state.highlighted;
+        if lit {
+            cx.canvas.rect(
+                list.x + line,
+                y,
+                list.width - 2 * line,
+                row,
+                theme.selection,
+            )
+        }
+        let fg = if it.disabled {
+            theme.text_disabled
+        } else if lit {
+            theme.selection_text
+        } else {
+            theme.text
+        };
+        let l = layout::layout(&it.label, &body, LayoutOptions::single_line());
+        let x = list.x + pad;
+        let ty = y + (row - l.height.ceil() as i64) / 2;
+        // The typed part of a name shows as a band under it, not color alone.
+        for (a, b) in &it.matches {
+            for band in l.selection_rects(*a, *b) {
+                cx.canvas.rect(
+                    x + band.x,
+                    ty + band.height - theme.px(2),
+                    band.width,
+                    theme.px(2),
+                    if lit {
+                        theme.selection_text.with_alpha(110)
+                    } else {
+                        theme.accent.with_alpha(140)
+                    },
+                )
+            }
+        }
+        layout::draw(&mut cx.canvas, &l, x as f64, ty as f64, &body, fg);
+        if !it.detail.is_empty() {
+            let d = layout::layout(&it.detail, &small, LayoutOptions::single_line());
+            let dx = list.right() - pad - d.width.ceil() as i64;
+            if dx > x + l.width.ceil() as i64 + pad {
+                layout::draw(
+                    &mut cx.canvas,
+                    &d,
+                    dx as f64,
+                    (y + (row - d.height.ceil() as i64) / 2) as f64,
+                    &small,
+                    if lit {
+                        theme.selection_text
+                    } else {
+                        theme.text_muted
+                    },
+                )
+            }
+        }
+        y += row;
+    }
+}
+
+// The key of the palette row at window point (`x`, `y`) in `list`, or "".
+fn palette_hit(
+    state: &completion::ChoiceState,
+    list: Rect,
+    theme: &Theme,
+    x: i64,
+    y: i64,
+) -> String {
+    if !list.contains(x, y) {
+        return String::new();
+    }
+    let i = state.first + (y - list.y) / theme.row_height();
+    if i >= state.items.len() as i64 || i >= state.first + state.visible_rows() {
+        return String::new();
+    }
+    state.items[i as usize].key.clone()
+}
+
+/// The palette's entries for `query`: the commands whose name, alone or
+/// after its category, begins with it, as typing completes a name; enabled
+/// ones first, each group by name.
 pub fn palette_items(registry: &[crate::commands::Command], query: &str) -> Vec<CompletionItem> {
     let mut items = vec![];
-    for c in registry {
-        if !c.visible {
-            continue;
+    for c in registry.iter().filter(|c| c.visible) {
+        let label = c.palette_label();
+        let matches = if query.is_empty() {
+            vec![]
+        } else {
+            let (whole, ranges) = completion::match_label(&label, query, MatchMode::Prefix);
+            if whole > 0.0 {
+                ranges
+            } else {
+                let (bare, ranges) = completion::match_label(&c.label, query, MatchMode::Prefix);
+                if bare <= 0.0 {
+                    continue;
+                }
+                // The name ends the palette's label, after its category.
+                match label.strip_suffix(c.label.as_str()) {
+                    Some(category) => {
+                        let at = category.len() as i64;
+                        ranges.iter().map(|(a, b)| (a + at, b + at)).collect()
+                    }
+                    None => vec![],
+                }
+            }
         };
-        let mut it = CompletionItem::new(&c.id, &c.palette_label());
+        let mut it = CompletionItem::new(&c.id, &label);
         it.detail = c.shortcut_label();
         it.category = c.category.clone();
         it.disabled = !c.enabled;
-        it.score = if c.enabled { 1.0 } else { 0.0 };
+        it.matches = matches;
         items.push(it)
     }
-    completion::rank(&items, query, MatchMode::Fuzzy, 200)
+    items.sort_by(|a, b| {
+        a.disabled
+            .cmp(&b.disabled)
+            .then_with(|| a.label.cmp(&b.label))
+    });
+    items
 }
 
 fn open_list(
@@ -922,12 +1044,9 @@ fn palette_event(p: &Palette, node: &Node, ev: &Event, st: &mut StateStore, cx: 
     if cs.highlighted_index() < 0 && !items.is_empty() {
         cs.highlighted = items[0].key.clone()
     };
-    let h = cx.theme.control_height();
-    let list = cx.to_window(Rect::new(
-        0,
-        h + cx.theme.px(4),
-        node.rect.width,
-        node.rect.height - h - cx.theme.px(4),
+    let list = cx.to_window(palette_list(
+        Rect::new(0, 0, node.rect.width, node.rect.height),
+        &cx.theme,
     ));
     match ev {
         Event::PointerDown { x, y, button, .. } => {
@@ -935,7 +1054,7 @@ fn palette_event(p: &Palette, node: &Node, ev: &Event, st: &mut StateStore, cx: 
                 return;
             };
             cx.focus_on(&p.id);
-            let key = completion::list_hit(&cs, list, &cx.theme, *x, *y);
+            let key = palette_hit(&cs, list, &cx.theme, *x, *y);
             if !key.is_empty() {
                 cs.highlighted = key;
                 if let Some(it) = cs.current() {
@@ -975,6 +1094,15 @@ fn palette_event(p: &Palette, node: &Node, ev: &Event, st: &mut StateStore, cx: 
                             crate::editing::prev_boundary(&cs.filter, cs.filter.byte_len()),
                         )
                         .to_string();
+                    cs.set_items(&palette_items(&cx.registry, &cs.filter));
+                    cx.relayout = true;
+                }
+                cx.consume()
+            }
+            // Tab completes the search to the highlighted command's name.
+            Key::Tab => {
+                if let Some(it) = cs.items.iter().find(|i| i.key == cs.highlighted) {
+                    cs.filter = it.label.clone();
                     cs.set_items(&palette_items(&cx.registry, &cs.filter));
                     cx.relayout = true;
                 }
@@ -1282,7 +1410,7 @@ mod tests {
     use crate::widgets::state::{StateStore, WState};
 
     #[test]
-    fn palette_names_commands_by_category_and_matches_the_category_too() {
+    fn palette_names_commands_by_category_and_completes_either_name() {
         let reg = vec![
             Command::new("t.koi8", "KOI8-R").category("Set Encoding"),
             Command::new("t.split", "Split Right").category("Terminal"),
@@ -1298,22 +1426,32 @@ mod tests {
                 "Uncategorized"
             ]
         );
-        let found = palette_items(&reg, "encoding");
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].key, "t.koi8");
+        for query in ["set enc", "koi"] {
+            let found = palette_items(&reg, query);
+            assert_eq!(found.len(), 1, "{query}");
+            assert_eq!(found[0].key, "t.koi8");
+        }
+        let split = palette_items(&reg, "SPL");
+        assert_eq!(split.len(), 1);
+        let at = "Terminal: ".len() as i64;
+        assert_eq!(split[0].matches, vec![(at, at + 3)]);
     }
 
     #[test]
-    fn palette_lists_enabled_matches_first() {
+    fn palette_lists_enabled_commands_first_and_completes_names_from_their_start() {
         let reg = vec![
             Command::new("a.open", "Open File"),
             Command::new("a.close", "Close File").enabled(false),
             Command::new("b", "Other"),
         ];
-        let items = palette_items(&reg, "file");
-        assert_eq!(items.len(), 2);
-        assert_eq!(items[0].key, "a.open");
-        assert!(items[1].disabled)
+        let all = palette_items(&reg, "");
+        let keys: Vec<&str> = all.iter().map(|i| i.key.as_str()).collect();
+        assert_eq!(keys, ["a.open", "b", "a.close"]);
+        assert!(all[2].disabled);
+        let begun = palette_items(&reg, "o");
+        let keys: Vec<&str> = begun.iter().map(|i| i.key.as_str()).collect();
+        assert_eq!(keys, ["a.open", "b"]);
+        assert!(palette_items(&reg, "file").is_empty())
     }
 
     #[test]

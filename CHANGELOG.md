@@ -4,7 +4,7 @@
 
 - `Options::start_at_view_size` holds a terminal's program until its view sizes the screen, so a shell draws its prompt once instead of erasing and redrawing it at startup.
 - `Event::NotStarted` reports a program that could not start once the screen was sized.
-- The command palette names each command with its category, as in "View: Zoom In", and its list is only as tall as the commands it shows.
+- The command palette completes a command's name as it is typed, alone or after its category ("View: Zoom In"), and Tab completes the search to the highlighted command. It shows as one panel, only as tall as the commands it lists.
 
 ## 0.2.13 - Cursor blinks without repaint
 

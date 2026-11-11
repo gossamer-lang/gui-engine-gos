@@ -99,6 +99,38 @@ fn a_program_waiting_for_its_size_is_refused_at_once_when_it_cannot_be_found() {
 
 #[cfg(unix)]
 #[test]
+fn the_pump_reports_the_foreground_job_and_its_directory_as_they_change() {
+    let budget = Budget::new(64 * 1024 * 1024);
+    let id = create(&options(4, 40, 10), budget.clone()).unwrap();
+    let dir = std::env::temp_dir().canonicalize().unwrap();
+    let command = Command {
+        cwd: dir.to_string_lossy().into_owned(),
+        ..shell("set -m; printf idle; read x; sh -c 'printf busy; read z'; read y")
+    };
+    spawn(id, &command).unwrap();
+    let mut heard = Vec::new();
+    let mut pump_until_heard = |wanted: &Event| {
+        while !heard.contains(wanted) {
+            for message in pump(&budget, false).1 {
+                if let UiMsg::Terminal(t, event @ Event::Foreground(..)) = message
+                    && t == id
+                {
+                    heard.push(event);
+                }
+            }
+            std::thread::yield_now();
+        }
+    };
+    let cwd = dir.to_string_lossy().into_owned();
+    pump_until_heard(&Event::Foreground(String::new(), cwd.clone()));
+    input(id, b"\n").unwrap();
+    pump_until_heard(&Event::Foreground("sh".into(), cwd.clone()));
+    assert_eq!(heard.len(), 2, "{heard:?}");
+    close(id);
+}
+
+#[cfg(unix)]
+#[test]
 fn a_program_that_cannot_start_once_sized_is_reported_from_the_pump() {
     use std::os::unix::fs::PermissionsExt;
 

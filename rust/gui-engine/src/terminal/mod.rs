@@ -142,6 +142,12 @@ pub enum Event {
     PasteHeld(String),
     /// The terminal's view took keyboard focus, as a click on it gives it.
     Focused,
+    /// What runs in front and where: the program name of the job in the
+    /// terminal's foreground, empty while the program itself is in front
+    /// (or where the system names no job), and the directory `cwd` reports.
+    /// Sent once the program starts and again when either changes, as
+    /// output arrives.
+    Foreground(String, String),
 }
 
 /// The state of a terminal an application reads.
@@ -190,6 +196,8 @@ struct Entry {
     sized: bool,
     /// Why the waiting program could not start, for the next pump.
     start_failure: Option<String>,
+    /// The foreground job and directory last reported.
+    foreground: Option<(String, String)>,
     budget: Budget,
     _lease: Lease,
     selection: Option<(Cell, Cell)>,
@@ -388,6 +396,7 @@ pub fn create(options: &Options, budget: Budget) -> Result<i64, String> {
             start_at_view_size: options.start_at_view_size,
             sized: false,
             start_failure: None,
+            foreground: None,
             budget,
             _lease: lease,
             selection: None,
@@ -1121,7 +1130,8 @@ pub(crate) fn pump(budget: &Budget, held: bool) -> (bool, Vec<UiMsg>) {
             changed = true;
             events.push(UiMsg::Terminal(*id, Event::Refused(why)));
         }
-        changed |= std::mem::take(&mut entry.output_shown);
+        let shown = std::mem::take(&mut entry.output_shown);
+        changed |= shown;
         entry.pumped = entry.revision;
         if entry
             .transport
@@ -1129,6 +1139,11 @@ pub(crate) fn pump(budget: &Budget, held: bool) -> (bool, Vec<UiMsg>) {
             .is_some_and(Transport::has_pending_output)
         {
             changed |= take_ending(*id, entry, &mut events, !held);
+        }
+        // A job starts, ends or changes directory around output it or its
+        // shell writes, so the foreground is looked at only then.
+        if shown || entry.foreground.is_none() {
+            report_foreground(*id, entry, &mut events);
         }
         // The transport's one wake also says the program took queued input,
         // and the drain above rearms it: a paste goes on after the drain, so
@@ -1139,6 +1154,26 @@ pub(crate) fn pump(budget: &Budget, held: bool) -> (bool, Vec<UiMsg>) {
         }
     }
     (changed, events)
+}
+
+// Reports what runs in the foreground of terminal `id`, and where, when
+// either changed since the last report.
+fn report_foreground(id: i64, entry: &mut Entry, events: &mut Vec<UiMsg>) {
+    let Some(transport) = &entry.transport else {
+        return;
+    };
+    let now = (
+        transport.job().unwrap_or_default(),
+        entry
+            .engine
+            .current_dir()
+            .or_else(|| transport.cwd())
+            .unwrap_or_default(),
+    );
+    if entry.foreground.as_ref() != Some(&now) {
+        entry.foreground = Some(now.clone());
+        events.push(UiMsg::Terminal(id, Event::Foreground(now.0, now.1)));
+    }
 }
 
 // Takes the end of terminal `id`'s output, its program's exit and the events

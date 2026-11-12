@@ -205,6 +205,38 @@ fn readiness(fd: i32, cancel: i32, events: i16, owed: &mut bool) -> Result<Wake,
     }
 }
 
+/// Reads and drops what the terminal's programs write until none holds the
+/// terminal any more, which the master reads as a hang-up.
+fn drain_until_hangup(fd: i32) {
+    let mut buffer = [0u8; 4096];
+    loop {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `pfd` is one valid pollfd for the open master descriptor.
+        let ready = unsafe { libc::poll(&mut pfd, 1, -1) };
+        if ready < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return;
+        }
+        if pfd.revents & libc::POLLIN == 0 {
+            return;
+        }
+        // SAFETY: `buffer` is writable for its length and `fd` is open.
+        let read = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
+        if read == 0 {
+            return;
+        }
+        if read < 0 && !would_block(&std::io::Error::last_os_error()) {
+            return;
+        }
+    }
+}
+
 fn would_block(error: &std::io::Error) -> bool {
     matches!(
         error.kind(),
@@ -660,14 +692,16 @@ impl Pty {
         }
     }
 
-    /// Hangs up the terminal, as closing any terminal does, and joins its
-    /// IO threads. Closing the master is the hang-up: the system sends the
-    /// program (the session leader) SIGHUP once, and a shell writes its
-    /// history and hangs up its jobs before it ends. No signal of our own
-    /// goes with it, since a shell that takes a second SIGHUP while ending
-    /// on the first exits at once, before its history is written. A thread
-    /// of its own reaps the program, so closing never waits on one that
-    /// ignores the hang-up; such a program goes on, as under any terminal.
+    /// Ends the terminal: its program hears SIGHUP once, as when any
+    /// terminal closes, and the IO threads are joined. A shell writes its
+    /// history and hangs up its jobs before it ends. The terminal stays open
+    /// meanwhile, with its output read and dropped, since the kernel's own
+    /// hang-up at the master's close would be a second SIGHUP, on which a
+    /// shell ends at once without writing its history; and an exiting
+    /// program's close of the terminal waits for its unread output (macOS).
+    /// Threads of their own reap the program and close the master once it
+    /// has gone, so closing never waits on it; a program that ignores the
+    /// hang-up goes on, as under any terminal.
     pub fn close(&mut self) -> Result<(), String> {
         if self.stopping.swap(true, Ordering::AcqRel) {
             return Ok(());
@@ -675,30 +709,46 @@ impl Pty {
         self.input.close();
         self.handoff.close();
         let _ = (&self.cancel).write_all(&[1]);
+        if self
+            .child
+            .as_mut()
+            .is_some_and(|child| child.try_wait().ok().flatten().is_none())
+        {
+            // SAFETY: the unreaped child still owns this process id.
+            unsafe { libc::kill(self.pid as i32, libc::SIGHUP) };
+        }
         for thread in [&mut self.reader, &mut self.writer] {
             if let Some(thread) = thread.take() {
                 let _ = thread.join();
             }
         }
-        // An exiting program's last close of the terminal waits for its unread
-        // output to drain while the master is open (macOS), so the master is
-        // released before the program is waited for.
-        self.master = None;
         let waiter = self.waiter.take();
         let child = self.child.take();
-        if waiter.is_none() && child.is_none() {
-            return Ok(());
+        if waiter.is_some() || child.is_some() {
+            thread::Builder::new()
+                .name("gui-pty-reap".into())
+                .stack_size(STACK)
+                .spawn(move || {
+                    if let Some(thread) = waiter {
+                        let _ = thread.join();
+                    }
+                    if let Some(mut child) = child {
+                        let _ = child.wait();
+                    }
+                })
+                .map_err(|e| e.to_string())?;
         }
+        let Some(master) = self.master.take() else {
+            return Ok(());
+        };
         thread::Builder::new()
-            .name("gui-pty-reap".into())
+            .name("gui-pty-drain".into())
             .stack_size(STACK)
             .spawn(move || {
-                if let Some(thread) = waiter {
-                    let _ = thread.join();
+                if let Some(fd) = master.as_raw_fd() {
+                    drain_until_hangup(fd);
                 }
-                if let Some(mut child) = child {
-                    let _ = child.wait();
-                }
+                drop(master);
             })
             .map(|_| ())
             .map_err(|e| e.to_string())

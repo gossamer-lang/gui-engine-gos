@@ -394,7 +394,8 @@ pub fn is_default_ignorable(c: char) -> bool {
 }
 
 /// Registers font bytes (a TTF/OTF/TTC file's contents) and answers the
-/// ids of the faces it held.
+/// ids of the faces it held, then of the bold instance of each variable face
+/// that has no bold face beside it.
 pub fn register(data: &[u8]) -> Result<Vec<FaceId>, errors::Error> {
     register_bytes(FontBytes::owned(data.to_vec()))
 }
@@ -404,10 +405,20 @@ pub fn register_static(data: &'static [u8]) -> Result<Vec<FaceId>, errors::Error
     register_bytes(FontBytes::Static(data))
 }
 
+/// Registers the font file at `path` (TTF, OTF or a TTC collection, every
+/// face it holds) before any text needs it, and answers the faces' ids. A file
+/// no process of this user can change is mapped, not read into the heap, and
+/// shares its mapping with any later load of the same file.
+pub fn register_file(path: &str) -> Result<Vec<FaceId>, errors::Error> {
+    let bytes = installed_bytes(std::path::Path::new(path), &|| true)
+        .map_err(|e| errors::wrap(e, format!("reading font {path}")))?;
+    register_bytes(bytes)
+}
+
 // Every face of a collection shares the one copy of its file.
 fn register_bytes(data: FontBytes) -> Result<Vec<FaceId>, errors::Error> {
     ensure_bundled();
-    if data.len() > FONT_BYTE_LIMIT {
+    if data.heap_bytes() > FONT_BYTE_LIMIT {
         return Err(errors::new("font exceeds its byte budget"));
     }
     let count = Face::count(&data);
@@ -425,6 +436,20 @@ fn register_bytes(data: FontBytes) -> Result<Vec<FaceId>, errors::Error> {
         }
         parsed.push(face);
     }
+    // A variable face with no bold beside it in its file draws its family's
+    // bold at 700 too, as an installed one does.
+    let bolds = parsed
+        .iter()
+        .filter(|f| {
+            !f.bold
+                && variation::axes(f).iter().any(|a| a.tag == "wght")
+                && !parsed
+                    .iter()
+                    .any(|o| o.bold && o.family == f.family && o.italic == f.italic)
+        })
+        .map(|f| at_weight(f.clone(), true))
+        .collect::<Vec<_>>();
+    parsed.extend(bolds);
     let mut faces = FACES.lock();
     let mut pending = BTreeMap::<i64, Face>::new();
     let mut ids = Vec::new();
@@ -1098,6 +1123,99 @@ mod tests {
         assert_eq!(&bytes[..], super::SANS);
         // Windows cannot truncate a mapped file, so every installed font maps there.
         assert_eq!(matches!(bytes, FontBytes::Mapped(_)), cfg!(windows));
+    }
+
+    // A TTC collection holding `fonts`, each table offset moved to where its
+    // font lands in the collection.
+    fn collection(fonts: &[&[u8]]) -> Vec<u8> {
+        let header = 12 + 4 * fonts.len();
+        let mut out = b"ttcf".to_vec();
+        out.extend_from_slice(&0x0001_0000_u32.to_be_bytes());
+        out.extend_from_slice(&(fonts.len() as u32).to_be_bytes());
+        let mut at = header;
+        for font in fonts {
+            out.extend_from_slice(&(at as u32).to_be_bytes());
+            at += font.len().next_multiple_of(4);
+        }
+        for font in fonts {
+            let base = out.len() as u32;
+            let mut font = font.to_vec();
+            let tables = u16::from_be_bytes([font[4], font[5]]) as usize;
+            for record in (0..tables).map(|t| 12 + 16 * t + 8) {
+                let offset = u32::from_be_bytes(font[record..record + 4].try_into().unwrap());
+                font[record..record + 4].copy_from_slice(&(offset + base).to_be_bytes());
+            }
+            out.extend_from_slice(&font);
+            out.resize(out.len().next_multiple_of(4), 0);
+        }
+        out
+    }
+
+    // `font` with every name `from` spells, in ASCII or UTF-16, replaced by
+    // `to` of the same length.
+    fn renamed(font: &[u8], from: &str, to: &str) -> Vec<u8> {
+        let mut out = font.to_vec();
+        let utf16 = |s: &str| {
+            s.encode_utf16()
+                .flat_map(u16::to_be_bytes)
+                .collect::<Vec<u8>>()
+        };
+        for (from, to) in [
+            (from.as_bytes().to_vec(), to.as_bytes().to_vec()),
+            (utf16(from), utf16(to)),
+        ] {
+            let mut at = 0;
+            while let Some(found) = out[at..].windows(from.len()).position(|w| w == from) {
+                out[at + found..at + found + to.len()].copy_from_slice(&to);
+                at += found + to.len();
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_registered_collection_draws_its_family_before_the_catalog_and_after_it() {
+        // A family of its own, apart from the bundled Plex faces other tests load.
+        let regular = renamed(
+            include_bytes!("../../assets/fonts/IBMPlexMono-Regular.ttf"),
+            "IBM Plex Mono",
+            "Plex TestMono",
+        );
+        let bold = renamed(
+            include_bytes!("../../assets/fonts/IBMPlexMono-Bold.ttf"),
+            "IBM Plex Mono",
+            "Plex TestMono",
+        );
+        let path =
+            std::env::temp_dir().join(format!("gui-font-collection-{}.ttc", std::process::id()));
+        let _cleanup = scopeguard::guard((), |_| {
+            let _ = std::fs::remove_file(&path);
+        });
+        std::fs::write(&path, collection(&[&regular, &bold])).unwrap();
+        let ids = super::register_file(&path.to_string_lossy()).unwrap();
+        assert_eq!(ids.len(), 2);
+        let family = super::Family::Named("Plex TestMono".to_string());
+        assert_eq!(primary(&family, false), ids[0]);
+        assert_eq!(primary(&family, true), ids[1]);
+        assert!(face(ids[1]).bold);
+        let records = crate::text::catalog::scan_file(&path.to_string_lossy()).unwrap();
+        let loaded = super::prepare_installed(&records[0], false, &|| true).unwrap();
+        assert_eq!(super::FaceId(loaded), ids[0]);
+        assert_eq!(primary(&family, false), ids[0]);
+    }
+
+    #[test]
+    fn a_registered_variable_face_also_draws_bold_at_700() {
+        let ids = super::register(&crate::text::font::variable_test_face(false)).unwrap();
+        assert_eq!(ids.len(), 2);
+        assert!(!face(ids[0]).bold);
+        assert!(face(ids[1]).bold);
+        assert_eq!(face(ids[1]).weight, 700);
+    }
+
+    #[test]
+    fn a_missing_font_file_is_an_error() {
+        assert!(super::register_file("/no/such/font.ttf").is_err());
     }
 
     #[test]

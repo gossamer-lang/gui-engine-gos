@@ -19,6 +19,18 @@ fn hosted(id: i64, args: &str) -> String {
     }
 }
 
+// The distinct families of the registered faces `ids`, in their order.
+fn registered_families(ids: &[gui_engine::text::fonts::FaceId]) -> Vec<String> {
+    let mut families = Vec::new();
+    for id in ids {
+        let family = gui_engine::text::fonts::face(*id).family;
+        if !families.contains(&family) {
+            families.push(family);
+        }
+    }
+    families
+}
+
 fn decode<T: serde::de::DeserializeOwned>(what: &str, text: &str) -> T {
     match serde_json::from_str(text) {
         Ok(v) => v,
@@ -157,6 +169,16 @@ register_module!(
 
     fn use_system_fonts(enabled: bool) {
         gui_engine::text::fonts::use_system_fonts(enabled)
+    }
+
+    fn register_font(data: Bytes) -> Result<Vec<String>, String> {
+        let ids = gui_engine::text::fonts::register(&data).map_err(|e| e.to_string())?;
+        Ok(registered_families(&ids))
+    }
+
+    fn register_font_file(path: String) -> Result<Vec<String>, String> {
+        let ids = gui_engine::text::fonts::register_file(&path).map_err(|e| e.to_string())?;
+        Ok(registered_families(&ids))
     }
 
     fn clipboard_use_memory(memory: bool) {

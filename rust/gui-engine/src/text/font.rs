@@ -75,7 +75,7 @@ impl FontBytes {
     }
 
     /// The heap the bytes occupy; a built-in or mapped file occupies none.
-    fn heap_bytes(&self) -> usize {
+    pub(crate) fn heap_bytes(&self) -> usize {
         match self {
             Self::Static(_) | Self::Mapped(_) => 0,
             Self::Shared(data) => data.len(),

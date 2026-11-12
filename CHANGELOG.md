@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.15 - Fonts from a file
+
+- `fonts::register_file` registers a font file, every face of a collection, at once, so text in an installed family can draw in it before the installed fonts' catalog is read. A file no process of the user can change is mapped rather than read into memory, and a later load of the same file reuses its faces.
+- The binding's `register_font` and `register_font_file` answer the families they add.
+- A registered variable font with no bold face beside it also draws its family's bold.
+- Builds on windowing-gos 0.1.18.
+
 ## 0.2.14 - Shells start at their window's size
 
 - A terminal's program starts once its view sizes the screen, so a shell draws its prompt once instead of erasing and redrawing it at startup. A terminal no view shows, such as a tab in the back of a window, starts after a short wait at the size a view last gave the session's terminals.

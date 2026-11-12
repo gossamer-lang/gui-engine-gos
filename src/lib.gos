@@ -125,6 +125,18 @@ pub fn use_system_fonts(enabled: bool) {
     gui_engine_host::use_system_fonts(enabled)
 }
 
+/// Registers the font in `data` (TTF, OTF or every face of a TTC), answering
+/// the families it adds.
+pub fn register_font(data: Vec<u8>) -> Result<Vec<String>, String> {
+    gui_engine_host::register_font(data)
+}
+
+/// Registers the font file at `path` at once, mapped where no process of this
+/// user can change it, answering the families it adds.
+pub fn register_font_file(path: String) -> Result<Vec<String>, String> {
+    gui_engine_host::register_font_file(path)
+}
+
 /// Adds desktop-theme icon pixels to the JSON application catalog.
 pub fn apps_with_icons(entries: String, size: i64) -> Result<String, String> {
     gui_engine_host::apps_with_icons(entries, size)

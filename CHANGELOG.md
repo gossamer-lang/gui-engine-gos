@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.16 - Timers on time
+
+- A timer no longer wakes the event loop before it is due when the system clock is being corrected. Builds on windowing-gos 0.1.19.
+
 ## 0.2.15 - Fonts from a file
 
 - `fonts::register_file` registers a font file, every face of a collection, at once, so text in an installed family can draw in it before the installed fonts' catalog is read. A file no process of the user can change is mapped rather than read into memory, and a later load of the same file reuses its faces.

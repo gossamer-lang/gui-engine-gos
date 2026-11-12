@@ -62,6 +62,9 @@ pub struct Palette {
     /// The entries a quick pick offers, in the order it lists them.
     #[serde(default)]
     pub items: Option<SharedItems>,
+    /// What a quick pick with no entries at all says.
+    #[serde(default)]
+    pub empty: String,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -477,10 +480,10 @@ pub fn paint_choice(ch: &Choice, node: &Node, cx: &mut PaintCx) {
                 shown_state.highlighted = items[0].key.clone()
             };
             let list = cx.abs(palette_list(r, &theme));
-            let empty = if p.items.is_some() {
-                crate::localization::tr("Nothing matches")
-            } else {
-                crate::localization::tr("No matching commands")
+            let empty = match &p.items {
+                Some(all) if all.is_empty() && !p.empty.is_empty() => p.empty.clone(),
+                Some(_) => crate::localization::tr("Nothing matches"),
+                None => crate::localization::tr("No matching commands"),
             };
             paint_palette_rows(&shown_state, list, &empty, cx);
         }

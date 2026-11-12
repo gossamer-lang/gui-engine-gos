@@ -1074,17 +1074,24 @@ impl Widget {
             id: id.to_string(),
             placeholder: "Search commands".to_string(),
             items: None,
+            empty: String::new(),
         }))
     }
 
     /// A list shown like the command palette over `items`, kept in their
     /// order and narrowed to those holding what is typed; the one chosen is
-    /// reported as `UiMsg::Chosen(id, key)`.
-    pub fn quick_pick(id: &str, items: &[CompletionItem], placeholder: &str) -> Widget {
+    /// reported as `UiMsg::Chosen(id, key)`. With no items it says `empty`.
+    pub fn quick_pick(
+        id: &str,
+        items: &[CompletionItem],
+        placeholder: &str,
+        empty: &str,
+    ) -> Widget {
         Widget::Choice(choices::Choice::Commands(choices::Palette {
             id: id.to_string(),
             placeholder: placeholder.to_string(),
             items: Some(items.to_vec().into()),
+            empty: empty.to_string(),
         }))
     }
 

@@ -84,6 +84,31 @@ fn a_program_no_view_sizes_starts_at_the_screens_size_once_its_wait_is_over() {
 
 #[cfg(unix)]
 #[test]
+fn a_program_no_view_sizes_starts_at_the_size_a_view_gave_the_sessions_terminals() {
+    in_session("start-like-shown", |budget| {
+        // The tab a window shows, sized by its view.
+        let shown = create(&options(5, 31, 10), budget.clone()).unwrap();
+        with(shown, |entry| {
+            follow_view(entry, 7, 33, (0, 0));
+            Ok(())
+        })
+        .unwrap();
+        // A tab behind it, which no view sizes before its wait is over.
+        let behind = create(&options(5, 31, 10), budget.clone()).unwrap();
+        spawn(behind, &shell("stty size; read x")).unwrap();
+        with(behind, |entry| {
+            entry.starting.as_mut().unwrap().due = Instant::now();
+            Ok(())
+        })
+        .unwrap();
+        pump_until_text(budget, behind, "7 33");
+        close(behind);
+        close(shown);
+    })
+}
+
+#[cfg(unix)]
+#[test]
 fn a_program_waiting_for_its_size_is_refused_at_once_when_it_cannot_be_found() {
     in_session("start-refused", |budget| {
         let id = create(&options(4, 30, 10), budget.clone()).unwrap();

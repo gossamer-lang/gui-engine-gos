@@ -23,7 +23,7 @@ mod conpty;
 mod pty;
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
@@ -50,6 +50,8 @@ const FEED_LIMIT: usize = 1024 * 1024;
 const START_WAIT: Duration = Duration::from_millis(250);
 
 static NEXT: AtomicI64 = AtomicI64::new(1);
+/// Counts the views' sizings, so the latest one in a session is known.
+static VIEWED: AtomicU64 = AtomicU64::new(1);
 static TERMINALS: LazyLock<Mutex<HashMap<i64, Entry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -186,6 +188,9 @@ struct Entry {
     starting: Option<Starting>,
     /// A view or `resize` has sized the screen since it opened.
     sized: bool,
+    /// When a view last sized the screen, in the order of `VIEWED`; 0
+    /// before one has.
+    viewed: u64,
     /// Why the waiting program could not start, for the next pump.
     start_failure: Option<String>,
     /// The foreground job and directory last reported.
@@ -386,6 +391,7 @@ pub fn create(options: &Options, budget: Budget) -> Result<i64, String> {
             transport: None,
             starting: None,
             sized: false,
+            viewed: 0,
             start_failure: None,
             foreground: None,
             budget,
@@ -543,8 +549,10 @@ fn take_output(entry: &mut Entry, bytes: &[u8]) {
 /// In a running session the program starts once a view or `resize` sizes
 /// the screen, so it starts at that size instead of being told of a new one
 /// at once (which makes a shell draw its prompt twice); a terminal no view
-/// shows starts at its own size after a short wait. Outside a session it
-/// starts at once.
+/// shows starts after a short wait, at the size a view last gave one of the
+/// session's terminals (its window's other tabs share it), or its own before
+/// any view has.
+/// Outside a session it starts at once.
 pub fn spawn(id: i64, command: &Command) -> Result<(), String> {
     let waker = crate::app::effects::current_waker();
     let in_session = waker.is_some();
@@ -904,6 +912,7 @@ fn follow_view(entry: &mut Entry, rows: u16, cols: u16, cell: (u16, u16)) {
         }
         Err(_) => {}
     }
+    entry.viewed = VIEWED.fetch_add(1, Ordering::Relaxed);
     entry.sized = true;
     start_waiting(entry);
 }
@@ -1115,8 +1124,20 @@ pub(crate) fn pump(budget: &Budget, held: bool) -> (bool, Vec<UiMsg>) {
     let mut events = Vec::new();
     let mut terminals = TERMINALS.lock();
     let now = Instant::now();
+    // A window's tabs share one size, so a program no view has sized (a tab
+    // in the back of a window) starts at the size a view gave this session's
+    // terminals last, rather than at its terminal's opening size.
+    let view_size = terminals
+        .values()
+        .filter(|e| e.budget == *budget && e.viewed > 0)
+        .max_by_key(|e| e.viewed)
+        .map(|e| (e.engine.size(), e.engine.cell()));
     for (id, entry) in terminals.iter_mut().filter(|(_, e)| e.budget == *budget) {
         if entry.starting.as_ref().is_some_and(|s| s.due <= now) {
+            // A size the screen cannot take leaves it the size it has.
+            if let Some(((rows, cols), cell)) = view_size {
+                let _ = resize_entry(entry, rows, cols, cell);
+            }
             start_waiting(entry);
         }
         if let Some(why) = entry.start_failure.take() {

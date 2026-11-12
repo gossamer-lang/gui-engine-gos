@@ -2,7 +2,7 @@
 
 ## 0.2.14 - Shells start at their window's size
 
-- A terminal's program starts once its view sizes the screen, so a shell draws its prompt once instead of erasing and redrawing it at startup. A terminal no view shows starts at its own size after a short wait.
+- A terminal's program starts once its view sizes the screen, so a shell draws its prompt once instead of erasing and redrawing it at startup. A terminal no view shows, such as a tab in the back of a window, starts after a short wait at the size a view last gave the session's terminals.
 - `Event::NotStarted` reports a program that could not start once the screen was sized.
 - `Widget::quick_pick` lists an application's own items the way the palette lists commands, narrowed to those holding what is typed, and reports the one chosen.
 - `Event::Foreground` names the job running in front of a terminal's program and its directory, each time either changes.

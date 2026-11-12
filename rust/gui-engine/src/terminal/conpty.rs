@@ -63,11 +63,6 @@ fn duplicate(raw: RawHandle) -> Result<OwnedHandle, String> {
     Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
 }
 
-fn exited(process: &OwnedHandle) -> bool {
-    // SAFETY: `process` is an owned, open process handle.
-    unsafe { WaitForSingleObject(process.as_raw_handle(), 0) == WAIT_OBJECT_0 }
-}
-
 // The exit code is set when termination begins, before the process object
 // signals; the program has ended only once it signals.
 fn wait_for_exit(process: &OwnedHandle) -> Result<u32, String> {
@@ -81,19 +76,6 @@ fn wait_for_exit(process: &OwnedHandle) -> Result<u32, String> {
         return Err(std::io::Error::last_os_error().to_string());
     }
     Ok(code)
-}
-
-fn terminate(process: &OwnedHandle) -> Result<(), String> {
-    if exited(process) {
-        return Ok(());
-    }
-    // A nonzero BOOL is success; an exit racing the call also counts.
-    // SAFETY: `process` is an owned, open process handle.
-    if unsafe { TerminateProcess(process.as_raw_handle(), 1) } != 0 || exited(process) {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error().to_string())
-    }
 }
 
 /// A pseudo-console opened for a program that has not started yet, so the
@@ -385,15 +367,17 @@ impl Pty {
         }
         self.input.close();
         self.handoff.close();
-        let terminated = terminate(&self.process);
         if let Some(writer) = self.writer.take() {
             // SAFETY: the writer thread is alive until joined below; cancelling
             // its synchronous write only ends that write.
             unsafe { CancelSynchronousIo(writer.as_raw_handle()) };
             let _ = writer.join();
         }
-        // Dropping the master closes the pseudo-console, which blocks until
-        // its output is read; the reader is still running to read it.
+        // Dropping the master closes the pseudo-console, as closing a console
+        // window does: its programs hear CTRL_CLOSE_EVENT, so a shell writes
+        // its history before it ends, and the system ends any that stays. The
+        // close blocks until its output is read; the reader is still running
+        // to read it.
         if let Some(master) = self.master.take() {
             let close = thread::Builder::new()
                 .name("gui-conpty-close".into())
@@ -402,12 +386,22 @@ impl Pty {
                 .map_err(|e| e.to_string())?;
             let _ = close.join();
         }
-        for thread in [&mut self.reader, &mut self.waiter] {
-            if let Some(thread) = thread.take() {
-                let _ = thread.join();
-            }
+        if let Some(thread) = self.reader.take() {
+            let _ = thread.join();
         }
-        terminated
+        // The program ends in its own time; a thread of its own waits for
+        // it, so closing never waits on it.
+        let Some(waiter) = self.waiter.take() else {
+            return Ok(());
+        };
+        thread::Builder::new()
+            .name("gui-conpty-reap".into())
+            .stack_size(STACK)
+            .spawn(move || {
+                let _ = waiter.join();
+            })
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -476,7 +470,7 @@ mod tests {
     }
 
     #[test]
-    fn closing_a_running_program_terminates_it_and_joins() {
+    fn closing_a_running_program_ends_it_and_joins() {
         let budget = Budget::new(8 * 1024 * 1024);
         let command = Command {
             program: "cmd.exe".into(),
@@ -499,7 +493,8 @@ mod tests {
             )
             .unwrap();
             pty.close().unwrap();
-            assert!(exited(&pty.process));
+            // Closing the pseudo-console ends the program, in the system's time.
+            assert!(wait_for_exit(&pty.process).is_ok());
             drop(pty);
             assert_eq!(budget.usage().0, 0);
         }

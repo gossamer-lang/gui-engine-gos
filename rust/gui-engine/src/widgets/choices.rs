@@ -625,9 +625,9 @@ pub fn pick_items(items: &[CompletionItem], query: &str) -> Vec<CompletionItem> 
         .collect()
 }
 
-/// The palette's entries for `query`: the commands whose name, alone or
-/// after its category, begins with it, as typing completes a name; enabled
-/// ones first, each group by name.
+/// The palette's entries for `query`: the commands whose name, with its
+/// category, holds the query anywhere as typed (ignoring case), so "pri"
+/// finds "File: New Private Tab"; enabled ones first, each group by name.
 pub fn palette_items(registry: &[crate::commands::Command], query: &str) -> Vec<CompletionItem> {
     let mut items = vec![];
     for c in registry.iter().filter(|c| c.visible) {
@@ -635,23 +635,11 @@ pub fn palette_items(registry: &[crate::commands::Command], query: &str) -> Vec<
         let matches = if query.is_empty() {
             vec![]
         } else {
-            let (whole, ranges) = completion::match_label(&label, query, MatchMode::Prefix);
-            if whole > 0.0 {
-                ranges
-            } else {
-                let (bare, ranges) = completion::match_label(&c.label, query, MatchMode::Prefix);
-                if bare <= 0.0 {
-                    continue;
-                }
-                // The name ends the palette's label, after its category.
-                match label.strip_suffix(c.label.as_str()) {
-                    Some(category) => {
-                        let at = category.len() as i64;
-                        ranges.iter().map(|(a, b)| (a + at, b + at)).collect()
-                    }
-                    None => vec![],
-                }
+            let (score, ranges) = completion::match_label(&label, query, MatchMode::Substring);
+            if score <= 0.0 {
+                continue;
             }
+            ranges
         };
         let mut it = CompletionItem::new(&c.id, &label);
         it.detail = c.shortcut_label();
@@ -1477,7 +1465,7 @@ mod tests {
     }
 
     #[test]
-    fn palette_names_commands_by_category_and_completes_either_name() {
+    fn palette_names_commands_by_category_and_finds_what_is_typed_anywhere_in_them() {
         let reg = vec![
             Command::new("t.koi8", "KOI8-R").category("Set Encoding"),
             Command::new("t.split", "Split Right").category("Terminal"),
@@ -1493,19 +1481,20 @@ mod tests {
                 "Uncategorized"
             ]
         );
-        for query in ["set enc", "koi"] {
+        for query in ["set enc", "koi", "ncoding: k"] {
             let found = palette_items(&reg, query);
             assert_eq!(found.len(), 1, "{query}");
             assert_eq!(found[0].key, "t.koi8");
         }
-        let split = palette_items(&reg, "SPL");
-        assert_eq!(split.len(), 1);
-        let at = "Terminal: ".len() as i64;
-        assert_eq!(split[0].matches, vec![(at, at + 3)]);
+        let right = palette_items(&reg, "RIGH");
+        assert_eq!(right.len(), 1);
+        let at = "Terminal: Split ".len() as i64;
+        assert_eq!(right[0].matches, vec![(at, at + 4)]);
+        assert!(palette_items(&reg, "sptl").is_empty());
     }
 
     #[test]
-    fn palette_lists_enabled_commands_first_and_completes_names_from_their_start() {
+    fn palette_lists_enabled_commands_first_and_finds_the_typed_text_anywhere() {
         let reg = vec![
             Command::new("a.open", "Open File"),
             Command::new("a.close", "Close File").enabled(false),
@@ -1515,10 +1504,10 @@ mod tests {
         let keys: Vec<&str> = all.iter().map(|i| i.key.as_str()).collect();
         assert_eq!(keys, ["a.open", "b", "a.close"]);
         assert!(all[2].disabled);
-        let begun = palette_items(&reg, "o");
-        let keys: Vec<&str> = begun.iter().map(|i| i.key.as_str()).collect();
-        assert_eq!(keys, ["a.open", "b"]);
-        assert!(palette_items(&reg, "file").is_empty())
+        let held = palette_items(&reg, "FIL");
+        let keys: Vec<&str> = held.iter().map(|i| i.key.as_str()).collect();
+        assert_eq!(keys, ["a.open", "a.close"]);
+        assert!(palette_items(&reg, "fli").is_empty())
     }
 
     #[test]

@@ -3,10 +3,11 @@
 ## 0.2.14 - Shells start at their window's size
 
 - A terminal's program starts once its view sizes the screen, so a shell draws its prompt once instead of erasing and redrawing it at startup. A terminal no view shows, such as a tab in the back of a window, starts after a short wait at the size a view last gave the session's terminals.
+- Closing a terminal hangs it up, as closing any terminal does, instead of killing its program: a shell saves its history and hangs up its jobs before it ends, and closing never waits on a program that ignores the hang-up.
 - `Event::NotStarted` reports a program that could not start once the screen was sized.
 - `Widget::quick_pick` lists an application's own items the way the palette lists commands, narrowed to those holding what is typed, and reports the one chosen.
 - `Event::Foreground` names the job running in front of a terminal's program and its directory, each time either changes.
-- The command palette completes a command's name as it is typed, alone or after its category ("View: Zoom In"), and Tab completes the search to the highlighted command. It shows as one panel, only as tall as the commands it lists.
+- The command palette finds the commands holding what is typed anywhere in their name, which it shows after its category ("View: Zoom In"), and Tab completes the search to the highlighted command. It shows as one panel, only as tall as the commands it lists.
 
 ## 0.2.13 - Cursor blinks without repaint
 

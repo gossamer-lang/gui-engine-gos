@@ -660,7 +660,14 @@ impl Pty {
         }
     }
 
-    /// Ends the program's process group and joins every IO thread.
+    /// Hangs up the terminal, as closing any terminal does, and joins its
+    /// IO threads. Closing the master is the hang-up: the system sends the
+    /// program (the session leader) SIGHUP once, and a shell writes its
+    /// history and hangs up its jobs before it ends. No signal of our own
+    /// goes with it, since a shell that takes a second SIGHUP while ending
+    /// on the first exits at once, before its history is written. A thread
+    /// of its own reaps the program, so closing never waits on one that
+    /// ignores the hang-up; such a program goes on, as under any terminal.
     pub fn close(&mut self) -> Result<(), String> {
         if self.stopping.swap(true, Ordering::AcqRel) {
             return Ok(());
@@ -668,24 +675,6 @@ impl Pty {
         self.input.close();
         self.handoff.close();
         let _ = (&self.cancel).write_all(&[1]);
-        if let Some(master) = &self.master
-            && let Some(fd) = master.as_raw_fd()
-        {
-            // The foreground process group and the session leader end
-            // whatever descriptors to the terminal they still hold.
-            // SAFETY: `fd` is the open master descriptor.
-            let foreground = unsafe { libc::tcgetpgrp(fd) };
-            if foreground > 0 {
-                // SAFETY: signals a process group of this terminal.
-                unsafe { libc::kill(-foreground, libc::SIGKILL) };
-            }
-        }
-        if let Some(child) = &mut self.child
-            && child.try_wait().ok().flatten().is_none()
-        {
-            // SAFETY: the unreaped child still owns this process id.
-            unsafe { libc::kill(self.pid as i32, libc::SIGKILL) };
-        }
         for thread in [&mut self.reader, &mut self.writer] {
             if let Some(thread) = thread.take() {
                 let _ = thread.join();
@@ -693,15 +682,26 @@ impl Pty {
         }
         // An exiting program's last close of the terminal waits for its unread
         // output to drain while the master is open (macOS), so the master is
-        // released before waiting for the exit.
+        // released before the program is waited for.
         self.master = None;
-        if let Some(thread) = self.waiter.take() {
-            let _ = thread.join();
+        let waiter = self.waiter.take();
+        let child = self.child.take();
+        if waiter.is_none() && child.is_none() {
+            return Ok(());
         }
-        match self.child.take() {
-            Some(mut child) => child.wait().map(|_| ()).map_err(|e| e.to_string()),
-            None => Ok(()),
-        }
+        thread::Builder::new()
+            .name("gui-pty-reap".into())
+            .stack_size(STACK)
+            .spawn(move || {
+                if let Some(thread) = waiter {
+                    let _ = thread.join();
+                }
+                if let Some(mut child) = child {
+                    let _ = child.wait();
+                }
+            })
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -900,9 +900,56 @@ mod tests {
         let _ = pty.write(&[b'a'; INPUT]);
         let _ = pty.write(&[b'b'; INPUT]);
         assert!(pty.queued_input() <= INPUT);
+        let pid = pty.pid() as i32;
         pty.close().unwrap();
         drop(pty);
         assert_eq!(budget.usage().0, 0);
+        // The program ignores the hang-up, so closing left it running, as
+        // any terminal does; the test ends it.
+        // SAFETY: kill(2) checks the target; signal 0 only probes it.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
+        // SAFETY: as above.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+
+    #[test]
+    fn closing_hangs_up_a_shell_which_writes_its_history_first() {
+        let budget = Budget::new(8 * 1024 * 1024);
+        let dir = std::env::temp_dir().join(format!("gui-pty-hup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let history = dir.join("history");
+        let (wake, wakes) = waker();
+        let (output, kept) = sink();
+        let shell = Command {
+            program: "bash".into(),
+            args: vec!["--norc".into(), "--noprofile".into(), "-i".into()],
+            env: vec![
+                ("HISTFILE".into(), history.to_string_lossy().into_owned()),
+                ("PS1".into(), "ready$ ".into()),
+            ],
+            ..Command::default()
+        };
+        let mut pty = Pty::spawn(&shell, 24, 80, (0, 0), &budget, wake, output).unwrap();
+        let mut typed = false;
+        collect(&pty, &wakes, &kept, |text, _| {
+            if !typed && text.contains("ready$") {
+                pty.write(b"echo typed-before-close\r").unwrap();
+                typed = true;
+            }
+            typed && text.matches("ready$").count() >= 2
+        });
+        let pid = pty.pid() as i32;
+        pty.close().unwrap();
+        drop(pty);
+        // Bash writes its history as it ends on the hang-up; the reaper
+        // thread collects it.
+        // SAFETY: kill(2) checks the target; signal 0 only probes it.
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            std::thread::yield_now();
+        }
+        let saved = std::fs::read_to_string(&history).unwrap_or_default();
+        assert!(saved.contains("echo typed-before-close"), "{saved:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

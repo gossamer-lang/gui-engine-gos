@@ -54,6 +54,46 @@ pub fn clipboard_use_memory(memory: bool) {
     gui_engine_host::clipboard_use_memory(memory)
 }
 
+/// Whether the clipboard is the in-memory board.
+pub fn clipboard_is_memory() -> bool {
+    gui_engine_host::clipboard_is_memory()
+}
+
+/// The clipboard's text, or "" when it holds none or cannot be read.
+pub fn clipboard_text() -> String {
+    gui_engine_host::clipboard_text()
+}
+
+/// Replaces the clipboard's contents with `text`.
+pub fn clipboard_set_text(text: String) {
+    gui_engine_host::clipboard_set_text(text)
+}
+
+/// Whether the clipboard holds text.
+pub fn clipboard_has_text() -> bool {
+    gui_engine_host::clipboard_has_text()
+}
+
+/// The primary selection's text, where the platform has one.
+pub fn clipboard_primary_text() -> String {
+    gui_engine_host::clipboard_primary_text()
+}
+
+/// Replaces the primary selection with `text`, where the platform has one.
+pub fn clipboard_set_primary_text(text: String) {
+    gui_engine_host::clipboard_set_primary_text(text)
+}
+
+/// Offers each payload under the MIME type at the same place in `mimes`.
+pub fn clipboard_set_data(mimes: Vec<String>, payloads: Vec<Vec<u8>>) {
+    gui_engine_host::clipboard_set_data(mimes, payloads)
+}
+
+/// The clipboard data offered as `mime`, if any.
+pub fn clipboard_data(mime: String) -> Option<Vec<u8>> {
+    gui_engine_host::clipboard_data(mime)
+}
+
 /// The JSON icon `size` pixels square: the JSON `icon` drawn in the JSON
 /// `foreground` on a rounded tile of the JSON `background`.
 pub fn app_icon_drawn(icon: String, size: i64, background: String, foreground: String) -> Result<String, String> {

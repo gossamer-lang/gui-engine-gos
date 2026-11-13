@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.18 - One clipboard
+
+- The binding reaches the engine's clipboard: `clipboard_text`, `clipboard_set_text`, `clipboard_has_text`, the primary selection, MIME data and `clipboard_is_memory`. A wrapper that forwards to them shares one board with the terminal's copies and a program's OSC 52 writes, the in-memory board included.
+
 ## 0.2.17 - System fonts from the first frame
 
 - `fonts::preload_family` registers an installed family at once, from the files fontconfig, Core Text or the Windows font registry name, so text in it draws from the first frame instead of switching to it once the installed fonts' catalog is read. The binding's `preload_font_family` reaches it.

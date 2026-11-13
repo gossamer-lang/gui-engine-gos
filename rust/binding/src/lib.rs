@@ -189,6 +189,39 @@ register_module!(
         gui_engine::services::clipboard::use_memory(memory)
     }
 
+    fn clipboard_is_memory() -> bool {
+        gui_engine::services::clipboard::is_memory()
+    }
+
+    fn clipboard_text() -> String {
+        gui_engine::services::clipboard::text()
+    }
+
+    fn clipboard_set_text(text: String) {
+        gui_engine::services::clipboard::set_text(&text)
+    }
+
+    fn clipboard_has_text() -> bool {
+        gui_engine::services::clipboard::has_text()
+    }
+
+    fn clipboard_primary_text() -> String {
+        gui_engine::services::clipboard::primary_text()
+    }
+
+    fn clipboard_set_primary_text(text: String) {
+        gui_engine::services::clipboard::set_primary_text(&text)
+    }
+
+    fn clipboard_set_data(mimes: Vec<String>, payloads: Vec<Bytes>) {
+        let items: Vec<(String, Vec<u8>)> = mimes.into_iter().zip(payloads.into_iter().map(Vec::from)).collect();
+        gui_engine::services::clipboard::set_data(&items)
+    }
+
+    fn clipboard_data(mime: String) -> Option<Bytes> {
+        gui_engine::services::clipboard::data(&mime).map(Bytes::from)
+    }
+
     fn app_icon_drawn(icon: String, size: i64, background: String, foreground: String) -> Result<String, String> {
         let icon = serde_json::from_str(&icon).map_err(|e| format!("icon: {e}"))?;
         let background = serde_json::from_str(&background).map_err(|e| format!("background: {e}"))?;

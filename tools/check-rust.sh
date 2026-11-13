@@ -16,7 +16,8 @@ case "$sdk" in
         sdk_ref="patch.crates-io.gossamer-binding.tag=\"${sdk##*@}\""
         ;;
     *)
-        sdk_source="patch.crates-io.gossamer-binding.path=\"$sdk\""
+        # A TOML literal string: a Windows path's backslashes are no escapes.
+        sdk_source="patch.crates-io.gossamer-binding.path='$sdk'"
         sdk_ref=
         ;;
 esac

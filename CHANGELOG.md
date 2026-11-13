@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.19 - Silent jobs in front
+
+- A terminal reports a job that writes nothing, such as `sleep`, as its foreground job once the job starts, instead of only when it writes.
+
 ## 0.2.18 - One clipboard
 
 - The binding reaches the engine's clipboard: `clipboard_text`, `clipboard_set_text`, `clipboard_has_text`, the primary selection, MIME data and `clipboard_is_memory`. A wrapper that forwards to them shares one board with the terminal's copies and a program's OSC 52 writes, the in-memory board included.

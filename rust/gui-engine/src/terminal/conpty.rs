@@ -352,6 +352,16 @@ impl Pty {
         None
     }
 
+    /// Windows names no job to report.
+    pub fn reported_job(&self) -> Option<String> {
+        None
+    }
+
+    /// Windows names no foreground job, so it never moves.
+    pub fn foreground_moved(&self) -> bool {
+        false
+    }
+
     /// Windows has no POSIX signals to send to a console program.
     pub fn signal(&self, signum: i32) -> Result<(), String> {
         Err(format!(

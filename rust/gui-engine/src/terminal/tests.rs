@@ -174,6 +174,38 @@ fn the_pump_reports_the_foreground_job_and_its_directory_as_they_change() {
 
 #[cfg(unix)]
 #[test]
+fn a_job_that_writes_nothing_is_reported_once_it_takes_the_foreground() {
+    let budget = Budget::new(64 * 1024 * 1024);
+    let id = create(&options(4, 40, 10), budget.clone()).unwrap();
+    let dir = std::env::temp_dir().canonicalize().unwrap();
+    let command = Command {
+        cwd: dir.to_string_lossy().into_owned(),
+        ..shell("set -m; printf idle; read x; sleep 30")
+    };
+    spawn(id, &command).unwrap();
+    let cwd = dir.to_string_lossy().into_owned();
+    let mut heard = Vec::new();
+    let mut pump_until_heard = |wanted: &Event| {
+        while !heard.contains(wanted) {
+            for message in pump(&budget, false).1 {
+                if let UiMsg::Terminal(t, event @ Event::Foreground(..)) = message
+                    && t == id
+                {
+                    heard.push(event);
+                }
+            }
+            std::thread::yield_now();
+        }
+    };
+    pump_until_heard(&Event::Foreground(String::new(), cwd.clone()));
+    // The echo of the line is the last output: `sleep` writes nothing.
+    input(id, b"\n").unwrap();
+    pump_until_heard(&Event::Foreground("sleep".into(), cwd.clone()));
+    close(id);
+}
+
+#[cfg(unix)]
+#[test]
 fn a_program_that_cannot_start_once_sized_is_reported_from_the_pump() {
     in_session("start-failed", |budget| {
         use std::os::unix::fs::PermissionsExt;

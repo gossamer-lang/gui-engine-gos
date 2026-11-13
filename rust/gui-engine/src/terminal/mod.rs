@@ -1159,8 +1159,13 @@ pub(crate) fn pump(budget: &Budget, held: bool) -> (bool, Vec<UiMsg>) {
             changed |= take_ending(*id, entry, &mut events, !held);
         }
         // A job starts, ends or changes directory around output it or its
-        // shell writes, so the foreground is looked at only then.
-        if shown || entry.foreground.is_none() {
+        // shell writes, so the foreground is looked at then, and when the
+        // reader saw it move after the output stopped.
+        let moved = entry
+            .transport
+            .as_ref()
+            .is_some_and(Transport::foreground_moved);
+        if shown || moved || entry.foreground.is_none() {
             report_foreground(*id, entry, &mut events);
         }
         // The transport's one wake also says the program took queued input,
@@ -1181,7 +1186,7 @@ fn report_foreground(id: i64, entry: &mut Entry, events: &mut Vec<UiMsg>) {
         return;
     };
     let now = (
-        transport.job().unwrap_or_default(),
+        transport.reported_job().unwrap_or_default(),
         entry
             .engine
             .current_dir()

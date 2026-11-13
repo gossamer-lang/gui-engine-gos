@@ -8,6 +8,7 @@ use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use parking_lot_core::SpinWait;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtyPair};
@@ -33,9 +34,39 @@ pub struct Pty {
     pid: u32,
     child: Option<Box<dyn Child + Send + Sync>>,
     notify: Arc<Notify>,
+    /// The foreground job the owner last reported.
+    reported: Arc<parking_lot::Mutex<Foreground>>,
+    /// Set by the reader when the foreground job differs from the one
+    /// reported, though no output came to show it.
+    moved: Arc<AtomicBool>,
     _slot: Slot,
     _lease: Lease,
 }
+
+/// A terminal's foreground job: its process group (-1 when unknown) and its
+/// program's name, empty while the terminal's own program is in front.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Foreground {
+    group: i32,
+    job: String,
+}
+
+/// The job in front of master `fd`, whose program is `pid`.
+fn foreground_of(fd: i32, pid: u32) -> Foreground {
+    // SAFETY: `fd` is the open master descriptor.
+    let group = unsafe { libc::tcgetpgrp(fd) };
+    let job = if group > 0 && group != pid as i32 {
+        process_name(group).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    Foreground { group, job }
+}
+
+/// How long after output stops the reader looks at the foreground once more.
+/// A shell starts a job after writing its prompt's last output, and a job may
+/// write nothing for as long as it runs.
+const FOREGROUND_RECHECK: Duration = Duration::from_millis(100);
 
 /// The working directory of process `pid`.
 #[cfg(target_os = "linux")]
@@ -162,12 +193,20 @@ enum Wake {
     Ready,
     /// The cancel descriptor is readable.
     Cancelled,
+    /// The deadline passed first.
+    Due,
 }
 
-/// Waits until `fd` is ready for `events` or `cancel` is readable. If `owed`
-/// is set, first returns this thread's freed memory to the runtime, and
-/// clears `owed` once that is done.
-fn readiness(fd: i32, cancel: i32, events: i16, owed: &mut bool) -> Result<Wake, String> {
+/// Waits until `fd` is ready for `events`, `cancel` is readable, or
+/// `deadline` passes. If `owed` is set, first returns this thread's freed
+/// memory to the runtime, and clears `owed` once that is done.
+fn readiness(
+    fd: i32,
+    cancel: i32,
+    events: i16,
+    owed: &mut bool,
+    deadline: Option<Instant>,
+) -> Result<Wake, String> {
     let pollfd = |fd, events| libc::pollfd {
         fd,
         events,
@@ -183,6 +222,14 @@ fn readiness(fd: i32, cancel: i32, events: i16, owed: &mut bool) -> Result<Wake,
                 }
                 None => *owed = false,
             }
+        }
+        if let Some(deadline) = deadline {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Ok(Wake::Due);
+            }
+            let left = i32::try_from(left.as_micros().div_ceil(1000)).unwrap_or(i32::MAX);
+            bound = if bound < 0 { left } else { bound.min(left) };
         }
         // SAFETY: `fds` holds two initialized pollfd records; the PTY
         // descriptor stays open until both IO threads have joined and the
@@ -361,10 +408,17 @@ impl Opened {
             pid,
             child: Some(child),
             notify: notify.clone(),
+            reported: Arc::new(parking_lot::Mutex::new(Foreground {
+                group: -1,
+                job: String::new(),
+            })),
+            moved: Arc::new(AtomicBool::new(false)),
             _slot: slot,
             _lease: lease,
         };
         let end = ending.clone();
+        let seen = pty.reported.clone();
+        let moved = pty.moved.clone();
         let stop = stopping.clone();
         let wake = notify.clone();
         let mut output = Output::new(sink, notify.clone(), handoff)?;
@@ -406,9 +460,35 @@ impl Opened {
                                     owed = true;
                                     continue;
                                 }
-                                if readiness(fd, signal.as_raw_fd(), libc::POLLIN, &mut owed)
-                                    != Ok(Wake::Ready)
-                                {
+                                // A job the shell starts once its output
+                                // stops may write nothing while it runs,
+                                // so the foreground is looked at once more
+                                // and the owner woken when it moved.
+                                let recheck = Some(Instant::now() + FOREGROUND_RECHECK);
+                                let mut woke = readiness(
+                                    fd,
+                                    signal.as_raw_fd(),
+                                    libc::POLLIN,
+                                    &mut owed,
+                                    recheck,
+                                );
+                                if woke == Ok(Wake::Due) {
+                                    // A forked shell takes the job's name
+                                    // only once it runs the job, in the
+                                    // same process group.
+                                    if foreground_of(fd, pid) != *seen.lock() {
+                                        moved.store(true, Ordering::Release);
+                                        wake.fire();
+                                    }
+                                    woke = readiness(
+                                        fd,
+                                        signal.as_raw_fd(),
+                                        libc::POLLIN,
+                                        &mut owed,
+                                        None,
+                                    );
+                                }
+                                if woke != Ok(Wake::Ready) {
                                     break false;
                                 }
                                 output.rested();
@@ -438,8 +518,13 @@ impl Opened {
                     while let Some(bytes) = input.pop() {
                         let mut offset = 0;
                         while offset < bytes.len() && !stop.load(Ordering::Acquire) {
-                            if readiness(fd, write_signal.as_raw_fd(), libc::POLLOUT, &mut true)
-                                != Ok(Wake::Ready)
+                            if readiness(
+                                fd,
+                                write_signal.as_raw_fd(),
+                                libc::POLLOUT,
+                                &mut true,
+                                None,
+                            ) != Ok(Wake::Ready)
                             {
                                 return;
                             }
@@ -645,11 +730,24 @@ impl Pty {
     /// other than the program runs there.
     pub fn job(&self) -> Option<String> {
         let fd = self.master.as_ref().and_then(|m| m.as_raw_fd())?;
-        // SAFETY: `fd` is the open master descriptor.
-        let foreground = unsafe { libc::tcgetpgrp(fd) };
-        (foreground > 0 && foreground != self.pid as i32)
-            .then(|| process_name(foreground))
-            .flatten()
+        let now = foreground_of(fd, self.pid);
+        (!now.job.is_empty()).then_some(now.job)
+    }
+
+    /// `job`, taken as the one the owner reports: the reader wakes the owner
+    /// when the foreground job changes without writing output.
+    pub fn reported_job(&self) -> Option<String> {
+        let fd = self.master.as_ref().and_then(|m| m.as_raw_fd())?;
+        let now = foreground_of(fd, self.pid);
+        let job = (!now.job.is_empty()).then(|| now.job.clone());
+        *self.reported.lock() = now;
+        job
+    }
+
+    /// Whether the reader saw the foreground job change from the one last
+    /// reported, though no output came; answers true once per change.
+    pub fn foreground_moved(&self) -> bool {
+        self.moved.swap(false, Ordering::AcqRel)
     }
 
     /// The working directory of the job in the terminal's foreground, or of

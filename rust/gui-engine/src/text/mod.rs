@@ -10,6 +10,7 @@ pub mod linebreak;
 pub mod offsets;
 pub mod opentype;
 pub mod syntax;
+pub mod system_fonts;
 pub mod ucd;
 pub mod variation;
 

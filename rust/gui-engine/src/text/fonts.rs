@@ -14,6 +14,7 @@ use crate::errors;
 use crate::text::catalog;
 use crate::text::catalog::FontRecord;
 use crate::text::font::{Face, FontBytes};
+use crate::text::system_fonts;
 use crate::text::ucd::EMOJI_PRESENTATION;
 use crate::text::variation;
 
@@ -248,10 +249,19 @@ pub fn primary(family: &Family, bold: bool) -> FaceId {
         Family::Monospace => 2,
         Family::Named(name) => match find_named(name, bold) {
             Some(i) => return i.into(),
-            None => match load_named(name, bold) {
-                Some(i) => return i.into(),
-                None => 0,
-            },
+            None => {
+                // A typographic family is never read as a legacy name, so
+                // one alias leads to a family that resolves by itself.
+                if find_named(name, !bold).is_none()
+                    && let Some((family, weight)) = legacy_alias(name)
+                {
+                    return primary(&Family::Named(weighted_family(&family, weight)), bold);
+                }
+                match load_named(name, bold) {
+                    Some(i) => return i.into(),
+                    None => 0,
+                }
+            }
         },
     };
     (base + if bold { 1 } else { 0 }).into()
@@ -397,12 +407,12 @@ pub fn is_default_ignorable(c: char) -> bool {
 /// ids of the faces it held, then of the bold instance of each variable face
 /// that has no bold face beside it.
 pub fn register(data: &[u8]) -> Result<Vec<FaceId>, errors::Error> {
-    register_bytes(FontBytes::owned(data.to_vec()))
+    register_bytes(FontBytes::owned(data.to_vec()), |_| true)
 }
 
 /// Registers a font file built into the program, read where it lies.
 pub fn register_static(data: &'static [u8]) -> Result<Vec<FaceId>, errors::Error> {
-    register_bytes(FontBytes::Static(data))
+    register_bytes(FontBytes::Static(data), |_| true)
 }
 
 /// Registers the font file at `path` (TTF, OTF or a TTC collection, every
@@ -412,11 +422,84 @@ pub fn register_static(data: &'static [u8]) -> Result<Vec<FaceId>, errors::Error
 pub fn register_file(path: &str) -> Result<Vec<FaceId>, errors::Error> {
     let bytes = installed_bytes(std::path::Path::new(path), &|| true)
         .map_err(|e| errors::wrap(e, format!("reading font {path}")))?;
-    register_bytes(bytes)
+    register_bytes(bytes, |_| true)
 }
 
-// Every face of a collection shares the one copy of its file.
-fn register_bytes(data: FontBytes) -> Result<Vec<FaceId>, errors::Error> {
+/// Registers the installed faces of family `name` at once, from the files
+/// the platform's font service (fontconfig, Core Text, the Windows font
+/// registry) names, so text in it draws from the first frame rather than once
+/// the installed fonts' catalog is read. Answers whether the family has a
+/// face now: bundled, already loaded, or registered here. Only that family's
+/// faces of a file holding several are registered.
+pub fn preload_family(name: &str) -> bool {
+    if loaded_family(name) {
+        return true;
+    }
+    if !SYSTEM_FONTS.load(Ordering::Relaxed) {
+        return false;
+    }
+    let mut families = vec![];
+    for id in register_family_files(name) {
+        let family = face(id).family;
+        if !family.eq_ignore_ascii_case(name) && !families.contains(&family) {
+            families.push(family);
+        }
+    }
+    // A face named by its legacy family draws bold in its typographic
+    // family's bold, so that family comes too.
+    for family in families {
+        register_family_files(&family);
+    }
+    loaded_family(name)
+}
+
+// Registers the faces of family `name`, by either of its names, in the files
+// the platform's font service names; answers their ids.
+fn register_family_files(name: &str) -> Vec<FaceId> {
+    let want = name.to_lowercase();
+    let mut ids = vec![];
+    for path in system_fonts::family_files(name) {
+        // A file that cannot be read or parsed leaves the family to its
+        // other files, and to the catalog.
+        if let Ok(bytes) = installed_bytes(std::path::Path::new(&path), &|| true)
+            && let Ok(found) = register_bytes(bytes, |face| {
+                face.family.to_lowercase() == want || face.legacy_family.to_lowercase() == want
+            })
+        {
+            ids.extend(found);
+        }
+    }
+    ids
+}
+
+// The typographic family and weight a legacy family name stands for ("Lilex
+// Light" is "Lilex" at 300), from a loaded face or, once it is read, the
+// installed catalog; upright faces first.
+fn legacy_alias(name: &str) -> Option<(String, i64)> {
+    let want = name.to_lowercase();
+    let loaded = FACES
+        .lock()
+        .values()
+        .filter(|f| f.legacy_family.to_lowercase() == want && f.family.to_lowercase() != want)
+        .min_by_key(|f| f.italic)
+        .map(|f| (f.family.clone(), f.weight));
+    if loaded.is_some() || !installed_known() {
+        return loaded;
+    }
+    INSTALLED
+        .lock()
+        .iter()
+        .filter(|r| r.legacy_family.to_lowercase() == want && r.family.to_lowercase() != want)
+        .min_by_key(|r| r.italic)
+        .map(|r| (r.family.clone(), record_weight(r)))
+}
+
+// The faces of a font file that `keep` accepts; every face of a collection
+// shares the one copy of its file.
+fn register_bytes(
+    data: FontBytes,
+    keep: impl Fn(&Face) -> bool,
+) -> Result<Vec<FaceId>, errors::Error> {
     ensure_bundled();
     if data.heap_bytes() > FONT_BYTE_LIMIT {
         return Err(errors::new("font exceeds its byte budget"));
@@ -429,6 +512,9 @@ fn register_bytes(data: FontBytes) -> Result<Vec<FaceId>, errors::Error> {
     let mut parsed = Vec::new();
     for index in 0..count {
         let face = Face::parse_bytes(data.clone(), index)?;
+        if !keep(&face) {
+            continue;
+        }
         if face.owned_bytes() > FONT_BYTE_LIMIT
             || faces_bytes(parsed.iter().chain([&face])) > REGISTRY_BYTE_LIMIT
         {
@@ -450,6 +536,9 @@ fn register_bytes(data: FontBytes) -> Result<Vec<FaceId>, errors::Error> {
         .map(|f| at_weight(f.clone(), true))
         .collect::<Vec<_>>();
     parsed.extend(bolds);
+    if parsed.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut faces = FACES.lock();
     let mut pending = BTreeMap::<i64, Face>::new();
     let mut ids = Vec::new();
@@ -665,7 +754,7 @@ pub fn family_known(name: &str) -> bool {
     INSTALLED
         .lock()
         .iter()
-        .any(|r| r.family.to_lowercase() == want)
+        .any(|r| r.family.to_lowercase() == want || r.legacy_family.to_lowercase() == want)
 }
 
 /// The variation axes of family `name`'s upright face; empty for a static
@@ -1027,7 +1116,13 @@ pub fn family_available(name: &str) -> bool {
 // Whether a loaded face, bundled or registered, is of family `name`.
 fn loaded_family(name: &str) -> bool {
     ensure_bundled();
-    find_named(name, false).is_some() || find_named(name, true).is_some()
+    let want = name.to_lowercase();
+    find_named(name, false).is_some()
+        || find_named(name, true).is_some()
+        || FACES
+            .lock()
+            .values()
+            .any(|f| f.legacy_family.to_lowercase() == want)
 }
 
 /// Number of loaded faces, for diagnostics.
@@ -1211,6 +1306,74 @@ mod tests {
         assert!(!face(ids[0]).bold);
         assert!(face(ids[1]).bold);
         assert_eq!(face(ids[1]).weight, 700);
+    }
+
+    // A family the platform's font service lists that no loaded face has.
+    #[cfg(free_unix)]
+    fn unloaded_installed_family() -> Option<String> {
+        let listed = std::process::Command::new("fc-list")
+            .args([":", "family"])
+            .output()
+            .ok()?;
+        String::from_utf8_lossy(&listed.stdout)
+            .lines()
+            .flat_map(|line| line.split(','))
+            .map(str::trim)
+            .filter(|family| !family.is_empty() && !super::loaded_family(family))
+            .find(|family| {
+                let want = family.to_lowercase();
+                super::system_fonts::family_files(family)
+                    .iter()
+                    .any(|path| {
+                        crate::text::catalog::scan_file(path).is_ok_and(|faces| {
+                            faces.iter().any(|f| f.family.to_lowercase() == want)
+                        })
+                    })
+            })
+            .map(str::to_string)
+    }
+
+    #[cfg(free_unix)]
+    #[test]
+    fn an_installed_family_draws_before_the_catalog_is_read() {
+        // Without fontconfig or an installed family beyond the bundled ones
+        // there is nothing to preload.
+        let Some(family) = unloaded_installed_family() else {
+            return;
+        };
+        assert!(super::preload_family(&family));
+        let named = super::Family::Named(family.clone());
+        assert_eq!(
+            face(primary(&named, false)).family.to_lowercase(),
+            family.to_lowercase()
+        );
+    }
+
+    #[test]
+    fn preloading_a_family_no_service_has_registers_nothing() {
+        assert!(!super::preload_family("No Such Family Anywhere"));
+        assert!(!super::loaded_family("No Such Family Anywhere"));
+    }
+
+    #[test]
+    fn a_legacy_family_name_draws_its_typographic_family_at_that_weight() {
+        for (legacy, weight, bold) in [
+            ("Alias Test Light", 300, false),
+            ("Alias Test Bold", 700, true),
+        ] {
+            let mut f = crate::text::font::Face::parse(super::MONO, 0).unwrap();
+            f.family = "Alias Test".to_string();
+            f.legacy_family = legacy.to_string();
+            f.weight = weight;
+            f.bold = bold;
+            super::add_face(&f);
+        }
+        assert!(super::family_available("Alias Test Light"));
+        let light = super::Family::Named("Alias Test Light".to_string());
+        let upright = face(primary(&light, false));
+        assert!(upright.family.starts_with("Alias Test"));
+        assert_eq!(upright.weight, 300);
+        assert_eq!(face(primary(&light, true)).weight, 700);
     }
 
     #[test]

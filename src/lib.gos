@@ -131,6 +131,12 @@ pub fn register_font(data: Vec<u8>) -> Result<Vec<String>, String> {
     gui_engine_host::register_font(data)
 }
 
+/// Registers the installed faces of family `name` at once, from the files the
+/// platform's font service names, answering whether the family has a face.
+pub fn preload_font_family(name: String) -> bool {
+    gui_engine_host::preload_font_family(name)
+}
+
 /// Registers the font file at `path` at once, mapped where no process of this
 /// user can change it, answering the families it adds.
 pub fn register_font_file(path: String) -> Result<Vec<String>, String> {

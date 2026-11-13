@@ -23,6 +23,9 @@ pub struct FontRecord {
     /// The face's index in its file (non-zero inside a collection).
     pub index: i64,
     pub family: String,
+    /// The family name ID 1 gives where it differs from `family`.
+    #[serde(default)]
+    pub legacy_family: String,
     pub style: String,
     pub bold: bool,
     pub italic: bool,
@@ -127,6 +130,7 @@ pub fn scan_file(file: &str) -> Result<Vec<FontRecord>, errors::Error> {
             path: file.to_string(),
             index: index as i64,
             family: face.family.clone(),
+            legacy_family: face.legacy_family.clone(),
             style: face.subfamily.clone(),
             bold: face.bold,
             italic: face.italic,
@@ -216,6 +220,7 @@ impl FontRecord {
         size_of::<Self>()
             + self.path.capacity()
             + self.family.capacity()
+            + self.legacy_family.capacity()
             + self.style.capacity()
             + self.coverage.len() * size_of::<u32>()
     }
@@ -346,7 +351,7 @@ fn share_coverage(records: &mut [FontRecord]) {
 
 /// Where the toolkit caches the summaries of installed fonts.
 pub fn cache_file() -> String {
-    paths::join(&services::cache_dir("gui-gos"), "fonts-v3.json")
+    paths::join(&services::cache_dir("gui-gos"), "fonts-v4.json")
 }
 
 #[cfg(test)]

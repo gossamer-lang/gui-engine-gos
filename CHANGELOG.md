@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.17 - System fonts from the first frame
+
+- `fonts::preload_family` registers an installed family at once, from the files fontconfig, Core Text or the Windows font registry name, so text in it draws from the first frame instead of switching to it once the installed fonts' catalog is read. The binding's `preload_font_family` reaches it.
+- A family named by its style-specific name, as fontconfig and desktop settings name it ("Lilex Light" of the family "Lilex"), draws in that face instead of the fallback. Catalog records and faces carry that name as `legacy_family`, and the catalog is read again once to learn it.
+
 ## 0.2.16 - Timers on time
 
 - A timer no longer wakes the event loop before it is due when the system clock is being corrected. Builds on windowing-gos 0.1.19.

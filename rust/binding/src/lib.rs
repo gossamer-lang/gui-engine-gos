@@ -176,6 +176,10 @@ register_module!(
         Ok(registered_families(&ids))
     }
 
+    fn preload_font_family(name: String) -> bool {
+        gui_engine::text::fonts::preload_family(&name)
+    }
+
     fn register_font_file(path: String) -> Result<Vec<String>, String> {
         let ids = gui_engine::text::fonts::register_file(&path).map_err(|e| e.to_string())?;
         Ok(registered_families(&ids))

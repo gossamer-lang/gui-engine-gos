@@ -111,6 +111,10 @@ impl std::fmt::Debug for FontBytes {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Face {
     pub family: String,
+    /// The family its name ID 1 gives where the typographic family (ID 16)
+    /// differs, as fontconfig and older settings name a face ("Lilex Light"
+    /// of family "Lilex"); empty otherwise.
+    pub legacy_family: String,
     pub subfamily: String,
     pub bold: bool,
     pub italic: bool,
@@ -157,6 +161,7 @@ impl Face {
         size_of::<Self>()
             + self.data.heap_bytes()
             + self.family.capacity()
+            + self.legacy_family.capacity()
             + self.subfamily.capacity()
             + self.tables.capacity() * (size_of::<(String, (i64, i64))>() + 32)
             + self.tables.keys().map(String::capacity).sum::<usize>()
@@ -171,6 +176,7 @@ impl Default for Face {
     fn default() -> Face {
         Face {
             family: String::new(),
+            legacy_family: String::new(),
             subfamily: String::new(),
             bold: false,
             italic: false,
@@ -471,10 +477,10 @@ impl Face {
             }
             i += 1;
         }
-        self.family = if typographic.is_empty() {
-            family
+        (self.family, self.legacy_family) = if typographic.is_empty() || typographic == family {
+            (family, String::new())
         } else {
-            typographic
+            (typographic, family)
         };
         self.subfamily = if typographic_subfamily.is_empty() {
             subfamily
@@ -2127,6 +2133,7 @@ mod tests {
             .insert("name".to_string(), (0, table.len() as i64));
         face.read_names();
         assert_eq!(face.family, "Lilex");
+        assert_eq!(face.legacy_family, "Lilex Light Italic");
         assert_eq!(face.subfamily, "Light Italic");
         assert!(face.italic);
     }

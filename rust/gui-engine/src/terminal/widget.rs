@@ -2295,8 +2295,14 @@ fn key_down(v: &View, key: Key, mods: windowing::Mods, repeat: bool, rows: i64, 
     if mode_key(v, key, mods, rows, cx) {
         return;
     }
-    // Ctrl+Shift+C and Ctrl+Shift+V copy and paste, leaving Ctrl+C and
-    // Ctrl+V to the program.
+    // A Ctrl+Shift chord the window binds to a command is the command's, so
+    // an application that rebinds copying, pasting or anything else is
+    // followed.
+    if mods.ctrl && mods.shift && bound_chord(key, mods, cx) {
+        return;
+    }
+    // Otherwise Ctrl+Shift+C and Ctrl+Shift+V copy and paste, leaving Ctrl+C
+    // and Ctrl+V to the program.
     if mods.ctrl && mods.shift && key == Key::C {
         copy_selection(v);
         return redraw(cx);
@@ -2335,7 +2341,12 @@ fn key_down(v: &View, key: Key, mods: windowing::Mods, repeat: bool, rows: i64, 
     if key == Key::F11 && !mods.ctrl && !mods.alt && !mods.shift && bound_chord(key, mods, cx) {
         return;
     }
+    // Shift+PageUp and Shift+PageDown scroll a page, unless the window binds
+    // them to commands of its own.
     if mods.shift && !mods.ctrl && (key == Key::PageUp || key == Key::PageDown) {
+        if bound_chord(key, mods, cx) {
+            return;
+        }
         let page = if key == Key::PageUp { rows } else { -rows };
         let _ = super::scroll(v.terminal, page);
         return redraw(cx);

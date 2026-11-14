@@ -811,6 +811,9 @@ mod session {
                         crate::commands::Command::new("view.zoom-in", "Zoom In")
                             .key("Ctrl+Shift+="),
                         crate::commands::Command::new("view.fullscreen", "Fullscreen").key("F11"),
+                        // Chords the terminal would take itself, rebound.
+                        crate::commands::Command::new("tab.close", "Close Tab").key("Ctrl+Shift+C"),
+                        crate::commands::Command::new("view.top", "Top").key("Shift+PageUp"),
                     ]
                 },
             );
@@ -836,10 +839,26 @@ mod session {
             s.press(windowing::Key::Char('='), chord).unwrap();
             s.press(windowing::Key::F11, windowing::Mods::default())
                 .unwrap();
+            s.press(windowing::Key::C, chord).unwrap();
+            s.press(
+                windowing::Key::PageUp,
+                windowing::Mods {
+                    shift: true,
+                    ..windowing::Mods::default()
+                },
+            )
+            .unwrap();
             s.step().unwrap();
             assert_eq!(
                 *ran.borrow(),
-                ["tab.new", "tab.right", "view.zoom-in", "view.fullscreen"]
+                [
+                    "tab.new",
+                    "tab.right",
+                    "view.zoom-in",
+                    "view.fullscreen",
+                    "tab.close",
+                    "view.top"
+                ]
             );
             s.shutdown();
         })

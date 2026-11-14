@@ -1,6 +1,6 @@
 [package]
 name = "gui-engine"
-version = "0.2.19"
+version = "0.2.20"
 edition = "2024"
 publish = false
 
@@ -57,6 +57,9 @@ wezterm-term = { git = "https://github.com/gossamer-lang/wezterm-lite", tag = "v
 portable-pty = "=0.9.0"
 encoding_rs = "0.8"
 regex = "1"
+# Folder watches (`Effect::WatchFolder`) through each system's own change
+# notification: inotify, FSEvents, kqueue, ReadDirectoryChangesW.
+notify = "8"
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
 zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }

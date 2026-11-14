@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.20 - Folder watches
+
+- `Effect::WatchFolder` delivers `UiMsg::FolderChanged` once as the watch begins and then each time a file in the folder is made, removed, renamed or written, from a thread that runs only while the watch does; `Effect::UnwatchFolder` ends it.
+
 ## 0.2.19 - Silent jobs in front
 
 - A terminal reports a job that writes nothing, such as `sleep`, as its foreground job once the job starts, instead of only when it writes.

@@ -96,6 +96,16 @@ pub enum Effect {
     /// Delivers `UiMsg::Timer(tag)` after `delay` ms (repeating when asked).
     StartTimer(String, i64, bool),
     CancelTimer(String),
+    /// Delivers `UiMsg::FolderChanged(id)` once as the watch begins, so the
+    /// folder is read with no change missed, then each time a file in folder
+    /// `path` is made, removed, renamed or written, until
+    /// `UnwatchFolder(id)`; a later watch under the same id replaces it. A
+    /// folder that cannot be watched delivers nothing.
+    WatchFolder {
+        id: String,
+        path: String,
+    },
+    UnwatchFolder(String),
     /// Answers a `UiMsg::CompletionRequest`: owner id, request id, items,
     /// and an error text ("" on success).
     AnswerCompletion(String, i64, Vec<CompletionItem>, String),

@@ -317,6 +317,8 @@ pub struct Session {
     shell: Option<Shell>,
     disposed: Option<DisposedCallback>,
     timers: Vec<Timer>,
+    /// Folder watches by the id `Effect::WatchFolder` gave each.
+    folders: HashMap<String, crate::services::folders::FolderWatch>,
     inbox: Inbox,
     pending: Vec<UiMsg>,
     clock_start: Instant,
@@ -503,6 +505,7 @@ pub fn start(name: &str, app_id: &str) -> Result<Session, errors::Error> {
         shell: None,
         disposed: None,
         timers: vec![],
+        folders: HashMap::new(),
         inbox,
         pending: vec![],
         clock_start: Instant::now(),
@@ -4339,6 +4342,20 @@ impl Session {
                         .filter(|t| !(t.window.is_empty() && t.owner.is_empty() && t.tag == tag))
                         .cloned()
                         .collect::<Vec<_>>()
+                }
+                Effect::WatchFolder { id, path } => {
+                    self.folders.remove(&id);
+                    match crate::services::folders::watch(id.clone(), &path, self.mailbox()) {
+                        Ok(watch) => {
+                            self.folders.insert(id.clone(), watch);
+                            // What changed before the watch began is read now.
+                            self.pending.push(UiMsg::FolderChanged(id));
+                        }
+                        Err(e) => self.log_line(&format!("folder {path} unwatched: {e}")),
+                    }
+                }
+                Effect::UnwatchFolder(id) => {
+                    self.folders.remove(&id);
                 }
                 Effect::AnswerCompletion(owner, request, items, error) => {
                     let mut w = 0;
@@ -8267,6 +8284,56 @@ mod advance_tests {
             assert!(s.semantics(0).dump().contains("ticks 10"));
             s.advance(50).unwrap();
             assert!(s.semantics(0).dump().contains("ticks 11"));
+            s.shutdown()
+        })
+    }
+
+    #[test]
+    fn a_file_written_in_place_in_a_watched_folder_reports_its_watch() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _cleanup = scopeguard::guard((), |_| crate::services::remove_test_config(&config));
+            let folder = std::path::Path::new(&config).join("records");
+            std::fs::create_dir_all(&folder).unwrap();
+            let record = folder.join("4242.json");
+            std::fs::write(&record, "{}").unwrap();
+            let mut s = crate::application(
+                "Folders",
+                "dev.gossamer.gui-folder-test",
+                || 0_i64,
+                |n, msg| match msg {
+                    UiMsg::FolderChanged(id) if id == "records" => n + 1,
+                    _ => n,
+                },
+                |n| Widget::label(&format!("changes {}", (*n).min(2))),
+            )
+            .size(200, 100)
+            .start()
+            .unwrap();
+            effects::perform(effects::Effect::WatchFolder {
+                id: "records".into(),
+                path: folder.to_string_lossy().into_owned(),
+            });
+            s.flush().unwrap();
+            // The watch reports itself as it begins.
+            assert!(s.semantics(0).dump().contains("changes 1"));
+            // Written in place, not replaced.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&record)
+                .and_then(|mut f| std::io::Write::write_all(&mut f, b"{\"status\":\"busy\"}"))
+                .unwrap();
+            while !s.semantics(0).dump().contains("changes 2") {
+                assert!(
+                    s.step().unwrap(),
+                    "the session ended before the change arrived"
+                );
+            }
+            assert_eq!(s.folders.len(), 1);
+            effects::perform(effects::Effect::UnwatchFolder("records".into()));
+            s.flush().unwrap();
+            assert!(s.folders.is_empty());
             s.shutdown()
         })
     }

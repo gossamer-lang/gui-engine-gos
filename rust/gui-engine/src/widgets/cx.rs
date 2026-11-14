@@ -353,6 +353,8 @@ pub enum UiMsg {
     Custom(String, String),
     /// The global shortcut `id` (`Effect::RegisterHotkey`) was pressed.
     Hotkey(String),
+    /// A file in the folder `Effect::WatchFolder` watches for `id` changed.
+    FolderChanged(String),
 }
 
 /// Where a popup sits relative to its anchor.

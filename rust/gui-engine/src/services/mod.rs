@@ -2,6 +2,7 @@ pub mod apps;
 pub(crate) mod bounded_io;
 pub mod clipboard;
 pub mod desktop;
+pub mod folders;
 pub mod jobs;
 pub mod listing;
 pub mod palette;

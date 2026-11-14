@@ -698,9 +698,10 @@ dependencies = [
 
 [[package]]
 name = "gui-engine"
-version = "0.2.20"
+version = "0.2.21"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "encoding_rs",
  "foldhash",
  "gif",

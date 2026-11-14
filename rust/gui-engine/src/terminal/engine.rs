@@ -36,6 +36,8 @@ pub struct Engine {
     images: Lease,
     /// The pixel size of a cell as the view draws it; zero until it has.
     cell: (u16, u16),
+    /// Kitty notifications (OSC 99) that arrived in parts.
+    gathering: super::kitty_notify::Gathering,
 }
 
 /// The most memory one terminal's images may take, while the session's
@@ -87,6 +89,10 @@ impl TerminalConfiguration for Config {
 /// hears of them; a program that sends more loses the oldest.
 const TOAST_LIMIT: usize = 8;
 
+/// The most program status reports a terminal holds before the session
+/// hears of them; a program that sends more loses the oldest.
+const STATUS_LIMIT: usize = 64;
+
 /// Receives what the terminal reports while it parses: titles, bells and
 /// desktop notifications.
 struct Alerts(Arc<Mutex<Notifications>>);
@@ -98,12 +104,7 @@ impl AlertHandler for Alerts {
             Alert::WindowTitleChanged(title) => notes.set_title(&title),
             Alert::Bell => notes.bells = notes.bells.saturating_add(1),
             Alert::ToastNotification { title, body, .. } => {
-                if notes.toasts.len() == TOAST_LIMIT {
-                    notes.toasts.pop_front();
-                }
-                let title = printable(title.as_deref().unwrap_or_default(), 256);
-                let body = printable(&body, 1024);
-                notes.toasts.push_back((title, body));
+                notes.toast(title.as_deref().unwrap_or_default(), &body)
             }
             // Colors are the view's, and the session already redraws on every
             // change.
@@ -163,6 +164,10 @@ struct Filter {
     osc: bool,
     overflow: bool,
     dropped: usize,
+    /// The strings the engine answers itself, taken out of the last pass
+    /// (`TAKEN`): each one without its end, and how much of the output came
+    /// before it.
+    taken: Vec<(usize, Vec<u8>)>,
 }
 
 /// Where the filter is in an escape sequence it intercepts.
@@ -192,6 +197,11 @@ pub struct Notifications {
     /// selection.
     clipboard: Option<String>,
     primary: Option<String>,
+    /// Program status reports (OSC 7501), oldest first.
+    statuses: std::collections::VecDeque<super::status::Status>,
+    /// Requests for the user's attention (OSC 1337 RequestAttention), and
+    /// their withdrawals, oldest first.
+    attention: std::collections::VecDeque<bool>,
     replies: std::collections::VecDeque<Vec<u8>>,
     reply_bytes: usize,
     pub dropped_replies: usize,
@@ -204,6 +214,15 @@ impl Notifications {
         }
         self.reply_bytes += bytes.len();
         self.replies.push_back(bytes.to_vec());
+    }
+    /// Keeps a desktop notification for the session; past `TOAST_LIMIT` the
+    /// oldest goes.
+    fn toast(&mut self, title: &str, body: &str) {
+        if self.toasts.len() == TOAST_LIMIT {
+            self.toasts.pop_front();
+        }
+        self.toasts
+            .push_back((printable(title, 256), printable(body, 1024)));
     }
     fn set_title(&mut self, title: &str) {
         self.title = title
@@ -235,6 +254,15 @@ fn next_escape(input: &[u8], from: usize) -> Option<usize> {
 }
 
 const OSC_LIMIT: usize = 4096;
+/// The strings the engine answers itself instead of the terminal core:
+/// program status (OSC 7501), kitty's notifications (OSC 99) and iTerm2's
+/// request for attention.
+const TAKEN: [&[u8]; 3] = [
+    super::status::PREFIX,
+    super::kitty_notify::PREFIX,
+    ATTENTION_PREFIX,
+];
+const ATTENTION_PREFIX: &[u8] = b"\x1b]1337;RequestAttention=";
 /// The longest image a program may send in one string: a sixel (DCS), a
 /// kitty graphics command (APC) or an iTerm2 file (OSC 1337).
 const IMAGE_STRING_LIMIT: usize = 16 * 1024 * 1024;
@@ -358,7 +386,13 @@ impl Filter {
                     }
                     if done {
                         if !self.overflow {
-                            out.extend_from_slice(&self.string);
+                            if TAKEN.iter().any(|p| self.string.starts_with(p)) {
+                                // BEL ends a string in one byte, ST in two.
+                                let end = self.string.len() - if byte == 7 { 1 } else { 2 };
+                                self.taken.push((out.len(), self.string[..end].to_vec()));
+                            } else {
+                                out.extend_from_slice(&self.string);
+                            }
                         }
                         self.end_string();
                         Ground
@@ -564,6 +598,7 @@ impl Engine {
             byte_limit,
             images,
             cell: (0, 0),
+            gathering: super::kitty_notify::Gathering::default(),
         })
     }
     /// Stores the history rows well above the screen compressed; cheap when
@@ -602,7 +637,15 @@ impl Engine {
             &filtered
         };
         let alternate = self.term.is_alt_screen_active();
-        self.term.advance_bytes(passed);
+        // A taken string is acted on where it fell in the output, so the
+        // answer to a query goes back before the replies to what followed it.
+        let mut parsed = 0;
+        for (at, string) in std::mem::take(&mut self.filter.taken) {
+            self.term.advance_bytes(&passed[parsed..at]);
+            parsed = at;
+            self.take_string(&string);
+        }
+        self.term.advance_bytes(&passed[parsed..]);
         self.charge_images();
         // The other screen has rows of its own, so a view into the one left
         // behind no longer applies.
@@ -610,6 +653,47 @@ impl Engine {
             self.view_top = None;
         }
         Ok(())
+    }
+    /// Acts on a string the engine answers itself.
+    fn take_string(&mut self, string: &[u8]) {
+        if let Some(body) = string.strip_prefix(super::status::PREFIX) {
+            self.take_status(body);
+        } else if let Some(body) = string.strip_prefix(super::kitty_notify::PREFIX) {
+            match self.gathering.read(body) {
+                super::kitty_notify::Request::Answer(bytes) => self.notes.lock().reply(&bytes),
+                super::kitty_notify::Request::Show(title, body) => {
+                    self.notes.lock().toast(&title, &body)
+                }
+                super::kitty_notify::Request::Nothing => {}
+            }
+        } else if let Some(value) = string.strip_prefix(ATTENTION_PREFIX) {
+            let asked = match value {
+                b"yes" | b"once" | b"fireworks" => Some(true),
+                b"no" => Some(false),
+                _ => None,
+            };
+            if let Some(asked) = asked {
+                let mut notes = self.notes.lock();
+                if notes.attention.len() == STATUS_LIMIT {
+                    notes.attention.pop_front();
+                }
+                notes.attention.push_back(asked);
+            }
+        }
+    }
+    /// Answers a program status query, or keeps a report for the session.
+    fn take_status(&mut self, body: &[u8]) {
+        let mut notes = self.notes.lock();
+        match super::status::read(body) {
+            Some(super::status::Request::Query) => notes.reply(super::status::ANSWER),
+            Some(super::status::Request::Report(status)) => {
+                if notes.statuses.len() == STATUS_LIMIT {
+                    notes.statuses.pop_front();
+                }
+                notes.statuses.push_back(status);
+            }
+            None => self.filter.dropped += 1,
+        }
     }
     /// Charges the session for the images the screen holds. Past what the
     /// session can take, the screen's image limit falls to its charge, so its
@@ -989,6 +1073,15 @@ impl Engine {
     pub fn take_toasts(&mut self) -> Vec<(String, String)> {
         self.notes.lock().toasts.drain(..).collect()
     }
+    /// The program's requests for attention (true) and their withdrawals
+    /// (false) since the last call.
+    pub fn take_attention(&mut self) -> Vec<bool> {
+        self.notes.lock().attention.drain(..).collect()
+    }
+    /// The program status reports (OSC 7501) since the last call.
+    pub fn take_statuses(&mut self) -> Vec<super::status::Status> {
+        self.notes.lock().statuses.drain(..).collect()
+    }
     /// The text the program last wrote to the clipboard and to the primary
     /// selection since the last call.
     pub fn take_clipboard(&mut self) -> (Option<String>, Option<String>) {
@@ -1260,6 +1353,55 @@ mod tests {
             e.process(format!("\x1b]9;{n}\x07").as_bytes()).unwrap();
         }
         assert_eq!(e.take_toasts().len(), TOAST_LIMIT);
+    }
+
+    #[test]
+    fn programs_ask_whether_the_terminal_listens_and_report_their_status() {
+        let mut e = Engine::new(4, 20, 10, 4 * 1024 * 1024, Budget::new(8 * 1024 * 1024)).unwrap();
+        // The answer to the query comes before the device attributes asked
+        // after it, which tells the program the terminal listens.
+        e.process(b"\x1b]7501;?\x1b\\\x1b[c").unwrap();
+        let replies = e.take_replies();
+        assert!(
+            replies.starts_with(b"\x1b]7501;?\x1b\\\x1b["),
+            "{replies:?}"
+        );
+        e.process(b"a\x1b]7501;state=working:app=codex\x1b\\b\x1b]7501;state=blocked:app=codex:kind=permission\x07c")
+            .unwrap();
+        let reported = e.take_statuses();
+        assert_eq!(
+            reported
+                .iter()
+                .map(|s| (s.state.as_str(), s.kind.as_str()))
+                .collect::<Vec<_>>(),
+            [("working", ""), ("blocked", "permission")]
+        );
+        assert!(reported.iter().all(|s| s.app == "codex"));
+        assert!(e.text().starts_with("abc"), "{:?}", e.text());
+        assert!(e.take_statuses().is_empty());
+        e.process(b"\x1b]7501;state=sleeping\x07").unwrap();
+        assert!(e.take_statuses().is_empty());
+        for _ in 0..100 {
+            e.process(b"\x1b]7501;state=idle\x07").unwrap();
+        }
+        assert_eq!(e.take_statuses().len(), STATUS_LIMIT);
+    }
+
+    #[test]
+    fn kitty_notifications_and_requests_for_attention_reach_the_session() {
+        let mut e = Engine::new(4, 20, 10, 4 * 1024 * 1024, Budget::new(8 * 1024 * 1024)).unwrap();
+        e.process(b"\x1b]99;i=1:d=0;Pi\x1b\\\x1b]99;i=1:p=body;Ready\x1b\\")
+            .unwrap();
+        assert_eq!(e.take_toasts(), [("Pi".to_string(), "Ready".to_string())]);
+        e.process(b"\x1b]99;i=a:p=?;\x1b\\").unwrap();
+        assert!(e.take_replies().starts_with(b"\x1b]99;i=a:p=?;"));
+        e.process(b"\x1b]1337;RequestAttention=yes\x07x\x1b]1337;RequestAttention=no\x07")
+            .unwrap();
+        assert_eq!(e.take_attention(), [true, false]);
+        // Other iTerm2 strings still reach the terminal core.
+        e.process(b"\x1b]1337;SetUserVar=a=Yg==\x07").unwrap();
+        assert!(e.take_attention().is_empty());
+        assert!(e.text().starts_with('x'), "{:?}", e.text());
     }
 
     #[test]

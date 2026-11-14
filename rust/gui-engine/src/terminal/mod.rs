@@ -10,10 +10,12 @@ pub mod engine;
 pub mod frame;
 mod images;
 pub mod keyboard;
+mod kitty_notify;
 mod layer;
 pub mod links;
 mod modes;
 mod shapes;
+pub mod status;
 mod transport;
 pub mod widget;
 
@@ -123,7 +125,7 @@ pub enum Event {
     LinkPointed(String),
     /// The user asked to open a link: Ctrl+click, or Command+click on macOS.
     LinkActivated(String),
-    /// The program sent a desktop notification (OSC 9 or 777): its title,
+    /// The program sent a desktop notification (OSC 9, 99 or 777): its title,
     /// empty when it gave none, and its body.
     Notify(String, String),
     /// The program wrote this text to the clipboard (OSC 52).
@@ -144,6 +146,12 @@ pub enum Event {
     /// Sent once the program starts and again when either changes, as
     /// output arrives.
     Foreground(String, String),
+    /// The program reported what it or one of its tasks is doing (OSC 7501).
+    /// The terminal answers the protocol's query, so programs know to report.
+    Status(status::Status),
+    /// The program asked for the user's attention (true), or withdrew its
+    /// request (false), as iTerm2's `OSC 1337 ; RequestAttention` does.
+    Attention(bool),
 }
 
 /// The state of a terminal an application reads.
@@ -1216,6 +1224,12 @@ fn take_ending(id: i64, entry: &mut Entry, events: &mut Vec<UiMsg>, rearm: bool)
     };
     for (title, body) in entry.engine.take_toasts() {
         events.push(UiMsg::Terminal(id, Event::Notify(title, body)));
+    }
+    for asked in entry.engine.take_attention() {
+        events.push(UiMsg::Terminal(id, Event::Attention(asked)));
+    }
+    for status in entry.engine.take_statuses() {
+        events.push(UiMsg::Terminal(id, Event::Status(status)));
     }
     let (clipboard, primary) = entry.engine.take_clipboard();
     if let Some(text) = clipboard {

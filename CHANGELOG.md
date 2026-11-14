@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.21 - Program status and attention requests
+
+- Terminals answer the Program Status Protocol's query (OSC 7501) and report what programs say they are doing as `Event::Status`: idle, working, blocked with what they wait for, done, error, or clear.
+- Kitty's desktop notifications (OSC 99), in parts or base64, arrive as `Event::Notify`, and their query is answered.
+- A program's request for attention (OSC 1337 RequestAttention) arrives as `Event::Attention`.
+
 ## 0.2.20 - Folder watches
 
 - `Effect::WatchFolder` delivers `UiMsg::FolderChanged` once as the watch begins and then each time a file in the folder is made, removed, renamed or written, from a thread that runs only while the watch does; `Effect::UnwatchFolder` ends it.

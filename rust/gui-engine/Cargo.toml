@@ -1,6 +1,6 @@
 [package]
 name = "gui-engine"
-version = "0.2.20"
+version = "0.2.21"
 edition = "2024"
 publish = false
 
@@ -30,6 +30,7 @@ parking_lot_core = "0.9"
 num_cpus = "1.17"
 # Content revisions of recorded paint are hashed every frame.
 foldhash = "0.2"
+base64 = "0.22"
 serde = { version = "1", features = ["derive", "rc"] }
 jiff = "0.2"
 png = "0.18"

@@ -21,7 +21,7 @@ use crate::widgets::cx::PaintCx;
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct LayerContext {
     pub(super) palette: ColorPalette,
-    pub(super) style: TextStyle,
+    pub(super) styles: [TextStyle; 4],
     /// Cell width, line height and text rise, by their bits.
     pub(super) metrics: [u64; 3],
     pub(super) inset: (i64, i64),

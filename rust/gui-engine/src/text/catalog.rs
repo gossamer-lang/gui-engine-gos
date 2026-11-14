@@ -32,7 +32,7 @@ pub struct FontRecord {
     /// The weight on the CSS scale (400 regular, 700 bold); 0 when unknown.
     pub weight: i64,
     pub monospace: bool,
-    /// Whether the face draws color bitmaps (CBDT) instead of outlines.
+    /// Whether the face draws in color (`COLR`, `CBDT`, or `sbix`).
     pub color: bool,
     /// The scalars the face has glyphs for, as inclusive (first, last)
     /// pairs flattened into one sorted list. Faces that cover the same
@@ -61,7 +61,7 @@ impl FontRecord {
 }
 
 // The summaries of one file, valid while its size and modification time hold.
-#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq)]
 struct CachedFile {
     path: String,
     size: i64,
@@ -69,16 +69,113 @@ struct CachedFile {
     faces: Vec<FontRecord>,
 }
 
-// The cache file's contents.
-#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+// The cache file's contents: each distinct coverage list once, as faces of a
+// family mostly share one, and each file's faces naming theirs by index.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 struct CacheDocument {
-    files: Vec<CachedFile>,
+    lists: Vec<Vec<u32>>,
+    files: Vec<StoredFile>,
 }
 
-// A `CacheDocument` written from summaries held elsewhere, in the same form.
-#[derive(serde::Serialize)]
-struct CacheDocumentRef<'a> {
-    files: &'a [CachedFile],
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct StoredFile {
+    path: String,
+    size: i64,
+    modified: i64,
+    faces: Vec<StoredFace>,
+}
+
+// A `FontRecord` as the cache keeps it: its file's path is the entry's, and
+// its coverage an index into the document's lists.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct StoredFace {
+    index: i64,
+    family: String,
+    legacy_family: String,
+    style: String,
+    bold: bool,
+    italic: bool,
+    weight: i64,
+    monospace: bool,
+    color: bool,
+    coverage: usize,
+}
+
+impl CacheDocument {
+    // The document for `entries`, each coverage list stored once.
+    fn of(entries: &[CachedFile]) -> CacheDocument {
+        let mut lists: Vec<Vec<u32>> = vec![];
+        let mut known: HashMap<std::sync::Arc<[u32]>, usize> = HashMap::new();
+        let files = entries
+            .iter()
+            .map(|entry| StoredFile {
+                path: entry.path.clone(),
+                size: entry.size,
+                modified: entry.modified,
+                faces: entry
+                    .faces
+                    .iter()
+                    .map(|face| {
+                        let coverage = *known
+                            .entry(std::sync::Arc::clone(&face.coverage))
+                            .or_insert_with(|| {
+                                lists.push(face.coverage.to_vec());
+                                lists.len() - 1
+                            });
+                        StoredFace {
+                            index: face.index,
+                            family: face.family.clone(),
+                            legacy_family: face.legacy_family.clone(),
+                            style: face.style.clone(),
+                            bold: face.bold,
+                            italic: face.italic,
+                            weight: face.weight,
+                            monospace: face.monospace,
+                            color: face.color,
+                            coverage,
+                        }
+                    })
+                    .collect(),
+            })
+            .collect();
+        CacheDocument { lists, files }
+    }
+
+    // The cached files, their faces sharing the document's lists; `None`
+    // when a face names a list the document lacks.
+    fn into_files(self) -> Option<Vec<CachedFile>> {
+        let lists: Vec<std::sync::Arc<[u32]>> = self.lists.into_iter().map(Into::into).collect();
+        self.files
+            .into_iter()
+            .map(|file| {
+                let faces = file
+                    .faces
+                    .into_iter()
+                    .map(|face| {
+                        Some(FontRecord {
+                            path: file.path.clone(),
+                            index: face.index,
+                            family: face.family,
+                            legacy_family: face.legacy_family,
+                            style: face.style,
+                            bold: face.bold,
+                            italic: face.italic,
+                            weight: face.weight,
+                            monospace: face.monospace,
+                            color: face.color,
+                            coverage: std::sync::Arc::clone(lists.get(face.coverage)?),
+                        })
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                Some(CachedFile {
+                    path: file.path,
+                    size: file.size,
+                    modified: file.modified,
+                    faces,
+                })
+            })
+            .collect()
+    }
 }
 
 // The tables a summary reads.
@@ -149,7 +246,7 @@ pub fn scan_file(file: &str) -> Result<Vec<FontRecord>, errors::Error> {
 
 // A single-face font holding only the summary tables of the face whose table
 // directory starts at `base`, read positionally from `f`, and whether the face
-// has color bitmaps.
+// draws in color.
 fn summary_tables(f: &fs::File, size: i64, base: i64) -> Result<(Vec<u8>, bool), errors::Error> {
     let head = read_at(f, 12, base)?;
     let count = be_u16(&head, 4);
@@ -194,7 +291,9 @@ fn summary_tables(f: &fs::File, size: i64, base: i64) -> Result<(Vec<u8>, bool),
     }
     Ok((
         out.to_vec(),
-        names.contains("CBDT") && names.contains("CBLC"),
+        (names.contains("CBDT") && names.contains("CBLC"))
+            || names.contains("sbix")
+            || (names.contains("COLR") && names.contains("CPAL")),
     ))
 }
 
@@ -235,9 +334,9 @@ pub fn load_cancellable(
     let mut known = HashMap::<String, CachedFile>::new();
     if let Ok(bytes) = bounded_io::read(std::path::Path::new(cache), 8 * 1024 * 1024, active)
         && let Ok(document) = serde_json::from_slice::<CacheDocument>(&bytes)
+        && let Some(cached) = document.into_files()
     {
-        let bytes: usize = document
-            .files
+        let bytes: usize = cached
             .iter()
             .map(|entry| {
                 entry.path.capacity()
@@ -250,7 +349,7 @@ pub fn load_cancellable(
             })
             .sum();
         if bytes <= CATALOG_BYTE_LIMIT {
-            for entry in document.files {
+            for entry in cached {
                 known.insert(entry.path.clone(), entry);
             }
         }
@@ -304,7 +403,7 @@ pub fn load_cancellable(
     {
         // The cache streams to disk, never whole in memory, and stops at its
         // own disk cap.
-        let document = CacheDocumentRef { files: &entries };
+        let document = CacheDocument::of(&entries);
         struct Limited<'a> {
             out: &'a mut dyn std::io::Write,
             written: usize,
@@ -330,6 +429,7 @@ pub fn load_cancellable(
                 Err(std::io::Error::other("font catalog cancelled or expired"))
             }
         });
+        remove_older_caches(cache);
     }
     let mut records: Vec<FontRecord> = entries.into_iter().flat_map(|entry| entry.faces).collect();
     share_coverage(&mut records);
@@ -351,7 +451,30 @@ fn share_coverage(records: &mut [FontRecord]) {
 
 /// Where the toolkit caches the summaries of installed fonts.
 pub fn cache_file() -> String {
-    paths::join(&services::cache_dir("gui-gos"), "fonts-v4.json")
+    paths::join(&services::cache_dir("gui-gos"), "fonts-v6.json")
+}
+
+// Removes the caches earlier versions wrote beside `cache` (`fonts-v2.json`
+// and on), which no version reads once a newer one is written.
+fn remove_older_caches(cache: &str) {
+    let Some(dir) = paths::parent(cache) else {
+        return;
+    };
+    let Ok(listing) = fs::read_dir(dir) else {
+        return;
+    };
+    let current = std::path::Path::new(cache).file_name();
+    for entry in listing.flatten() {
+        let name = entry.file_name();
+        let text = name.to_string_lossy();
+        let older = text
+            .strip_prefix("fonts-v")
+            .and_then(|rest| rest.strip_suffix(".json"))
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+        if older && Some(name.as_os_str()) != current {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -426,5 +549,45 @@ mod tests {
             ));
             assert!(records[0].covers('A') && !records[0].covers('\u{10FFFF}'));
         }
+    }
+
+    #[test]
+    fn the_cache_stores_each_coverage_list_once() {
+        let config = crate::services::private_test_config();
+        let _defer = scopeguard::guard((), |_| {
+            crate::services::remove_test_config(&config);
+        });
+        let cache = paths::join(&config, "fonts.json");
+        let mono = "assets/fonts/DejaVuSansMono.ttf".to_string();
+        let records = load(&[SANS.to_string(), mono, SANS.to_string()], &cache);
+        assert_eq!(records.len(), 3);
+        let stored: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&cache).unwrap()).unwrap();
+        assert_eq!(stored["lists"].as_array().unwrap().len(), 2);
+        let first = &stored["files"][0]["faces"][0];
+        assert_eq!(first["family"], "DejaVu Sans");
+        assert_eq!(first["coverage"], 0);
+    }
+
+    #[test]
+    fn writing_the_cache_removes_older_versions_of_it() {
+        let config = crate::services::private_test_config();
+        let _defer = scopeguard::guard((), |_| {
+            crate::services::remove_test_config(&config);
+        });
+        let older = [
+            paths::join(&config, "fonts-v2.json"),
+            paths::join(&config, "fonts-v5.json"),
+        ];
+        let unrelated = paths::join(&config, "fonts-vx.json");
+        fs::create_dir_all(&config).unwrap();
+        for file in older.iter().chain([&unrelated]) {
+            fs::write(file, "{}").unwrap();
+        }
+        let cache = paths::join(&config, "fonts-v6.json");
+        assert_eq!(load(&[SANS.to_string()], &cache).len(), 1);
+        assert!(paths::exists(&cache));
+        assert!(older.iter().all(|file| !paths::exists(file)));
+        assert!(paths::exists(&unrelated));
     }
 }

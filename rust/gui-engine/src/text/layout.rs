@@ -17,14 +17,11 @@ use crate::render::Canvas;
 use crate::render::vector::{FillRule, Mask};
 use crate::style::color::Color;
 use crate::text::bidi;
-use crate::text::font::{ColorGlyph, Face};
+use crate::text::font::ColorGlyph;
 use crate::text::fonts;
 use crate::text::fonts::{FaceId, Family};
-use crate::text::indic;
 use crate::text::linebreak;
-use crate::text::opentype;
-use crate::text::opentype::GlyphInfo;
-use crate::text::ucd::{JOINING, SCRIPT, SCRIPT_CODES, SCRIPT_NAMES};
+use crate::text::ucd::{SCRIPT, SCRIPT_CODES, SCRIPT_NAMES};
 
 thread_local! { static WORK_CONTEXT: std::cell::RefCell<Option<crate::services::jobs::Context>> = const { std::cell::RefCell::new(None) }; }
 pub(crate) fn work_active() -> bool {
@@ -65,6 +62,9 @@ pub struct TextStyle {
     /// Greek and Cyrillic text; scripts that need theirs keep them.
     #[serde(default = "ligatures_on")]
     pub ligatures: bool,
+    /// OpenType feature settings, as `parse_features` reads them.
+    #[serde(default)]
+    pub features: String,
 }
 
 fn ligatures_on() -> bool {
@@ -82,6 +82,7 @@ impl TextStyle {
             tab_width: 4,
             line_spacing: 0.0,
             ligatures: true,
+            features: String::new(),
         }
     }
 
@@ -95,6 +96,7 @@ impl TextStyle {
             tab_width: 4,
             line_spacing: 0.0,
             ligatures: true,
+            features: String::new(),
         }
     }
 
@@ -120,14 +122,15 @@ impl TextStyle {
             Family::Named(ref n) => n,
         };
         format!(
-            "{}|{}|{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}|{}|{}",
             fam,
             (self.size * 64.0) as i64,
             self.bold,
             self.italic,
             self.tab_width,
             (self.line_spacing * 100.0) as i64,
-            self.ligatures
+            self.ligatures,
+            self.features
         )
     }
 }
@@ -540,7 +543,7 @@ pub fn purge_caches() {
     crate::rich::layout_cache::purge();
     crate::widgets::colorpicker::purge_cache();
     fonts::purge_fallback_cache();
-    opentype::purge_cache();
+    PLANS.lock().clear();
     CACHE.lock().clear();
     PARAGRAPHS.lock().clear();
     GLYPHS.lock().clear();
@@ -768,99 +771,6 @@ fn script_of(c: char) -> i64 {
     0
 }
 
-// The OpenType script tag for a Unicode script name.
-fn script_tag(index: i64) -> String {
-    if index <= 1 || index >= SCRIPT_CODES.len() as i64 {
-        return "DFLT".to_string();
-    }
-    // OpenType tags are ISO 15924 codes in lower case, except where the
-    // registry names them otherwise; Indic and Myanmar take their v2 tags.
-    let code = SCRIPT_CODES[index as usize].to_lowercase();
-    let tag = match code.as_str() {
-        "zinh" | "zyyy" | "zzzz" => "DFLT",
-        "hira" | "kana" | "hrkt" => "kana",
-        "laoo" => "lao ",
-        "yiii" => "yi  ",
-        "nkoo" => "nko ",
-        "vaii" => "vai ",
-        "deva" => "dev2",
-        "beng" => "bng2",
-        "guru" => "gur2",
-        "gujr" => "gjr2",
-        "orya" => "ory2",
-        "taml" => "tml2",
-        "telu" => "tel2",
-        "knda" => "knd2",
-        "mlym" => "mlm2",
-        "mymr" => "mym2",
-        _ => return code,
-    };
-    tag.to_string()
-}
-
-fn joining_type(c: char) -> i64 {
-    let v = c as i64;
-    let mut lo = 0;
-    let mut hi = JOINING.len() / 3;
-    while lo < hi {
-        let mid = (lo + hi) / 2;
-        if v < JOINING[mid * 3] {
-            hi = mid;
-        } else if v > JOINING[mid * 3 + 1] {
-            lo = mid + 1;
-        } else {
-            return JOINING[mid * 3 + 2];
-        }
-    }
-    // Unlisted marks and format characters are transparent.
-    if unicode::is_mark(c) || v == 0x200b || (0x200e..=0x200f).contains(&v) {
-        5
-    } else {
-        0
-    }
-}
-
-// Arabic positional forms (U=0 R=1 L=2 D=3 C=4 T=5) for one run's chars.
-fn arabic_forms(chars: &[char]) -> Vec<String> {
-    let n = chars.len();
-    let types = chars.iter().map(|&c| joining_type(c)).collect::<Vec<_>>();
-    let mut forms = vec![String::new(); n];
-    let mut i = 0;
-    while i < n {
-        let t = types[i];
-        if t == 5 || t == 0 {
-            i += 1;
-            continue;
-        }
-        // Previous and next non-transparent neighbours.
-        let mut p = i as i64 - 1;
-        while p >= 0 && types[p as usize] == 5 {
-            p -= 1
-        }
-        let mut q = i + 1;
-        while q < n && types[q] == 5 {
-            q += 1
-        }
-        let joins_prev =
-            p >= 0 && matches!(types[p as usize], 2..=4) && (t == 3 || t == 1 || t == 4);
-        let joins_next = q < n
-            && (types[q] == 3 || types[q] == 1 || types[q] == 4)
-            && (t == 3 || t == 2 || t == 4);
-        forms[i] = if joins_prev && joins_next {
-            "medi"
-        } else if joins_prev {
-            "fina"
-        } else if joins_next {
-            "init"
-        } else {
-            "isol"
-        }
-        .to_string();
-        i += 1;
-    }
-    forms
-}
-
 fn cached_paragraph(text: &str, style: &TextStyle, options: LayoutOptions) -> Vec<Line> {
     let key = format!("{}#{}#{}", style.key(), options.key(), text);
     if let Some(lines) = PARAGRAPHS.lock().get(&key) {
@@ -928,7 +838,7 @@ fn layout_paragraph(
             ..Line::default()
         }];
     }
-    let primary = fonts::primary(&style.family, style.bold);
+    let primary = fonts::primary_style(&style.family, style.bold, style.italic);
     let runs = itemize_and_shape(&chars, &offsets, &levels, end, primary, style, spans);
     // Advance of each source char (glyph advances assigned to clusters).
     let scale = style.size / fonts::face(primary).units_per_em as f64;
@@ -1076,22 +986,18 @@ fn itemize_and_shape(
     let styled_faces = spans
         .iter()
         .map(|span| {
-            fonts::primary(
+            fonts::primary_style(
                 if span.marks.code {
                     &Family::Monospace
                 } else {
                     &style.family
                 },
                 style.bold || span.marks.strong,
+                style.italic || span.marks.emphasis,
             )
         })
         .collect::<Vec<_>>();
-    let contextual_forms =
-        if !spans.is_empty() && chars.iter().any(|c| (0x600..=0x8ff).contains(&(*c as u32))) {
-            Some(arabic_forms(chars))
-        } else {
-            None
-        };
+    let features = Features::of(style);
     let mut faces = vec![];
     let mut scripts = vec![];
     let mut k = 0;
@@ -1155,13 +1061,13 @@ fn itemize_and_shape(
         }
         let run_end = if e < n { offsets[e] } else { end };
         let mut glyphs = shape_run(
-            &chars[s..e],
-            &offsets[s..e],
+            chars,
+            offsets,
+            s..e,
             levels[s] % 2 == 1,
             faces[s],
-            &script_tag(scripts[s]),
-            contextual_forms.as_ref().map(|forms| &forms[s..e]),
-            style.ligatures,
+            scripts[s],
+            &features,
         );
         for glyph in &mut glyphs {
             if let Some(image) =
@@ -1191,89 +1097,174 @@ fn itemize_and_shape(
     runs
 }
 
-/// Shapes one run in logical order: cmap, GSUB, advances, GPOS.
+/// One shaped glyph: its id, the byte offset of the first character it
+/// renders, and its placement in font units.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct GlyphInfo {
+    pub gid: i64,
+    pub cluster: i64,
+    pub x_advance: i64,
+    pub x_offset: i64,
+    pub y_offset: i64,
+}
+
+/// A style's OpenType feature settings for shaping: the user's list, then
+/// the ligature switch for scripts whose ligatures are optional.
+#[derive(Debug, Clone, Default)]
+struct Features {
+    settings: Vec<harfrust::Feature>,
+    /// With ligatures off, `liga`, `clig` and `calt` are off as well.
+    without_ligatures: Vec<harfrust::Feature>,
+    key: String,
+}
+
+impl Features {
+    fn of(style: &TextStyle) -> Features {
+        let settings = parse_features(&style.features);
+        let mut without_ligatures = settings.clone();
+        if !style.ligatures {
+            without_ligatures.extend(
+                [b"liga", b"clig", b"calt"]
+                    .map(|tag| harfrust::Feature::new(harfrust::Tag::new(tag), 0, ..)),
+            );
+        }
+        Features {
+            settings,
+            without_ligatures,
+            key: format!("{}|{}", style.features, style.ligatures),
+        }
+    }
+
+    // Latin, Greek, Cyrillic and script-neutral text may give up its
+    // ligatures; scripts that need theirs to be legible keep them.
+    fn for_script(&self, script: Option<harfrust::Script>) -> &[harfrust::Feature] {
+        let optional = script.is_none_or(|s| {
+            [
+                harfrust::Script::LATIN,
+                harfrust::Script::GREEK,
+                harfrust::Script::CYRILLIC,
+                harfrust::Script::COMMON,
+                harfrust::Script::INHERITED,
+            ]
+            .contains(&s)
+        });
+        if optional {
+            &self.without_ligatures
+        } else {
+            &self.settings
+        }
+    }
+}
+
+/// Parses feature settings separated by spaces or commas, in the forms
+/// HarfBuzz and CSS accept: `ss01`, `+ss01`, `-calt`, `cv01=2`, `zero=1`.
+/// Settings that do not parse are left out.
+pub fn parse_features(text: &str) -> Vec<harfrust::Feature> {
+    text.split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| s.parse::<harfrust::Feature>().ok())
+        .collect()
+}
+
+type PlanKey = (i64, u32, bool, String);
+
+// Shaping plans by face, script, direction and feature settings; built once
+// per combination, since they depend only on the face's layout tables.
+static PLANS: LazyLock<
+    Mutex<std::collections::HashMap<PlanKey, std::sync::Arc<harfrust::ShapePlan>>>,
+> = LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+// The characters a run's neighbours give its shaping as context, so joining
+// and contextual forms continue across run boundaries.
+const CONTEXT: usize = 5;
+
+/// Shapes `chars[range]` with harfrust, answering glyphs in logical order.
 fn shape_run(
     chars: &[char],
     offsets: &[i64],
+    range: std::ops::Range<usize>,
     rtl: bool,
     face_id: FaceId,
-    script: &str,
-    contextual_forms: Option<&[String]>,
-    ligatures: bool,
+    script: i64,
+    features: &Features,
 ) -> Vec<GlyphInfo> {
     let face = fonts::face(face_id);
-    if indic::is_indic(script) {
-        let mut glyphs = indic::shape(&face, script, chars, offsets);
-        position_run(&face, script, &mut glyphs, rtl);
-        return glyphs;
-    }
-    let forms = if script == "arab" || script == "syrc" {
-        contextual_forms.map_or_else(|| arabic_forms(chars), |forms| forms.to_vec())
-    } else {
-        vec![String::new(); chars.len()]
+    let Some(font) = face.model() else {
+        return vec![];
     };
-    let mut glyphs = vec![];
-    let mut i = 0;
-    while i < chars.len() {
-        let c = if rtl {
-            bidi::mirror(chars[i])
-        } else {
-            chars[i]
-        };
-        let gid = if c == '\t' {
-            face.glyph_for(' ')
-        } else {
-            face.glyph_for(c)
-        };
-        let mut g = GlyphInfo::new(gid, offsets[i], &forms[i]);
-        g.ignorable = fonts::is_default_ignorable(c);
-        glyphs.push(g);
-        i += 1;
+    let script = SCRIPT_CODES
+        .get(script as usize)
+        .and_then(|code| harfrust::Tag::new_checked(code.as_bytes()).ok())
+        .and_then(harfrust::Script::from_iso15924_tag);
+    let direction = if rtl {
+        harfrust::Direction::RightToLeft
+    } else {
+        harfrust::Direction::LeftToRight
+    };
+    let settings = features.for_script(script);
+    let mut buffer = harfrust::Buffer::new();
+    for i in range.clone() {
+        let c = if chars[i] == '\t' { ' ' } else { chars[i] };
+        buffer.push(u32::from(c), u32::try_from(offsets[i]).unwrap_or(u32::MAX));
     }
-    let mut features = vec!["ccmp", "locl", "rlig", "liga", "clig", "calt"];
-    if script == "arab" || script == "syrc" {
-        features = vec![
-            "ccmp", "locl", "isol", "fina", "medi", "init", "rlig", "calt", "liga",
-        ];
-    }
-    if script == "latn" || script == "DFLT" || script == "cyrl" || script == "grek" {
-        // Discretionary ligatures stay off; standard ones follow the style.
-        features = if ligatures {
-            vec!["ccmp", "locl", "liga", "clig", "calt"]
-        } else {
-            vec!["ccmp", "locl"]
-        };
-    }
-    opentype::substitute(&face, script, &mut glyphs, &features);
-    position_run(&face, script, &mut glyphs, rtl);
-    glyphs
-}
-
-// Sets advances from the font's metrics, then applies GPOS (or `kern`).
-// Default-ignorable characters the substitutions left alone become the
-// space glyph with no advance, so they never show.
-fn position_run(face: &Face, script: &str, glyphs: &mut Vec<GlyphInfo>, rtl: bool) {
-    let space = face.glyph_for(' ');
-    for g in glyphs.iter_mut() {
-        if g.ignorable {
-            g.gid = space
-        };
-        let (adv, _) = face.h_metrics(g.gid);
-        g.x_advance = if g.ignorable { 0 } else { adv };
-    }
-    if !opentype::position(
-        face,
-        script,
-        glyphs,
-        &["kern", "mark", "mkmk", "curs", "dist", "abvm", "blwm"],
+    let before = range.start.saturating_sub(CONTEXT)..range.start;
+    let after = range.end..(range.end + CONTEXT).min(chars.len());
+    buffer.set_pre_context_codepoints(
+        &chars[before]
+            .iter()
+            .map(|&c| u32::from(c))
+            .collect::<Vec<_>>(),
+    );
+    buffer.set_post_context_codepoints(
+        &chars[after]
+            .iter()
+            .map(|&c| u32::from(c))
+            .collect::<Vec<_>>(),
+    );
+    buffer.set_direction(direction);
+    buffer.set_script(script);
+    let key = (
+        face.slot,
+        script.map_or(0, |s| u32::from_be_bytes(s.tag().to_be_bytes())),
         rtl,
-    ) {
-        opentype::kern_table(face, glyphs)
+        features.key.clone(),
+    );
+    let cached = PLANS.lock().get(&key).cloned();
+    let plan = match cached {
+        Some(plan) => plan,
+        None => {
+            let plan = std::sync::Arc::new(harfrust::ShapePlan::new(
+                font, direction, script, None, settings,
+            ));
+            if face.slot >= 0 {
+                PLANS.lock().insert(key, std::sync::Arc::clone(&plan));
+            }
+            plan
+        }
+    };
+    let shaper = harfrust::ShaperFont::new(font);
+    let options = harfrust::ShapeOptions::new()
+        .plan(Some(&plan))
+        .features(settings);
+    if harfrust::shape(&shaper, &mut buffer, options).is_err() {
+        return vec![];
     }
-    for g in glyphs.iter_mut().filter(|g| g.ignorable) {
-        g.x_advance = 0;
-        g.x_offset = 0;
+    let mut glyphs = buffer
+        .glyph_infos()
+        .iter()
+        .zip(buffer.glyph_positions())
+        .map(|(info, pos)| GlyphInfo {
+            gid: i64::from(info.glyph_id),
+            cluster: i64::from(info.cluster),
+            x_advance: i64::from(pos.x_advance),
+            x_offset: i64::from(pos.x_offset),
+            y_offset: i64::from(pos.y_offset),
+        })
+        .collect::<Vec<_>>();
+    if rtl {
+        glyphs.reverse();
     }
+    glyphs
 }
 
 // Positions one line's glyphs: slices each run to the line, orders runs
@@ -1915,6 +1906,13 @@ fn glyph_mask(face_id: FaceId, gid: i64, size: f64, sub: i64, italic: bool) -> G
         return found.clone();
     }
     let face = fonts::face(face_id);
+    if let Some(bitmap) = face.mask_glyph(gid, size) {
+        let glyph = sized_mask_glyph(&bitmap, size);
+        GLYPHS
+            .lock()
+            .insert(key, glyph.clone(), glyph.coverage.len());
+        return glyph;
+    }
     let outline = face.outline(gid);
     let s = size / face.units_per_em as f64;
     let slant = if italic && !face.italic { 0.2 * s } else { 0.0 };
@@ -1940,6 +1938,32 @@ fn glyph_mask(face_id: FaceId, gid: i64, size: f64, sub: i64, italic: bool) -> G
     glyph
 }
 
+// A bitmap font's glyph at `size`: whole multiples of its strike keep sharp
+// edges, so each pixel repeats (or is sampled) by the nearest ratio.
+fn sized_mask_glyph(g: &crate::text::font::MaskGlyph, size: f64) -> GlyphBitmap {
+    if g.width <= 0 || g.height <= 0 || g.ppem <= 0.0 {
+        return GlyphBitmap::default();
+    }
+    let scale = size / g.ppem;
+    let w = (g.width as f64 * scale).round().max(1.0) as i64;
+    let h = (g.height as f64 * scale).round().max(1.0) as i64;
+    let mut coverage = Vec::with_capacity((w * h) as usize);
+    for y in 0..h {
+        let sy = ((y * g.height) / h).min(g.height - 1);
+        for x in 0..w {
+            let sx = ((x * g.width) / w).min(g.width - 1);
+            coverage.push(g.coverage[(sy * g.width + sx) as usize]);
+        }
+    }
+    GlyphBitmap {
+        left: (g.bearing_x as f64 * scale).round() as i64,
+        top: -((g.bearing_y as f64 * scale).round() as i64),
+        width: w,
+        height: h,
+        coverage: render::Coverage::new(coverage),
+    }
+}
+
 // A color glyph sized for one text size: drawn `width` by `height` from
 // `rgba` (`source_w` by `source_h`), offset from the pen and the baseline.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -1953,18 +1977,24 @@ struct ColorImage {
     source_h: i64,
 }
 
-static COLOR_GLYPHS: SharedCache<(i64, i64, i64), ColorImage> =
+static COLOR_GLYPHS: SharedCache<(i64, i64, i64, u32), ColorImage> =
     LazyLock::new(|| Mutex::new(ByteCache::new(GLYPH_BUDGET / 2)));
 
-// The color bitmap of glyph `gid` at `size` pixels per em; empty when the
-// face has none for it or its PNG does not decode.
-fn color_glyph(face_id: FaceId, gid: i64, size: f64) -> ColorImage {
+// Glyph `gid` in color at `size` pixels per em, with `text` for the palette's
+// foreground entry; empty when the face has no color form of it.
+fn color_glyph(face_id: FaceId, gid: i64, size: f64, text: Color) -> ColorImage {
     let fid: i64 = face_id.into();
-    let key = (fid, gid, (size * 64.0) as i64);
+    let foreground = [text.r, text.g, text.b, text.a];
+    let key = (
+        fid,
+        gid,
+        (size * 64.0) as i64,
+        u32::from_be_bytes(foreground),
+    );
     if let Some(found) = COLOR_GLYPHS.lock().get(&key) {
         return found.clone();
     }
-    let image = match fonts::face(face_id).color_bitmap(gid, size) {
+    let image = match fonts::face(face_id).color_glyph(gid, size, foreground) {
         Some(g) => sized_color_glyph(&g, size),
         None => ColorImage::default(),
     };
@@ -1976,15 +2006,15 @@ fn color_glyph(face_id: FaceId, gid: i64, size: f64) -> ColorImage {
 // Shrinks a strike's bitmap to `size` by area averaging; one drawn larger
 // than its strike keeps its pixels and is scaled while drawing.
 fn sized_color_glyph(g: &ColorGlyph, size: f64) -> ColorImage {
-    let Some(decoded) = render::png::decode(&g.png) else {
+    let src_w = g.width;
+    let src_h = g.height;
+    if src_w <= 0 || src_h <= 0 || g.ppem <= 0.0 {
         return ColorImage::default();
-    };
-    let src_w = decoded.width;
-    let src_h = decoded.height;
-    let scale = size / g.ppem as f64;
+    }
+    let scale = size / g.ppem;
     let w = (src_w as f64 * scale + 0.5).max(1.0) as i64;
     let h = (src_h as f64 * scale + 0.5).max(1.0) as i64;
-    let pixels = decoded.rgba;
+    let pixels = g.rgba.clone();
     let shrinking = w < src_w && h < src_h;
     let rgba = if shrinking {
         render::shrink(&pixels, src_w, src_h, w, h)
@@ -2225,8 +2255,9 @@ fn draw_glyph(
     };
     let whole = gx.floor();
     if fonts::is_color(g.face) {
-        // Color glyphs keep their own colors and sit on whole pixels.
-        let c = color_glyph(g.face, g.gid, style.size);
+        // Color glyphs keep their own colors and sit on whole pixels; a
+        // color face's plain glyphs draw as outlines in the text's color.
+        let c = color_glyph(g.face, g.gid, style.size, color);
         if c.width > 0 {
             canvas.image_scaled(
                 whole as i64 + c.left,
@@ -2236,9 +2267,9 @@ fn draw_glyph(
                 &c.rgba,
                 c.source_w,
                 c.source_h,
-            )
+            );
+            return;
         }
-        return;
     }
     let sub = ((gx - whole) * SUBPIXEL as f64) as i64;
     let m = glyph_mask(
@@ -2523,6 +2554,55 @@ mod tests {
     }
 
     #[test]
+    fn feature_settings_turn_a_fonts_features_off_and_on() {
+        let mut off = sans();
+        off.features = "-liga".to_string();
+        let separate = layout("ffi", &off, LayoutOptions::single_line());
+        assert_eq!(separate.lines[0].glyphs.len(), 3);
+        assert_ne!(sans().key(), off.key());
+        off.features = "+liga".to_string();
+        let joined = layout("ffi", &off, LayoutOptions::single_line());
+        assert!(joined.lines[0].glyphs.len() < 3);
+    }
+
+    #[test]
+    fn feature_settings_parse_in_harfbuzz_and_css_forms() {
+        let parsed = super::parse_features("ss01, -calt cv01=2 +zero nonsense=");
+        let tags = parsed
+            .iter()
+            .map(|f| (f.tag.to_string(), f.value))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tags,
+            vec![
+                ("ss01".to_string(), 1),
+                ("calt".to_string(), 0),
+                ("cv01".to_string(), 2),
+                ("zero".to_string(), 1),
+            ]
+        );
+        assert!(super::parse_features("").is_empty());
+    }
+
+    #[test]
+    fn right_to_left_text_reads_from_the_right() {
+        let l = layout(
+            "\u{5d0}\u{5d1}\u{5d2}",
+            &sans(),
+            LayoutOptions::single_line(),
+        );
+        let x_of = |start: i64| {
+            l.lines[0]
+                .glyphs
+                .iter()
+                .find(|g| g.start == start)
+                .map(|g| g.x)
+        };
+        assert!(x_of(0) > x_of(2));
+        assert!(x_of(2) > x_of(4));
+    }
+
+    #[test]
     fn range_boxes_split_ligature_advances_at_grapheme_boundaries() {
         let l = layout("ffi", &sans(), LayoutOptions::single_line());
         let full = l.range_rects(0, 3, 0, 0);
@@ -2658,7 +2738,7 @@ mod byte_budget_tests {
             rgba: vec![255; 64],
             ..Default::default()
         };
-        COLOR_GLYPHS.lock().insert((-1, -1, 12), image, 64);
+        COLOR_GLYPHS.lock().insert((-1, -1, 12, 0), image, 64);
         assert!(glyph_cache_stats().1 >= 64);
         let style = TextStyle::sans(12.0);
         let options = LayoutOptions::single_line();
@@ -2670,6 +2750,6 @@ mod byte_budget_tests {
         // in what this test cached rather than in the process-wide totals.
         let key = format!("{}#{}#{}", style.key(), options.key(), "cache bytes");
         assert!(CACHE.lock().get(&key).is_none());
-        assert!(COLOR_GLYPHS.lock().get(&(-1, -1, 12)).is_none());
+        assert!(COLOR_GLYPHS.lock().get(&(-1, -1, 12, 0)).is_none());
     }
 }

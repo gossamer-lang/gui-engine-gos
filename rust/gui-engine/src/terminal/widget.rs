@@ -105,6 +105,23 @@ pub struct ViewOptions {
     /// Whether letters of one style join into the font's ligatures, such as
     /// a coding font's arrows.
     pub ligatures: bool,
+    /// OpenType feature settings for the text, such as `ss01 zero -calt`
+    /// (see `layout::parse_features`).
+    pub font_features: String,
+    /// Variation axis settings for the font, such as `wdth=90 slnt=-5`; the
+    /// weight comes from `font_weight`.
+    pub font_variations: String,
+    /// The family bold text draws in; empty draws it in the font's family.
+    pub bold_font: String,
+    /// The weight bold text draws at; 0 draws it 300 heavier than
+    /// `font_weight` (700 to 900), or at 700 in `bold_font`.
+    pub bold_weight: i64,
+    /// The family italic text draws in; empty draws it in the font's own
+    /// italic, or slants the upright face where the family has none.
+    pub italic_font: String,
+    /// The family bold italic text draws in; empty draws it in the bold
+    /// font's italic.
+    pub bold_italic_font: String,
 }
 
 impl Default for ViewOptions {
@@ -128,6 +145,12 @@ impl Default for ViewOptions {
             line_height: 1.0,
             font_weight: 400,
             ligatures: true,
+            font_features: String::new(),
+            font_variations: String::new(),
+            bold_font: String::new(),
+            bold_weight: 0,
+            italic_font: String::new(),
+            bold_italic_font: String::new(),
         }
     }
 }
@@ -282,6 +305,7 @@ pub(super) fn metrics(v: &View, theme: &Theme) -> (f64, f64, TextStyle) {
     // A point is 96/72 interface units.
     style.size = points * 96.0 / 72.0 * theme.scale * theme.text_scale;
     style.ligatures = v.options.ligatures;
+    style.features = v.options.font_features.clone();
     ensure_default_font();
     let family = if v.font.is_empty() {
         DEFAULT_FONT
@@ -289,8 +313,8 @@ pub(super) fn metrics(v: &View, theme: &Theme) -> (f64, f64, TextStyle) {
         &v.font
     };
     if crate::text::fonts::family_available(family) {
-        let weighted = crate::text::fonts::weighted_family(family, v.options.font_weight);
-        style.family = crate::text::fonts::Family::Named(weighted);
+        let derived = styled_family(family, v.options.font_weight, &v.options.font_variations);
+        style.family = crate::text::fonts::Family::Named(derived);
     }
     let (width, _) = layout::measure("M", &style);
     let (_, _, line) = layout::metrics(&style);
@@ -308,6 +332,78 @@ fn line_factor(v: &View) -> f64 {
 
 // How far text sits below the top of its row, centering it in a row taller
 // (or shorter) than the font's line.
+/// Family `name` drawn at `weight` and the axis settings in `variations`
+/// (`tag=value`, separated by spaces or commas), registered once.
+fn styled_family(name: &str, weight: i64, variations: &str) -> String {
+    let mut values = parse_variations(variations);
+    if values.is_empty() {
+        return crate::text::fonts::weighted_family(name, weight);
+    }
+    values.insert("wght".to_string(), weight as f64);
+    crate::text::fonts::instance_family(name, &values)
+}
+
+/// Axis settings such as `wdth=90 slnt=-5`, by tag; ones that do not parse
+/// are left out, and `wght` is left to the font's weight.
+pub fn parse_variations(text: &str) -> std::collections::HashMap<String, f64> {
+    text.split(|c: char| c == ',' || c.is_whitespace())
+        .filter_map(|setting| {
+            let (tag, value) = setting.split_once('=')?;
+            let tag = tag.trim();
+            let value = value.trim().parse::<f64>().ok()?;
+            (tag.len() == 4 && tag.is_ascii() && tag != "wght" && value.is_finite())
+                .then(|| (tag.to_string(), value))
+        })
+        .collect()
+}
+
+/// The text style of each cell style, by `bold * 2 + italic`: the view's
+/// own families for bold and italic text where it names them, the font's
+/// own faces otherwise.
+pub(super) fn style_variants(v: &View, regular: &TextStyle) -> [TextStyle; 4] {
+    let o = &v.options;
+    fn available(name: &str) -> Option<&str> {
+        (!name.is_empty() && crate::text::fonts::family_available(name)).then_some(name)
+    }
+    let font = if v.font.is_empty() {
+        DEFAULT_FONT
+    } else {
+        &v.font
+    };
+    let derived = |name: &str, weight: i64| {
+        crate::text::fonts::Family::Named(styled_family(name, weight, &o.font_variations))
+    };
+    let mut bold = regular.clone();
+    bold.bold = true;
+    if available(&o.bold_font).is_some() || o.bold_weight > 0 {
+        let name = available(&o.bold_font).unwrap_or(font);
+        let weight = if o.bold_weight > 0 {
+            o.bold_weight
+        } else {
+            700
+        };
+        bold.family = derived(name, weight);
+        bold.bold = false;
+    }
+    let mut italic = regular.clone();
+    italic.italic = true;
+    if let Some(name) = available(&o.italic_font) {
+        italic.family = derived(name, o.font_weight);
+    }
+    let mut bold_italic = bold.clone();
+    bold_italic.italic = true;
+    if let Some(name) = available(&o.bold_italic_font) {
+        let weight = if o.bold_weight > 0 {
+            o.bold_weight
+        } else {
+            700
+        };
+        bold_italic.family = derived(name, weight);
+        bold_italic.bold = false;
+    }
+    [regular.clone(), italic, bold, bold_italic]
+}
+
 fn text_offset(style: &TextStyle, lh: f64) -> f64 {
     let (_, _, line) = layout::metrics(style);
     ((lh - line.ceil()) / 2.0).floor()
@@ -620,7 +716,7 @@ pub(super) struct RowPaint<'a> {
     v: &'a View,
     theme: &'a Theme,
     colors: &'a ColorPalette,
-    style: &'a TextStyle,
+    styles: &'a [TextStyle; 4],
     selection: Option<(Cell, Cell)>,
     highlighted: &'a [Vec<(i64, i64)>],
     hovered: &'a [&'a Link],
@@ -660,7 +756,7 @@ pub(super) fn draw_row(
         v,
         theme,
         colors,
-        style,
+        styles,
         selection,
         highlighted,
         hovered,
@@ -751,13 +847,8 @@ pub(super) fn draw_row(
         }
         // A run's layout key is its style's key, `#`, then its text, so the
         // text is read from the key rather than copied apart from it.
-        let style_key = style_keys[usize::from(cell.bold) * 2 + usize::from(cell.italic)]
-            .get_or_insert_with(|| {
-                let mut run = style.clone();
-                run.bold = cell.bold;
-                run.italic = cell.italic;
-                run.key()
-            });
+        let variant = usize::from(cell.bold) * 2 + usize::from(cell.italic);
+        let style_key = style_keys[variant].get_or_insert_with(|| styles[variant].key());
         let prefix = style_key.len() + 1;
         let mut key = String::with_capacity(prefix + end - col);
         key.push_str(style_key);
@@ -776,9 +867,7 @@ pub(super) fn draw_row(
         let shape = Rect::new(origin.x + x, origin.y + y, width, height);
         let drawn = !ascii(cell) && shapes::draw(&mut cx.canvas, text, shape, fg, bg);
         if !drawn && !text.trim().is_empty() {
-            let mut run = style.clone();
-            run.bold = cell.bold;
-            run.italic = cell.italic;
+            let mut run = styles[variant].clone();
             lay_out(layouts, &key, text, &run);
             let mut at = ((origin.x + x) as f64, (origin.y + y) as f64 + rise);
             // A glyph wider than its cells, such as an emoji a program
@@ -825,7 +914,7 @@ pub(super) fn draw_row(
 #[derive(Debug, PartialEq)]
 struct RowContext {
     palette: ColorPalette,
-    style: TextStyle,
+    styles: [TextStyle; 4],
     /// Cell width, line height and text rise, by their bits.
     metrics: [u64; 3],
     origin: Rect,
@@ -939,6 +1028,7 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
     // Only a window with keyboard focus gives it to the terminal it focuses.
     let focused = cx.focus == v.id && cx.active;
     let (cw, lh, style) = metrics(v, &theme);
+    let styles = style_variants(v, &style);
     // Programs place images in whole pixels per cell.
     let cell = (pixels_of(cw), pixels_of(lh));
     let captured = with_entry(v.terminal, |entry| {
@@ -1021,7 +1111,7 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
         && frame.images().is_empty())
     .then(|| LayerContext {
         palette: colors.clone(),
-        style: style.clone(),
+        styles: styles.clone(),
         metrics: [cw.to_bits(), lh.to_bits(), rise.to_bits()],
         inset: (left, pad),
         rule: (theme.px(1), theme.px(2)),
@@ -1074,7 +1164,7 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
         v,
         theme: &theme,
         colors: &colors,
-        style: &style,
+        styles: &styles,
         selection,
         highlighted: &highlighted,
         hovered: &hovered,
@@ -1131,7 +1221,7 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
         recorded.begin(
             RowContext {
                 palette: colors.clone(),
-                style: style.clone(),
+                styles: styles.clone(),
                 metrics: [cw.to_bits(), lh.to_bits(), rise.to_bits()],
                 origin,
                 inset: (left, pad),
@@ -2490,6 +2580,56 @@ mod tests {
         );
         let expected = DEFAULT_POINTS * 96.0 / 72.0 * theme.scale * theme.text_scale;
         assert!((default.size - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn named_bold_and_italic_fonts_draw_their_styles() {
+        let theme = Theme::default();
+        let mut view = View::new("term", 1, "Shell");
+        view.options.bold_font = "DejaVu Sans Mono".to_string();
+        view.options.italic_font = "DejaVu Sans".to_string();
+        view.options.font_features = "-calt zero".to_string();
+        let (_, _, style) = metrics(&view, &theme);
+        assert_eq!(style.features, "-calt zero");
+        let styles = style_variants(&view, &style);
+        assert_eq!(styles[0], style);
+        let face_of = |s: &TextStyle| {
+            crate::text::fonts::face(crate::text::fonts::primary_style(
+                &s.family, s.bold, s.italic,
+            ))
+        };
+        assert_eq!(face_of(&styles[0]).family, DEFAULT_FONT);
+        let bold = face_of(&styles[2]);
+        assert_eq!(
+            (bold.family.starts_with("DejaVu Sans Mono"), bold.weight),
+            (true, 700)
+        );
+        assert!(face_of(&styles[1]).family.starts_with("DejaVu Sans"));
+        assert!(styles[1].italic);
+        assert!(styles[3].italic);
+        view.options.bold_font.clear();
+        view.options.bold_weight = 500;
+        let styles = style_variants(&view, &style);
+        assert!(!styles[2].bold);
+        assert_eq!(
+            face_of(&styles[2]).family,
+            format!("{DEFAULT_FONT} (weight 500)")
+        );
+    }
+
+    #[test]
+    fn variation_settings_parse_by_tag_leaving_the_weight_to_its_own_setting() {
+        let values = parse_variations("wdth=90, slnt=-5 wght=900 bad CASL=x MONO=1");
+        let mut pairs = values.into_iter().collect::<Vec<_>>();
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            pairs,
+            vec![
+                ("MONO".to_string(), 1.0),
+                ("slnt".to_string(), -5.0),
+                ("wdth".to_string(), 90.0),
+            ]
+        );
     }
 
     #[test]

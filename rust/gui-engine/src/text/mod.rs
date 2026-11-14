@@ -1,23 +1,25 @@
 pub mod bidi;
 pub mod catalog;
+pub(crate) mod color_glyph;
 pub mod folding;
 pub mod font;
 pub mod font_assets;
 pub mod fonts;
-pub mod indic;
+
 pub mod layout;
 pub mod linebreak;
 pub mod offsets;
-pub mod opentype;
+
 pub mod syntax;
 pub mod system_fonts;
 pub mod ucd;
 pub mod variation;
 
 // text: fonts, shaping, bidirectional layout, line breaking, and drawing.
-// `layout` is the entry point every widget uses; `fonts` registers faces;
-// `font` and `opentype` read font files; `bidi` and `linebreak` implement
-// UAX #9 and UAX #14 over the pinned Unicode data in `ucd`.
+// `layout` is the entry point every widget uses and shapes runs with
+// harfrust; `fonts` registers faces; `font` reads font files through skrifa
+// and `color_glyph` paints their `COLR` glyphs; `bidi` and `linebreak`
+// implement UAX #9 and UAX #14 over the pinned Unicode data in `ucd`.
 
 use crate::render::Canvas;
 use crate::style::color::Color;

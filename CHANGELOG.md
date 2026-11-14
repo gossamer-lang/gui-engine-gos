@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.22 - Shaping with harfrust, fonts through skrifa
+
+- Text is shaped by harfrust, the Rust port of HarfBuzz: every script HarfBuzz shapes, Myanmar, Khmer, Thai, Tibetan and Sinhala among them, Apple's `morx` and `kerx` tables, and positioning that follows a variable font's location.
+- Fonts are read through skrifa: CFF2 outlines, every variation axis, and line metrics that change along them.
+- Color glyphs in `COLR` (versions 0 and 1, gradients and blend modes included) and `sbix`, the formats of Windows' and macOS's emoji fonts, draw in color. A color font's plain glyphs draw in the text's color.
+- Bitmap fonts (`EBDT`), such as Terminus and Cozette in OTB form, draw from their bitmaps.
+- `TextStyle::features` turns OpenType features on or off, such as `ss01 zero -calt` or `cv01=2`.
+- Italic text draws in its family's own italic face where it has one, instead of slanting the upright face.
+- Bold text in a family drawn at axis settings (`instance_family`) draws in that family's bold instead of the fallback sans.
+- Terminal views take `font_features`, `font_variations`, `bold_font`, `bold_weight`, `italic_font` and `bold_italic_font`.
+- Text not yet in the layout cache shapes faster, and much faster in coding fonts with many ligatures.
+- The installed fonts' catalog is read again once, to mark `COLR` and `sbix` fonts as color fonts. Its cache keeps each coverage list once, so it is several times smaller and loads much faster, and older cache files are removed.
+- Requires Gossamer 0.79.0 and builds on windowing-gos 0.1.23.
+
 ## 0.2.21 - Program status and attention requests
 
 - Terminals answer the Program Status Protocol's query (OSC 7501) and report what programs say they are doing as `Event::Status`: idle, working, blocked with what they wait for, done, error, or clear.

@@ -171,7 +171,7 @@ fn add_face_with_lifetime(f: &Face, permanent: bool) -> i64 {
         AUTO_FACES.lock().insert(index);
     }
     drop(faces);
-    if f.has_color_bitmaps() {
+    if f.has_color_glyphs() {
         COLOR_FACES.lock().insert(index);
     }
     index
@@ -565,7 +565,7 @@ fn register_bytes(
     }
     let mut colors = COLOR_FACES.lock();
     for (&id, face) in &pending {
-        if face.has_color_bitmaps() {
+        if face.has_color_glyphs() {
             colors.insert(id);
         }
     }
@@ -768,8 +768,8 @@ pub fn family_axes(name: &str) -> Vec<variation::Axis> {
 }
 
 /// A family name that draws `name` at `values` (axis tag to value), with
-/// that instance registered once; `name` itself when `values` is empty or the
-/// family is unknown.
+/// that instance registered once, regular and bold; `name` itself when
+/// `values` is empty or the family is unknown.
 pub fn instance_family(name: &str, values: &HashMap<String, f64>) -> String {
     if values.is_empty() {
         return name.to_string();
@@ -787,19 +787,162 @@ pub fn instance_family(name: &str, values: &HashMap<String, f64>) -> String {
     if INSTANCES.lock().contains(&derived) {
         return derived;
     };
-    let Some(i) = upright(name) else {
-        return name.to_string();
-    };
-    let mut f = face_at(i).instance(values);
-    f.family = derived.clone();
-    // Looked up as an upright family; its weight is in its coordinates.
-    f.bold = false;
-    let permanent = !AUTO_FACES.lock().contains(&i);
-    if add_face_with_lifetime(&f, permanent) < 0 {
+    let weight = values.get("wght").map_or(400, |w| w.round() as i64);
+    if !register_derived(name, &derived, weight, values) {
         return name.to_string();
     }
-    INSTANCES.lock().insert(derived.clone());
     derived
+}
+
+// Derived families (from `weighted_family` and `instance_family`) by name:
+// the family each draws, its weight, and its axis values.
+type Derivation = (String, i64, HashMap<String, f64>);
+static DERIVED: LazyLock<Mutex<HashMap<String, Derivation>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+// Derived families whose italic faces are registered, or whose family has none.
+static DERIVED_ITALICS: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+// Registers family `derived` as `name` at `weight` and the axis `values`: its
+// regular face, and its bold one 300 heavier (700 to 900). False when either
+// is not loaded yet or the registry is full.
+fn register_derived(name: &str, derived: &str, weight: i64, values: &HashMap<String, f64>) -> bool {
+    let bolder = (weight + 300).clamp(700, 900);
+    let (Some(regular), Some(bold)) = (
+        face_at_weight(name, weight, false, values),
+        face_at_weight(name, bolder, false, values),
+    ) else {
+        return false;
+    };
+    for (f, is_bold) in [(regular, false), (bold, true)] {
+        if !add_derived_face(f, derived, is_bold) {
+            return false;
+        }
+    }
+    INSTANCES.lock().insert(derived.to_string());
+    DERIVED.lock().insert(
+        derived.to_string(),
+        (name.to_string(), weight, values.clone()),
+    );
+    faces_changed();
+    true
+}
+
+// Adds `f` to the registry as family `derived`'s regular or bold face, kept
+// as long as the face it was made from.
+fn add_derived_face(mut f: Face, derived: &str, is_bold: bool) -> bool {
+    let permanent = f.slot < 0 || !AUTO_FACES.lock().contains(&f.slot);
+    f.family = derived.to_string();
+    // Looked up by its derived family, as that family's regular or bold.
+    f.bold = is_bold;
+    add_face_with_lifetime(&f, permanent) >= 0
+}
+
+/// The primary face for a family, weight and slant: the family's own italic
+/// face for italic text where it has one, its upright face otherwise (which
+/// text then slants).
+pub fn primary_style(family: &Family, bold: bool, italic: bool) -> FaceId {
+    if italic
+        && let Family::Named(name) = family
+        && let Some(i) = italic_face(name, bold)
+    {
+        return i.into();
+    }
+    primary(family, bold)
+}
+
+// The italic face of family `name`, regular or bold: a loaded one, one made
+// for a derived family from its family's italics, or one loading from the
+// installed catalog (answered once it is in).
+fn italic_face(name: &str, bold: bool) -> Option<i64> {
+    if let Some(i) = find_styled(name, bold, true) {
+        return Some(i);
+    }
+    let derivation = DERIVED.lock().get(name).cloned();
+    match derivation {
+        Some((base, weight, values)) => {
+            if DERIVED_ITALICS.lock().contains(name) {
+                return None;
+            }
+            register_italics(name, &base, weight, &values);
+            find_styled(name, bold, true)
+        }
+        None => load_italic(name, bold),
+    }
+}
+
+// Adds the italic faces of `base` at `weight` and `values` to derived family
+// `derived`, regular and bold; it is marked done once they are in or `base`
+// has no italics that may still load.
+fn register_italics(derived: &str, base: &str, weight: i64, values: &HashMap<String, f64>) {
+    let bolder = (weight + 300).clamp(700, 900);
+    let mut done = true;
+    for (w, is_bold) in [(weight, false), (bolder, true)] {
+        match face_at_weight(base, w, true, values) {
+            Some(f) => {
+                if add_derived_face(f, derived, is_bold) {
+                    faces_changed();
+                }
+            }
+            None => done &= !italic_loading(base, w),
+        }
+    }
+    if done {
+        DERIVED_ITALICS.lock().insert(derived.to_string());
+    }
+}
+
+// Whether the installed italic face of family `name` nearest `weight` (the
+// one `face_at_weight` asks for) is still loading, or the installed catalog
+// that would name it is.
+fn italic_loading(name: &str, weight: i64) -> bool {
+    if !installed_known() {
+        ensure_installed();
+        return true;
+    }
+    let want = name.to_lowercase();
+    let nearest = INSTALLED
+        .lock()
+        .iter()
+        .filter(|r| r.italic && r.family.to_lowercase() == want)
+        .min_by_key(|r| (record_weight(r) - weight).abs())
+        .cloned();
+    nearest.is_some_and(|r| {
+        LOADED_SYSTEM
+            .lock()
+            .get(&(r.path, r.index, weight >= 600))
+            .is_none()
+    })
+}
+
+// The installed italic face of family `name` nearest regular or bold, once
+// loaded; asks for it to load otherwise.
+fn load_italic(name: &str, bold: bool) -> Option<i64> {
+    if !installed_known() {
+        return None;
+    }
+    let want = name.to_lowercase();
+    let target = if bold { 700 } else { 400 };
+    let record = INSTALLED
+        .lock()
+        .iter()
+        .filter(|r| r.italic && r.family.to_lowercase() == want)
+        .min_by_key(|r| (record_weight(r) - target).abs())
+        .cloned()?;
+    load_installed(&record, bold)
+}
+
+// The loaded face of family `name` that is exactly regular or bold, upright
+// or italic, nearest 400 or 700.
+fn find_styled(name: &str, bold: bool, italic: bool) -> Option<i64> {
+    let want = name.to_lowercase();
+    let target = if bold { 700 } else { 400 };
+    FACES
+        .lock()
+        .iter()
+        .filter(|(_, f)| f.family.to_lowercase() == want && f.bold == bold && f.italic == italic)
+        .min_by_key(|(_, f)| (f.weight - target).abs())
+        .map(|(&id, _)| id)
 }
 
 // The installed face to fall back to for `chars`, which must all be covered:
@@ -1045,40 +1188,33 @@ pub fn weighted_family(name: &str, weight: i64) -> String {
     if INSTANCES.lock().contains(&derived) {
         return derived;
     }
-    let bolder = (weight + 300).clamp(700, 900);
-    let (Some(upright), Some(bold)) = (face_at_weight(name, weight), face_at_weight(name, bolder))
-    else {
+    if !register_derived(name, &derived, weight, &HashMap::new()) {
         return name.to_string();
-    };
-    for (mut f, is_bold) in [(upright, false), (bold, true)] {
-        f.family = derived.clone();
-        // Looked up by its derived family, as that family's regular or bold.
-        f.bold = is_bold;
-        if add_face_with_lifetime(&f, true) < 0 {
-            return name.to_string();
-        }
     }
-    INSTANCES.lock().insert(derived.clone());
-    faces_changed();
     derived
 }
 
 // Family `name`'s upright face nearest `weight`, loaded or installed (once
 // it has loaded); a variable face comes at that weight.
-fn face_at_weight(name: &str, weight: i64) -> Option<Face> {
+fn face_at_weight(
+    name: &str,
+    weight: i64,
+    italic: bool,
+    values: &HashMap<String, f64>,
+) -> Option<Face> {
     ensure_bundled();
     let want = name.to_lowercase();
     let loaded = FACES
         .lock()
         .values()
-        .filter(|f| f.family.to_lowercase() == want && !f.italic)
+        .filter(|f| f.family.to_lowercase() == want && f.italic == italic && !is_derived(f))
         .min_by_key(|f| (f.weight - weight).abs())
         .cloned();
     let installed = if installed_known() {
         INSTALLED
             .lock()
             .iter()
-            .filter(|r| r.family.to_lowercase() == want && !r.italic)
+            .filter(|r| r.family.to_lowercase() == want && r.italic == italic)
             .min_by_key(|r| (record_weight(r) - weight).abs())
             .cloned()
     } else {
@@ -1090,13 +1226,29 @@ fn face_at_weight(name: &str, weight: i64) -> Option<Face> {
         (Some(f), None) => f,
         (None, None) => return None,
     };
-    let axes = variation::axes(&face);
-    Some(match axes.iter().find(|a| a.tag == "wght") {
+    let mut settings = values.clone();
+    match variation::axes(&face).iter().find(|a| a.tag == "wght") {
         Some(axis) => {
-            face.instance(&crate::hmap! { "wght" => (weight as f64).clamp(axis.min, axis.max) })
+            settings.insert(
+                "wght".to_string(),
+                (weight as f64).clamp(axis.min, axis.max),
+            );
         }
-        None => face,
+        None => {
+            settings.remove("wght");
+        }
+    }
+    Some(if settings.is_empty() {
+        face
+    } else {
+        face.instance(&settings)
     })
+}
+
+// Whether `f` was registered as a derived family's face rather than read
+// from a file under its own family.
+fn is_derived(f: &Face) -> bool {
+    INSTANCES.lock().contains(&f.family)
 }
 
 /// Whether a family is bundled, registered or installed.
@@ -1134,6 +1286,25 @@ pub fn loaded_count() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{face, face_for, face_for_cluster, primary, shown_as_emoji};
+
+    #[test]
+    fn italic_text_takes_the_familys_italic_face_and_keeps_it_when_weighted() {
+        for italic in [false, true] {
+            let mut f = crate::text::font::Face::parse(super::SANS, 0).unwrap();
+            f.family = "Slant Test".to_string();
+            f.italic = italic;
+            super::add_face(&f);
+        }
+        let family = super::Family::Named("Slant Test".to_string());
+        assert!(!face(super::primary_style(&family, false, false)).italic);
+        assert!(face(super::primary_style(&family, false, true)).italic);
+        let weighted = super::Family::Named(super::weighted_family("Slant Test", 300));
+        assert_ne!(weighted, family);
+        assert!(!face(super::primary_style(&weighted, false, false)).italic);
+        assert!(face(super::primary_style(&weighted, false, true)).italic);
+        let upright_only = super::Family::Named("DejaVu Sans".to_string());
+        assert!(!face(super::primary_style(&upright_only, false, true)).italic);
+    }
 
     #[test]
     fn a_family_draws_regular_text_with_its_face_nearest_400() {

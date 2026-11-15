@@ -429,7 +429,6 @@ pub fn load_cancellable(
                 Err(std::io::Error::other("font catalog cancelled or expired"))
             }
         });
-        remove_older_caches(cache);
     }
     let mut records: Vec<FontRecord> = entries.into_iter().flat_map(|entry| entry.faces).collect();
     share_coverage(&mut records);
@@ -452,29 +451,6 @@ fn share_coverage(records: &mut [FontRecord]) {
 /// Where the toolkit caches the summaries of installed fonts.
 pub fn cache_file() -> String {
     paths::join(&services::cache_dir("gui-gos"), "fonts-v6.json")
-}
-
-// Removes the caches earlier versions wrote beside `cache` (`fonts-v2.json`
-// and on), which no version reads once a newer one is written.
-fn remove_older_caches(cache: &str) {
-    let Some(dir) = paths::parent(cache) else {
-        return;
-    };
-    let Ok(listing) = fs::read_dir(dir) else {
-        return;
-    };
-    let current = std::path::Path::new(cache).file_name();
-    for entry in listing.flatten() {
-        let name = entry.file_name();
-        let text = name.to_string_lossy();
-        let older = text
-            .strip_prefix("fonts-v")
-            .and_then(|rest| rest.strip_suffix(".json"))
-            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
-        if older && Some(name.as_os_str()) != current {
-            let _ = fs::remove_file(entry.path());
-        }
-    }
 }
 
 #[cfg(test)]
@@ -567,27 +543,5 @@ mod tests {
         let first = &stored["files"][0]["faces"][0];
         assert_eq!(first["family"], "DejaVu Sans");
         assert_eq!(first["coverage"], 0);
-    }
-
-    #[test]
-    fn writing_the_cache_removes_older_versions_of_it() {
-        let config = crate::services::private_test_config();
-        let _defer = scopeguard::guard((), |_| {
-            crate::services::remove_test_config(&config);
-        });
-        let older = [
-            paths::join(&config, "fonts-v2.json"),
-            paths::join(&config, "fonts-v5.json"),
-        ];
-        let unrelated = paths::join(&config, "fonts-vx.json");
-        fs::create_dir_all(&config).unwrap();
-        for file in older.iter().chain([&unrelated]) {
-            fs::write(file, "{}").unwrap();
-        }
-        let cache = paths::join(&config, "fonts-v6.json");
-        assert_eq!(load(&[SANS.to_string()], &cache).len(), 1);
-        assert!(paths::exists(&cache));
-        assert!(older.iter().all(|file| !paths::exists(file)));
-        assert!(paths::exists(&unrelated));
     }
 }

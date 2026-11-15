@@ -430,6 +430,8 @@ pub fn load_cancellable(
             }
         });
     }
+    mark_used(cache);
+    remove_unused_formats(cache, std::time::SystemTime::now());
     let mut records: Vec<FontRecord> = entries.into_iter().flat_map(|entry| entry.faces).collect();
     share_coverage(&mut records);
     Ok(records)
@@ -448,17 +450,66 @@ fn share_coverage(records: &mut [FontRecord]) {
     }
 }
 
-/// Where the toolkit caches the summaries of installed fonts.
+/// Where the toolkit caches the summaries of installed fonts. Every
+/// application shares the one file: installed fonts are a fact of the
+/// machine, so a second copy would only repeat the cold scan.
 pub fn cache_file() -> String {
     paths::join(&services::cache_dir("gui-gos"), "fonts-v6.json")
 }
 
+/// How long a catalog of another format must go unused before any toolkit
+/// version removes it. Each version marks the format it reads on every load,
+/// so a format an installed application still reads stays.
+const UNUSED_FORMAT_AGE: std::time::Duration = std::time::Duration::from_hours(30 * 24);
+
+// Records a load of `cache`, whether or not it was rewritten, as the time
+// other versions judge the format by.
+fn mark_used(cache: &str) {
+    if let Ok(file) = fs::OpenOptions::new().write(true).open(cache) {
+        let _ = file.set_modified(std::time::SystemTime::now());
+    }
+}
+
+// Removes the catalogs of other formats beside `cache` (`fonts-v2.json` and
+// on, older or newer) that nothing has used for `UNUSED_FORMAT_AGE` by `now`.
+fn remove_unused_formats(cache: &str, now: std::time::SystemTime) {
+    let Some(dir) = paths::parent(cache) else {
+        return;
+    };
+    let Ok(listing) = fs::read_dir(dir) else {
+        return;
+    };
+    let current = std::path::Path::new(cache).file_name();
+    for entry in listing.flatten() {
+        let name = entry.file_name();
+        let text = name.to_string_lossy();
+        let catalog = text
+            .strip_prefix("fonts-v")
+            .and_then(|rest| rest.strip_suffix(".json"))
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+        if !catalog || Some(name.as_os_str()) == current {
+            continue;
+        }
+        let unused = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .is_ok_and(|used| {
+                now.duration_since(used)
+                    .is_ok_and(|age| age >= UNUSED_FORMAT_AGE)
+            });
+        if unused {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{load, scan_file};
+    use super::{UNUSED_FORMAT_AGE, load, scan_file};
     use crate::paths;
     use crate::text::font::Face;
     use std::fs;
+    use std::time::{Duration, SystemTime};
 
     const SANS: &str = "assets/fonts/DejaVuSans.ttf";
 
@@ -502,6 +553,60 @@ mod tests {
         fs::write(&cache, text.replace("DejaVu Sans", "Cached Sans")).unwrap();
         assert_eq!(load(&[SANS.to_string()], &cache)[0].family, "Cached Sans");
         assert_eq!(load(&[], &cache).len(), 0)
+    }
+
+    fn age(file: &str, by: Duration) {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(file)
+            .and_then(|f| f.set_modified(SystemTime::now() - by))
+            .unwrap();
+    }
+
+    #[test]
+    fn every_load_marks_the_catalog_used() {
+        let config = crate::services::private_test_config();
+        let _defer = scopeguard::guard((), |_| {
+            crate::services::remove_test_config(&config);
+        });
+        let cache = paths::join(&config, "fonts-v6.json");
+        assert_eq!(load(&[SANS.to_string()], &cache).len(), 1);
+        age(&cache, UNUSED_FORMAT_AGE * 2);
+        // Unchanged fonts leave the file as it was, but the load still counts.
+        assert_eq!(load(&[SANS.to_string()], &cache).len(), 1);
+        let used = fs::metadata(&cache).unwrap().modified().unwrap();
+        assert!(SystemTime::now().duration_since(used).unwrap() < UNUSED_FORMAT_AGE);
+    }
+
+    #[test]
+    fn a_load_removes_other_formats_only_once_they_go_unused() {
+        let config = crate::services::private_test_config();
+        let _defer = scopeguard::guard((), |_| {
+            crate::services::remove_test_config(&config);
+        });
+        fs::create_dir_all(&config).unwrap();
+        let unused = [
+            paths::join(&config, "fonts-v2.json"),
+            paths::join(&config, "fonts-v7.json"),
+        ];
+        let in_use = paths::join(&config, "fonts-v5.json");
+        let unrelated = paths::join(&config, "fonts-vx.json");
+        for file in unused.iter().chain([&in_use, &unrelated]) {
+            fs::write(file, "{}").unwrap();
+        }
+        for file in unused.iter().chain([&unrelated]) {
+            age(file, UNUSED_FORMAT_AGE + Duration::from_hours(1));
+        }
+        age(&in_use, UNUSED_FORMAT_AGE - Duration::from_hours(1));
+        let cache = paths::join(&config, "fonts-v6.json");
+        assert_eq!(load(&[SANS.to_string()], &cache).len(), 1);
+        assert!(paths::exists(&cache));
+        assert!(unused.iter().all(|file| !paths::exists(file)));
+        assert!(
+            paths::exists(&in_use),
+            "a format read this month was removed"
+        );
+        assert!(paths::exists(&unrelated));
     }
 
     #[test]

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.23 - Terminal output after a late frame
+
+- Terminal output and pastes no longer stall when the loop runs late for a frame it held a terminal's wake for.
+
 ## 0.2.22 - Shaping with harfrust, fonts through skrifa
 
 - Text is shaped by harfrust, the Rust port of HarfBuzz: every script HarfBuzz shapes, Myanmar, Khmer, Thai, Tibetan and Sinhala among them, Apple's `morx` and `kerx` tables, and positioning that follows a variable font's location.

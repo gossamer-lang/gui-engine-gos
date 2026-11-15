@@ -284,6 +284,10 @@ pub struct Session {
     /// When the windows' cached raster layers are next swept, or -1 while
     /// none are cached.
     layer_sweep: i64,
+    /// When the terminals' wakes, held off for a frame, are taken back, or
+    /// None while they are on. Held wakes fire for nothing, so this stays
+    /// due until a pass takes them, however late the loop runs.
+    wake_due: Option<i64>,
     started: bool,
     pub windows: Vec<WindowState>,
     pub app_id: String,
@@ -483,6 +487,7 @@ pub fn start(name: &str, app_id: &str) -> Result<Session, errors::Error> {
         resource_error: String::new(),
         renderers: HashMap::new(),
         layer_sweep: -1,
+        wake_due: None,
         hotkeys: HashMap::new(),
         launch_activation: None,
         started: false,
@@ -1439,7 +1444,7 @@ impl Session {
     fn settle_pass(&mut self, paced: bool) -> Result<bool, errors::Error> {
         self.check_memory()?;
         let mut rounds = 0;
-        let mut held_any = false;
+        let mut held;
         loop {
             if crate::text::fonts::take_catalog_request() {
                 self.run_job(&services::jobs::Job::Fonts(FONT_CATALOG_OWNER.into()));
@@ -1471,13 +1476,12 @@ impl Session {
             // of once per write. A paste needs every wake, so it is never held.
             let now = self.now();
             let waiting = paced && crate::terminal::output_waiting(&self.budget);
-            let held = paced
+            held = paced
                 && !crate::terminal::any_pasting(&self.budget)
                 && self
                     .windows
                     .iter()
                     .any(|w| w.output_recent(now) || (waiting && w.output_presented.is_some()));
-            held_any |= held;
             let (terminals_changed, terminal_events) = crate::terminal::pump(&self.budget, held);
             if terminals_changed {
                 for w in 0..self.windows.len() as i64 {
@@ -1553,13 +1557,18 @@ impl Session {
         for request in crate::text::document_syntax::take_requests() {
             self.run_job(&services::jobs::Job::SyntaxLines(request));
         }
-        // Wakes kept off for an upcoming frame are turned back on at that frame.
+        // Wakes kept off for an upcoming frame are turned back on at that frame,
+        // or at once when no frame waits.
         let now = self.now();
-        Ok(held_any
-            && !self
-                .windows
+        self.wake_due = held.then(|| {
+            self.windows
                 .iter()
-                .any(|w| w.output_dirty || w.output_recent(now)))
+                .filter(|w| w.output_recent(now))
+                .filter_map(|w| w.output_presented.map(|at| at + w.output_interval()))
+                .min()
+                .unwrap_or(now)
+        });
+        Ok(self.wake_due.is_some_and(|due| due <= now))
     }
 
     // The next event, waiting no longer than the next timer. Runs of
@@ -1661,6 +1670,7 @@ impl Session {
                 w.output_presented
                     .map_or(self.now(), |at| at + w.output_interval())
             })
+            .chain(self.wake_due)
             .min()
     }
 
@@ -7607,9 +7617,13 @@ mod dialog_scope_tests {
             let due = s
                 .output_due()
                 .expect("a frame is due to take the wake back");
-            s.clock_held = Some(due);
+            // A loop that comes back only well after that frame still finds
+            // it due, and the pass it runs then takes the wake back.
+            s.clock_held = Some(due + 10 * s.windows[0].output_interval());
+            assert!(s.output_due().is_some_and(|at| at <= s.now()));
             s.settle_paced(true).unwrap();
             assert!(!crate::terminal::output_wake_taken(id));
+            assert_eq!(s.wake_due, None);
             crate::terminal::close(id);
             s.shutdown();
         })

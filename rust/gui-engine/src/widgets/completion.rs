@@ -429,6 +429,7 @@ pub fn rank_cancellable(
             bytes = bytes.saturating_add(cost);
             kept.push(Ranked(matched));
             if kept.len() > limit {
+                // More kept than the limit means at least one is kept.
                 bytes -= kept.pop().unwrap().0.owned_bytes() + 2 * size_of::<CompletionItem>();
             }
             if bytes > RESULT_BYTE_LIMIT {

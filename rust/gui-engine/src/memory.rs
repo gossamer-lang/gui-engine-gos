@@ -17,6 +17,8 @@ struct Entry<V> {
 /// entries are returned to the caller's normal path without being retained.
 pub(crate) struct ByteCache<K, V> {
     entries: BTreeMap<std::sync::Arc<K>, Entry<V>>,
+    /// Every key of `entries`, under its entry's `used`; the two indexes
+    /// always hold the same keys.
     ages: BTreeMap<u64, std::sync::Arc<K>>,
     limit: usize,
     bytes: usize,
@@ -42,6 +44,7 @@ impl<K: Ord + Clone, V> ByteCache<K, V> {
             self.clock = 0;
             for (_, key) in old {
                 self.clock += 1;
+                // `ages` and `entries` hold the same keys.
                 self.entries.get_mut(key.as_ref()).unwrap().used = self.clock;
                 self.ages.insert(self.clock, key);
             }
@@ -52,6 +55,7 @@ impl<K: Ord + Clone, V> ByteCache<K, V> {
     pub fn get(&mut self, key: &K) -> Option<&V> {
         let clock = self.tick();
         let entry = self.entries.get_mut(key)?;
+        // `ages` holds every entry under its `used`.
         let owned = self.ages.remove(&entry.used).expect("cache age exists");
         entry.used = clock;
         self.ages.insert(clock, owned);
@@ -75,6 +79,7 @@ impl<K: Ord + Clone, V> ByteCache<K, V> {
             return false;
         }
         while self.bytes > self.limit - bytes {
+            // Bytes over the limit are held by entries, which `ages` all names.
             let (_, oldest) = self.ages.pop_first().expect("nonempty cache over limit");
             self.bytes -= self.entries.remove(oldest.as_ref()).unwrap().bytes;
             self.evictions += 1;

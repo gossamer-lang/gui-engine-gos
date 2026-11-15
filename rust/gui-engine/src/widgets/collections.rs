@@ -447,20 +447,13 @@ pub fn row_at(c: &Collection, s: &CollectionState, theme: &Theme, y: i64) -> i64
         return -1;
     }
     if c.height_of.is_some() && s.extents.len() == (c.count + 1) as usize {
-        // Binary search the prefix sums.
-        let mut lo = 0;
-        let mut hi = c.count - 1;
-        while lo <= hi {
-            let mid = (lo + hi) / 2;
-            if y < s.extents[mid as usize] {
-                hi = mid - 1;
-            } else if y >= s.extents[(mid + 1) as usize] {
-                lo = mid + 1;
-            } else {
-                return mid;
-            }
-        }
-        return -1;
+        // Row i spans extents[i]..extents[i + 1] of the prefix sums.
+        let after = s.extents.partition_point(|&top| top <= y) as i64;
+        return if after == 0 || after > c.count {
+            -1
+        } else {
+            after - 1
+        };
     }
     let i = y / default_row_height(c, theme).max(1);
     if i >= c.count { -1 } else { i }
@@ -500,17 +493,12 @@ fn top_row(c: &Collection, s: &CollectionState, theme: &Theme) -> (i64, i64) {
         return (0, s.scroll_y);
     }
     if s.extents.len() > 1 {
-        let last = s.extents.len() - 2;
-        let mut lo = 0;
-        let mut hi = last;
-        while lo < hi {
-            let mid = (lo + hi).div_ceil(2);
-            if s.extents[mid] <= s.scroll_y {
-                lo = mid
-            } else {
-                hi = mid - 1
-            }
-        }
+        // The last row whose top is at or above the scroll; the final extent
+        // is the content's end, not a row.
+        let rows = &s.extents[..s.extents.len() - 1];
+        let lo = rows
+            .partition_point(|&top| top <= s.scroll_y)
+            .saturating_sub(1);
         return (lo as i64, s.scroll_y - s.extents[lo]);
     }
     let h = default_row_height(c, theme).max(1);

@@ -32,6 +32,22 @@ pub fn draw_text(canvas: &mut Canvas, x: i64, y: i64, text: &str, style: &TextSt
 }
 
 /// The pixel width of one line of `text`.
+/// The value a table of sorted, disjoint `start, end, value` triples gives
+/// `code`, or None when no range holds it.
+pub(crate) fn range_value(table: &[i64], code: i64) -> Option<i64> {
+    let (ranges, _) = table.as_chunks::<3>();
+    let found = ranges.binary_search_by(|&[start, end, _]| {
+        if end < code {
+            std::cmp::Ordering::Less
+        } else if start > code {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    });
+    found.ok().map(|i| ranges[i][2])
+}
+
 pub fn width(text: &str, style: &TextStyle) -> f64 {
     let (w, _) = layout::measure(text, style);
     w

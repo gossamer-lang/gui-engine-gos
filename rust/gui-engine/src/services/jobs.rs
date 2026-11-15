@@ -410,6 +410,7 @@ impl Worker {
             state.sequence = state
                 .sequence
                 .checked_add(1)
+                // A u64 counted once per job does not run out in practice.
                 .expect("job sequence exhausted");
             (job.owner().to_owned(), state.sequence + 3)
         });
@@ -510,9 +511,10 @@ impl Drop for Worker {
 
 fn run_worker(shared: &Shared, mail: &Mailbox) {
     run_worker_with(shared, mail, |job, context| {
-        let mut last = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+        // None until the first progress report, which goes out at once.
+        let mut last: Option<Instant> = None;
         let mut progress = |done, total| {
-            if context.active() && last.elapsed() >= Duration::from_millis(50) {
+            if context.active() && last.is_none_or(|at| at.elapsed() >= Duration::from_millis(50)) {
                 let message = match job {
                     Job::Work(work) => work.message(super::work::Outcome::Progress(done, total)),
                     _ => UiMsg::WorkFinished(
@@ -523,7 +525,7 @@ fn run_worker(shared: &Shared, mail: &Mailbox) {
                     ),
                 };
                 let _ = mail.try_post_guarded(&message, &context.delivery);
-                last = Instant::now();
+                last = Some(Instant::now());
             }
         };
         match job {
@@ -630,6 +632,8 @@ fn run_worker_with(
             if state.stopped {
                 return;
             }
+            // The wait above ends only once the queue has a request or the
+            // worker stopped.
             let request = state.queue.pop_front().unwrap();
             state.active = Some((request.job.owner().to_owned(), request.context.clone()));
             request

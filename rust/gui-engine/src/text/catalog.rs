@@ -44,19 +44,18 @@ impl FontRecord {
     /// Whether the face has a glyph for `c`.
     pub fn covers(&self, c: char) -> bool {
         let code = u32::from(c);
-        let mut lo = 0;
-        let mut hi = self.coverage.len() / 2;
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            if code < self.coverage[mid * 2] {
-                hi = mid;
-            } else if code > self.coverage[mid * 2 + 1] {
-                lo = mid + 1;
-            } else {
-                return true;
-            }
-        }
-        false
+        let (ranges, _) = self.coverage.as_chunks::<2>();
+        ranges
+            .binary_search_by(|&[start, end]| {
+                if end < code {
+                    std::cmp::Ordering::Less
+                } else if start > code {
+                    std::cmp::Ordering::Greater
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .is_ok()
     }
 }
 

@@ -106,6 +106,7 @@ pub(crate) fn get(
     }
     let budget = crate::app::effects::current_budget();
     let identity = (budget.identity(), owner.to_owned());
+    // A style and its options hold plain values with string keys, which encode.
     let style_key = serde_json::to_string(&(style.clone(), options)).unwrap();
     {
         let mut state = STATE.lock();

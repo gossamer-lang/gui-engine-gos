@@ -755,20 +755,7 @@ pub fn grapheme_boundaries(text: &str) -> Vec<i64> {
 }
 
 fn script_of(c: char) -> i64 {
-    let v = c as i64;
-    let mut lo = 0;
-    let mut hi = SCRIPT.len() / 3;
-    while lo < hi {
-        let mid = (lo + hi) / 2;
-        if v < SCRIPT[mid * 3] {
-            hi = mid;
-        } else if v > SCRIPT[mid * 3 + 1] {
-            lo = mid + 1;
-        } else {
-            return SCRIPT[mid * 3 + 2];
-        }
-    }
-    0
+    super::range_value(&SCRIPT, c as i64).unwrap_or(0)
 }
 
 fn cached_paragraph(text: &str, style: &TextStyle, options: LayoutOptions) -> Vec<Line> {
@@ -1402,17 +1389,7 @@ fn place_line(
 // First boundary >= b, or > b when strict. Queries must not rescan the
 // document's complete boundary index for every glyph in every paragraph.
 fn boundary_index(boundaries: &[i64], b: i64, strict: bool) -> i64 {
-    let mut lo = 0;
-    let mut hi = boundaries.len();
-    while lo < hi {
-        let mid = (lo + hi) / 2;
-        if boundaries[mid] < b || (strict && boundaries[mid] == b) {
-            lo = mid + 1
-        } else {
-            hi = mid
-        }
-    }
-    lo as i64
+    boundaries.partition_point(|&at| at < b || (strict && at == b)) as i64
 }
 
 fn snap_down(boundaries: &[i64], b: i64) -> i64 {
@@ -1491,17 +1468,8 @@ fn elide(
 impl TextLayout {
     /// The index of the line holding byte `offset` (the last line for the end).
     pub fn line_of(&self, offset: i64) -> i64 {
-        let mut lo = 0;
-        let mut hi = self.lines.len();
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            if self.lines[mid].start <= offset {
-                lo = mid + 1
-            } else {
-                hi = mid
-            }
-        }
-        if lo == 0 { 0 } else { (lo - 1) as i64 }
+        let after = self.lines.partition_point(|line| line.start <= offset);
+        after.saturating_sub(1) as i64
     }
 
     /// The caret's x for byte `offset` within its line, from the layout left.
@@ -2198,16 +2166,7 @@ pub fn draw_syntax(
             continue;
         };
         for glyph in &line.glyphs {
-            let mut lo = 0;
-            let mut hi = spans.len();
-            while lo < hi {
-                let mid = (lo + hi) / 2;
-                if spans[mid].end <= glyph.start {
-                    lo = mid + 1
-                } else {
-                    hi = mid
-                }
-            }
+            let lo = spans.partition_point(|span| span.end <= glyph.start);
             let color = if lo < spans.len() && spans[lo].start <= glyph.start {
                 crate::text::syntax::color(spans[lo].kind, theme)
             } else {

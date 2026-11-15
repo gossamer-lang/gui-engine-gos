@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.0 - Version numbers that mean what they say
+
+- 0.2.8 through 0.2.25 should have been minor releases, not patches: they raised the minimum Gossamer (0.78 in 0.2.8, 0.79 in 0.2.22), changed behavior, and 0.2.22 added fields to `TextStyle` and `terminal::ViewOptions` and replaced the text stack. From now on, any release that can break a build bumps the minor version.
+- Background jobs no longer panic when reporting progress right after the machine starts.
+- Rich list and quote edits return an error instead of panicking when a block has no parent.
+
 ## 0.2.25 - Old font caches cleaned up
 
 - Font cache files in older formats are deleted after 30 days unused, so apps still using one keep it.

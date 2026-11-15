@@ -25,6 +25,7 @@ fn leaf<'a>(stack: &'a mut Vec<Block>, roots: &[Arc<Block>]) -> Result<&'a mut B
         }
         stack.push(Block::new(Kind::Paragraph));
     }
+    // The stack holds at least the paragraph pushed above.
     Ok(stack.last_mut().unwrap())
 }
 fn inline_html(

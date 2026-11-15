@@ -91,7 +91,11 @@ impl<'a> Decoder<'a> {
         Ok(bytes)
     }
     fn number(&mut self) -> Result<u64, String> {
-        Ok(u64::from_le_bytes(self.bytes(8)?.try_into().unwrap()))
+        let bytes = self.bytes(8)?;
+        let array = bytes
+            .try_into()
+            .map_err(|_| "a number is not 8 bytes".to_string())?;
+        Ok(u64::from_le_bytes(array))
     }
     fn text(&mut self, limit: usize) -> Result<String, String> {
         let length = usize::try_from(self.number()?).map_err(|_| "checkpoint length overflow")?;

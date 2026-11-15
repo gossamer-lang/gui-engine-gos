@@ -356,8 +356,8 @@ pub fn decimate(points: &VecDeque<(f64, f64)>, map: &Mapping, sorted: bool) -> V
         return points.iter().copied().collect();
     }
     let (from, to) = (map.window.x0, map.window.x1);
-    let start = partition(points, |p| p.0 < from).saturating_sub(1);
-    let end = (partition(points, |p| p.0 <= to) + 1).min(points.len());
+    let start = points.partition_point(|p| p.0 < from).saturating_sub(1);
+    let end = (points.partition_point(|p| p.0 <= to) + 1).min(points.len());
     if end - start <= columns * 4 {
         return points.range(start..end).copied().collect();
     }
@@ -724,8 +724,8 @@ pub fn hit(model: &Model, width: i64, height: i64, theme: &Theme, x: f64, y: f64
                 map.data_x(x - radius).min(map.data_x(x + radius)),
                 map.data_x(x - radius).max(map.data_x(x + radius)),
             );
-            let start = partition(&s.points, |p| p.0 < lo);
-            let end = partition(&s.points, |p| p.0 <= hi);
+            let start = s.points.partition_point(|p| p.0 < lo);
+            let end = s.points.partition_point(|p| p.0 <= hi);
             Box::new((start..end).map(move |k| (k, &s.points[k])))
         } else {
             Box::new(all.enumerate())
@@ -747,19 +747,6 @@ pub fn hit(model: &Model, width: i64, height: i64, theme: &Theme, x: f64, y: f64
         }
     }
     best.map(|(_, hit)| hit)
-}
-
-fn partition(points: &VecDeque<(f64, f64)>, pred: impl Fn(&(f64, f64)) -> bool) -> usize {
-    let (mut lo, mut hi) = (0, points.len());
-    while lo < hi {
-        let mid = (lo + hi) / 2;
-        if pred(&points[mid]) {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    lo
 }
 
 /// The series whose legend entry is under a local pixel.

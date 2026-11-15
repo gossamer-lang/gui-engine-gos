@@ -248,6 +248,7 @@ fn markdown_block(block: &Block) -> String {
 }
 #[cfg(feature = "markup")]
 fn semantic(content: &Content) -> serde_json::Value {
+    // Rich content holds strings, numbers and string-keyed maps, which encode.
     let mut value = serde_json::to_value(content).unwrap();
     fn strip(value: &mut serde_json::Value) {
         match value {

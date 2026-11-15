@@ -108,17 +108,8 @@ pub struct Break {
 /// The raw class of `c` from the pinned data (XX when unlisted).
 pub fn raw_class(c: char) -> i64 {
     let v = c as i64;
-    let mut lo = 0;
-    let mut hi = LINE_BREAK.len() / 3;
-    while lo < hi {
-        let mid = (lo + hi) / 2;
-        if v < LINE_BREAK[mid * 3] {
-            hi = mid;
-        } else if v > LINE_BREAK[mid * 3 + 1] {
-            lo = mid + 1;
-        } else {
-            return LINE_BREAK[mid * 3 + 2];
-        }
+    if let Some(class) = super::range_value(&LINE_BREAK, v) {
+        return class;
     }
     // Unlisted CJK ideograph ranges default to ID per LineBreak.txt.
     if (0x3400..=0x4dbf).contains(&v)

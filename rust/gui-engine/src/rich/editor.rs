@@ -207,7 +207,8 @@ pub fn enter(document: i64) -> Result<registry::Info, String> {
         return registry::transact(document, info.revision, &edits, || true);
     }
     let path = path(&snapshot.content, id).ok_or("selected rich block is closed")?;
-    let (parent, index) = parent_index(&snapshot.content, &path);
+    let (parent, index) =
+        parent_index(&snapshot.content, &path).ok_or("selected rich block has no parent")?;
     let mut right = leaf.sliced(end, leaf.text.len());
     right.id = next_id();
     if matches!(right.kind, Kind::Heading(_)) {
@@ -222,7 +223,8 @@ pub fn enter(document: i64) -> Result<registry::Info, String> {
         marks: None,
     });
     if parent.kind == Kind::Item && path.len() >= 2 {
-        let (list, item_index) = parent_index(&snapshot.content, &path[..path.len() - 1]);
+        let (list, item_index) = parent_index(&snapshot.content, &path[..path.len() - 1])
+            .ok_or("rich item has no list")?;
         if matches!(list.kind, Kind::List(_)) {
             if leaf.text.is_empty() && parent.children.len() == 1 {
                 return indent(document, true);
@@ -287,14 +289,17 @@ fn path(content: &Content, id: i64) -> Option<Vec<usize>> {
     let mut indices = Vec::new();
     visit(&content.blocks, id, &mut indices).then_some(indices)
 }
-fn parent_index(content: &Content, path: &[usize]) -> (Block, usize) {
+// The block holding the block at `path`, and its index there; None for an
+// empty path.
+fn parent_index(content: &Content, path: &[usize]) -> Option<(Block, usize)> {
+    let (&index, ancestors) = path.split_last()?;
     let mut root = Block::new(Kind::Quote);
     root.id = 0;
     root.children = content.blocks.clone();
-    for &index in &path[..path.len() - 1] {
-        root = (*root.children[index]).clone();
+    for &ancestor in ancestors {
+        root = (*root.children[ancestor]).clone();
     }
-    (root, *path.last().unwrap())
+    Some((root, index))
 }
 /// Indent a list item under its predecessor, or outdent into the containing list.
 /// At the top level outdent promotes the item while preserving surrounding lists.
@@ -304,7 +309,8 @@ pub fn indent(document: i64, outdent: bool) -> Result<registry::Info, String> {
         .ok_or("selected rich block is closed")?;
     let mut item = None;
     while !indices.is_empty() {
-        let (parent, index) = parent_index(&snapshot.content, &indices);
+        let (parent, index) =
+            parent_index(&snapshot.content, &indices).ok_or("rich block has no parent")?;
         if parent.children[index].kind == Kind::Item {
             item = Some((indices.clone(), parent, index));
             break;
@@ -342,10 +348,12 @@ pub fn indent(document: i64, outdent: bool) -> Result<registry::Info, String> {
         });
     } else {
         let list_path = &item_path[..item_path.len() - 1];
-        let (parent, list_index) = parent_index(&snapshot.content, list_path);
+        let (parent, list_index) =
+            parent_index(&snapshot.content, list_path).ok_or("rich item has no list")?;
         if parent.kind == Kind::Item && list_path.len() >= 2 {
             let (outer, parent_index) =
-                parent_index(&snapshot.content, &list_path[..list_path.len() - 1]);
+                parent_index(&snapshot.content, &list_path[..list_path.len() - 1])
+                    .ok_or("rich list has no parent")?;
             if !matches!(outer.kind, Kind::List(_)) {
                 return Err("invalid nested list".into());
             }
@@ -417,7 +425,8 @@ pub fn wrap(document: i64, kind: Kind) -> Result<registry::Info, String> {
     let (snapshot, info) = registry::view(document)?;
     let id = info.selection.caret.block;
     let path = path(&snapshot.content, id).ok_or("selected rich block is closed")?;
-    let (parent, index) = parent_index(&snapshot.content, &path);
+    let (parent, index) =
+        parent_index(&snapshot.content, &path).ok_or("selected rich block has no parent")?;
     let mut wrapper = Block::new(kind.clone());
     let wrapper_id = wrapper.id;
     let target = if matches!(kind, Kind::List(_)) {
@@ -610,5 +619,18 @@ mod tests {
         );
         registry::close(id);
         assert_eq!(budget.usage().0, 0);
+    }
+
+    #[test]
+    fn a_path_names_its_parent_and_an_empty_path_has_none() {
+        let mut quote = Block::new(Kind::Quote);
+        quote.children.push(Arc::new(Block::new(Kind::Paragraph)));
+        let content = Content {
+            blocks: vec![Arc::new(quote)],
+            ..Content::default()
+        };
+        let (parent, index) = parent_index(&content, &[0, 0]).unwrap();
+        assert_eq!((parent.kind, index), (Kind::Quote, 0));
+        assert!(parent_index(&content, &[]).is_none());
     }
 }

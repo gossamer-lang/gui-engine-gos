@@ -47,19 +47,8 @@ pub enum Direction {
 /// The bidi class of `c` from the pinned Unicode data.
 pub fn class(c: char) -> i64 {
     let v = c as i64;
-    let mut lo = 0;
-    let mut hi = BIDI.len() / 3;
-    while lo < hi {
-        let mid = (lo + hi) / 2;
-        let start = BIDI[mid * 3];
-        let end = BIDI[mid * 3 + 1];
-        if v < start {
-            hi = mid;
-        } else if v > end {
-            lo = mid + 1;
-        } else {
-            return BIDI[mid * 3 + 2];
-        }
+    if let Some(class) = super::range_value(&BIDI, v) {
+        return class;
     }
     // Unlisted code points: right-to-left in the Hebrew and Arabic
     // blocks per DerivedBidiClass defaults, left-to-right elsewhere.
@@ -85,21 +74,12 @@ pub fn class(c: char) -> i64 {
 
 /// The mirrored form of `c` for right-to-left display, or `c`.
 pub fn mirror(c: char) -> char {
-    let v = c as i64;
-    let mut lo = 0;
-    let mut hi = MIRROR.len() / 3;
-    while lo < hi {
-        let mid = (lo + hi) / 2;
-        let k = MIRROR[mid * 3];
-        if v < k {
-            hi = mid;
-        } else if v > k {
-            lo = mid + 1;
-        } else {
-            return char::from_u32(MIRROR[mid * 3 + 2] as u32).unwrap_or(c);
-        }
-    }
-    c
+    let (pairs, _) = MIRROR.as_chunks::<3>();
+    pairs
+        .binary_search_by_key(&(c as i64), |&[code, ..]| code)
+        .ok()
+        .and_then(|i| char::from_u32(pairs[i][2] as u32))
+        .unwrap_or(c)
 }
 
 fn is_isolate_initiator(t: i64) -> bool {

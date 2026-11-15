@@ -365,6 +365,7 @@ pub(crate) fn run(request: &Request, context: &Context) -> Result<(), String> {
         }
     }
     while rows.len() > 16384 {
+        // The loop runs only while rows hold over 16384 entries.
         let key = *rows.keys().next().unwrap();
         rows.remove(&key);
     }

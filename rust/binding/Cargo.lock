@@ -777,7 +777,7 @@ dependencies = [
 
 [[package]]
 name = "gui-engine"
-version = "0.2.25"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -798,7 +798,6 @@ dependencies = [
  "png",
  "portable-pty",
  "pulldown-cmark",
- "read-fonts",
  "regex",
  "ropey",
  "roxmltree",
@@ -821,7 +820,7 @@ dependencies = [
 
 [[package]]
 name = "gui-engine-binding"
-version = "0.2.25"
+version = "0.3.0"
 dependencies = [
  "gos-windowing",
  "gossamer-binding",

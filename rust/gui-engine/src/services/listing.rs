@@ -318,6 +318,8 @@ pub fn list_cancellable(req: &ListRequest, active: impl Fn() -> bool) -> Listing
             if bytes > LIST_BYTE_LIMIT {
                 result.error = "listing byte budget reached".into();
             }
+            // `bytes` counts only kept entries, so a count over a limit means
+            // there is one to drop.
             bytes -= kept.pop().unwrap().bytes;
         }
     }

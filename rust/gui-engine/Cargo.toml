@@ -1,6 +1,6 @@
 [package]
 name = "gui-engine"
-version = "0.2.25"
+version = "0.3.0"
 edition = "2024"
 publish = false
 
@@ -41,7 +41,6 @@ libloading = "0.9"
 # Installed fonts are mapped rather than read when nothing the user runs can
 # shorten the file (services/bounded_io.rs).
 memmap2 = "0.9"
-read-fonts = "=0.47.0"
 skrifa = "=0.50.0"
 harfrust = "=0.16.0"
 miniz_oxide = "0.9"

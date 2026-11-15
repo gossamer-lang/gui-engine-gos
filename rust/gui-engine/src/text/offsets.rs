@@ -466,16 +466,8 @@ impl LineIndex {
     /// The line and column of byte offset `at`; the `\n` itself is its line's end.
     pub fn position(&self, at: ByteOffset) -> Result<LinePosition, OffsetError> {
         let ByteOffset(b) = check_byte(&self.text, at)?;
-        let mut lo = 0;
-        let mut hi = self.starts.len();
-        while lo + 1 < hi {
-            let mid = (lo + hi) / 2;
-            if self.starts[mid] <= b {
-                lo = mid
-            } else {
-                hi = mid
-            }
-        }
+        // The first line starts at 0, so at least one start is at or before `b`.
+        let lo = self.starts.partition_point(|&start| start <= b) - 1;
         Ok(LinePosition {
             line: lo as i64,
             column: ByteOffset(b - self.starts[lo]),

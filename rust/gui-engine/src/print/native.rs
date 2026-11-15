@@ -346,6 +346,8 @@ mod gdi {
                 for px in bgra.as_chunks_mut::<4>().0 {
                     px.swap(0, 2);
                 }
+                // SAFETY: BITMAPINFO and its header are C structs of integers,
+                // for which all-zero bytes are a valid value.
                 let mut header: BITMAPINFO = unsafe { std::mem::zeroed() };
                 header.bmiHeader = BITMAPINFOHEADER {
                     biSize: size_of::<BITMAPINFOHEADER>() as u32,

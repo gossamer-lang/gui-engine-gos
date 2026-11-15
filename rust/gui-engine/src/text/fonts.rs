@@ -362,24 +362,7 @@ fn shown_as_emoji(cluster: &[char]) -> bool {
     if cluster.contains(&'\u{FE0E}') || cluster.is_empty() {
         return false;
     };
-    in_ranges(&EMOJI_PRESENTATION, cluster[0] as i64)
-}
-
-// Whether `code` falls in a `start, end, value` table.
-fn in_ranges(table: &[i64], code: i64) -> bool {
-    let mut lo = 0;
-    let mut hi = table.len() / 3;
-    while lo < hi {
-        let mid = (lo + hi) / 2;
-        if code < table[mid * 3] {
-            hi = mid;
-        } else if code > table[mid * 3 + 1] {
-            lo = mid + 1;
-        } else {
-            return true;
-        }
-    }
-    false
+    super::range_value(&EMOJI_PRESENTATION, cluster[0] as i64).is_some()
 }
 
 // The face for a cluster's base when no face covers the whole cluster.

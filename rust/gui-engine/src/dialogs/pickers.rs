@@ -1127,16 +1127,16 @@ pub fn action(
             let mut text = value(&n, "date");
             let date = Date::parse(&text);
             let clock = ClockTime::parse(&value(&n, "time"));
-            if (mode != DateMode::Time && date.is_none())
-                || (mode != DateMode::Date && clock.is_none())
-            {
-                n.error = crate::localization::tr("Enter a valid date and time");
-                return (n, None, effects.to_vec());
-            }
-            if mode == DateMode::Time {
-                text = clock.unwrap().iso()
-            } else if mode == DateMode::DateTime {
-                text = format!("{}T{}", date.unwrap().iso(), clock.unwrap().iso())
+            text = match (mode, date, clock) {
+                (DateMode::Date, Some(_), _) => text,
+                (DateMode::Time, _, Some(clock)) => clock.iso(),
+                (DateMode::DateTime, Some(date), Some(clock)) => {
+                    format!("{}T{}", date.iso(), clock.iso())
+                }
+                _ => {
+                    n.error = crate::localization::tr("Enter a valid date and time");
+                    return (n, None, effects.to_vec());
+                }
             };
             let kind = match mode {
                 DateMode::Date => crate::widgets::temporal::TemporalKind::DateOnly,

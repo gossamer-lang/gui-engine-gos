@@ -627,7 +627,6 @@ mod tests {
         quote.children.push(Arc::new(Block::new(Kind::Paragraph)));
         let content = Content {
             blocks: vec![Arc::new(quote)],
-            ..Content::default()
         };
         let (parent, index) = parent_index(&content, &[0, 0]).unwrap();
         assert_eq!((parent.kind, index), (Kind::Quote, 0));

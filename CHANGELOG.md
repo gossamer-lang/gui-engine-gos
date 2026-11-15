@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.24 - No busy loop behind a hidden terminal
+
+- A terminal no window shows, such as a tab in the back, no longer keeps the loop awake with an animation or layer deadline its last paint set.
+- A terminal animation that is due waits for its window's next frame instead of waking the loop until then.
+
 ## 0.2.23 - Terminal output after a late frame
 
 - Terminal output and pastes no longer stall when the loop runs late for a frame it held a terminal's wake for.

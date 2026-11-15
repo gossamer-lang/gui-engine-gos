@@ -262,6 +262,9 @@ struct Entry {
     pictures: images::Pictures,
     /// When an animated image the screen shows next changes frame.
     animation_due: Option<i64>,
+    /// Whether a view painted the screen since the session began rendering
+    /// its windows; a deadline only a paint renews belongs to a view shown.
+    painted: bool,
     /// Whether new output, and typing, bring a view scrolled back to the
     /// live screen; the widget sets them from its options.
     scroll_on_output: bool,
@@ -432,6 +435,7 @@ pub fn create(options: &Options, budget: Budget) -> Result<i64, String> {
             highlights: Vec::new(),
             pictures: images::Pictures::default(),
             animation_due: None,
+            painted: false,
             scroll_on_output: false,
             scroll_on_keystroke: true,
             bells_flashed: 0,
@@ -1095,6 +1099,32 @@ pub(crate) fn animation_due() -> Option<i64> {
         .values()
         .filter_map(|entry| entry.animation_due)
         .min()
+}
+
+/// Marks the terminals of `budget` unpainted, ahead of rendering its windows.
+pub(crate) fn begin_paints(budget: &Budget) {
+    for entry in TERMINALS
+        .lock()
+        .values_mut()
+        .filter(|e| e.budget == *budget)
+    {
+        entry.painted = false;
+    }
+}
+
+/// Drops the deadlines due by `now` of the terminals of `budget` that no
+/// view painted while every window of the session rendered: no window shows
+/// them, and a view that shows one again paints it and sets its own.
+pub(crate) fn forget_unpainted(budget: &Budget, now: i64) {
+    for entry in TERMINALS
+        .lock()
+        .values_mut()
+        .filter(|e| e.budget == *budget)
+    {
+        if !entry.painted && entry.animation_due.is_some_and(|due| due <= now) {
+            entry.animation_due = None;
+        }
+    }
 }
 
 /// When the first program waiting for its view starts without one.

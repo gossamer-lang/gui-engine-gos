@@ -1519,6 +1519,8 @@ impl Session {
         }
         self.reconcile_tabs()?;
         self.check_memory()?;
+        crate::terminal::begin_paints(&self.budget);
+        let mut rendered_all = true;
         let mut w = 0;
         while w < self.windows.len() {
             self.mark_tree(w as i64);
@@ -1542,11 +1544,16 @@ impl Session {
                 if self.windows[w].dirty {
                     self.render(w as i64)?
                 }
+            } else {
+                rendered_all = false;
             }
             if output {
                 self.windows[w].output_paint_ms = self.now() - now;
             }
             w += 1;
+        }
+        if rendered_all {
+            crate::terminal::forget_unpainted(&self.budget, self.now());
         }
         for request in crate::rich::layout_cache::take_requests(&self.budget) {
             self.run_job(&services::jobs::Job::RichLayout(request));
@@ -1676,7 +1683,10 @@ impl Session {
 
     fn next_deadline(&self) -> i64 {
         let mut best = self.output_due().unwrap_or(-1);
+        // An animation already due made its windows' output due, so their
+        // next frame, not the passed deadline, is when the loop wakes.
         if let Some(due) = crate::terminal::animation_due()
+            && due > self.now()
             && (best < 0 || due < best)
         {
             best = due;

@@ -1059,6 +1059,26 @@ mod session {
     }
 
     #[test]
+    fn a_terminal_no_window_shows_keeps_no_deadline_once_its_windows_render() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _defer = scopeguard::guard((), |_| crate::services::remove_test_config(&config));
+            let (mut s, shown, _) =
+                shown_program("hidden-deadline", "printf 'ready\\r\\n'; read x");
+            step_until(&mut s, || snapshot(shown).unwrap().text.contains("ready"));
+            // A tab put behind another keeps the deadline its last paint set.
+            let hidden =
+                create(&options(8, 40, 100), crate::app::effects::current_budget()).unwrap();
+            with_entry(hidden, |entry| entry.animation_due = Some(1));
+            s.flush().unwrap();
+            assert_eq!(with_entry(hidden, |entry| entry.animation_due), Some(None));
+            close(hidden);
+            close(shown);
+            s.shutdown();
+        })
+    }
+
+    #[test]
     fn a_large_paste_reaches_the_program_whole_and_typing_follows_it() {
         crate::testing::on_ui_thread(|| {
             let config = crate::services::private_test_config();

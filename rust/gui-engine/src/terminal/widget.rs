@@ -1278,6 +1278,7 @@ pub fn paint_terminal(v: &View, node: &Node, cx: &mut PaintCx) {
         entry.layer = layer;
         entry.pictures = pictures;
         entry.animation_due = [below, above, release_due].into_iter().flatten().min();
+        entry.painted = true;
     });
     // The cursor shows focus, filled while the terminal has it and hollow
     // otherwise, so the terminal draws no focus ring around its screen.

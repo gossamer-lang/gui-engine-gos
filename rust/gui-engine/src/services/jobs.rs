@@ -577,18 +577,20 @@ fn run_worker(shared: &Shared, mail: &Mailbox) {
                 req.request,
                 listing::list_cancellable(req, || context.active()),
             ),
-            Job::FontFace(_, record, bold) => {
-                match fonts::prepare_installed(record, *bold, &|| context.active()) {
-                    Ok(_) => UiMsg::FontReady(record.family.clone()),
-                    Err(error) => job.failure(error),
-                }
-            }
-            Job::Fonts(owner) => {
-                match fonts::scan_installed_cancellable(&|| context.active(), &mut progress) {
-                    Ok(records) => UiMsg::FontsLoaded(owner.clone(), records),
-                    Err(why) => job.failure(why),
-                }
-            }
+            // Font files load and the catalog builds while text may be
+            // streaming, so they run at background priority.
+            Job::FontFace(_, record, bold) => match super::background::run(|| {
+                fonts::prepare_installed(record, *bold, &|| context.active())
+            }) {
+                Ok(_) => UiMsg::FontReady(record.family.clone()),
+                Err(error) => job.failure(error),
+            },
+            Job::Fonts(owner) => match super::background::run(|| {
+                fonts::scan_installed_cancellable(&|| context.active(), &mut progress)
+            }) {
+                Ok(records) => UiMsg::FontsLoaded(owner.clone(), records),
+                Err(why) => job.failure(why),
+            },
             Job::Apps(owner) => {
                 match apps::installed_cancellable(&|| context.active(), &mut progress) {
                     Ok(entries) => UiMsg::AppsLoaded(owner.clone(), entries),

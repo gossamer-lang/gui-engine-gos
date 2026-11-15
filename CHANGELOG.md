@@ -12,6 +12,7 @@
 - Terminal views take `font_features`, `font_variations`, `bold_font`, `bold_weight`, `italic_font` and `bold_italic_font`.
 - Text not yet in the layout cache shapes faster, and much faster in coding fonts with many ligatures.
 - The installed fonts' catalog is read again once, to mark `COLR` and `sbix` fonts as color fonts. Its cache keeps each coverage list once, so it is several times smaller and loads much faster, and older cache files are removed.
+- Font files load and the installed fonts' catalog builds at background priority, behind drawing and terminal output.
 - Requires Gossamer 0.79.0 and builds on windowing-gos 0.1.23.
 
 ## 0.2.21 - Program status and attention requests

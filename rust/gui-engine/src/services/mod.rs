@@ -1,4 +1,5 @@
 pub mod apps;
+pub(crate) mod background;
 pub(crate) mod bounded_io;
 pub mod clipboard;
 pub mod desktop;

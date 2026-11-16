@@ -9,7 +9,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 
 use portable_pty::{CommandBuilder, MasterPty, PtyPair};
-use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle, WAIT_OBJECT_0};
+use windows_sys::Win32::Foundation::{
+    DUPLICATE_SAME_ACCESS, DuplicateHandle, WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
 use windows_sys::Win32::System::IO::CancelSynchronousIo;
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetExitCodeProcess, INFINITE, TerminateProcess, WaitForSingleObject,
@@ -35,7 +37,9 @@ pub struct Pty {
     writer: Option<JoinHandle<()>>,
     waiter: Option<JoinHandle<()>>,
     notify: Arc<Notify>,
-    _slot: Slot,
+    /// Held until the reader and exit waiter end, which can be after
+    /// `close` when the program outlives its console.
+    slot: Option<Slot>,
     _lease: Lease,
 }
 
@@ -77,6 +81,13 @@ fn wait_for_exit(process: &OwnedHandle) -> Result<u32, String> {
     }
     Ok(code)
 }
+
+/// How long a program has to end after its console closes. Windows ends a
+/// program in a console window five seconds after the close event, and a
+/// pseudo-console's programs are held to the same: one still starting when
+/// its console closes can otherwise run on, and keep the console host, for
+/// good.
+const CLOSE_GRACE_MS: u32 = 5_000;
 
 /// A pseudo-console opened for a program that has not started yet, so the
 /// program can start at a size set after the opening.
@@ -142,7 +153,7 @@ impl Opened {
             writer: None,
             waiter: None,
             notify: notify.clone(),
-            _slot: slot,
+            slot: Some(slot),
             _lease: lease,
         };
         let end = ending.clone();
@@ -369,8 +380,10 @@ impl Pty {
         ))
     }
 
-    /// Terminates the program, closes the pseudo-console and joins every IO
-    /// thread.
+    /// Hangs up the program by closing its pseudo-console, and ends the IO
+    /// threads. The program has `CLOSE_GRACE_MS` to end before it is ended;
+    /// the reader and the exit waiter end with it, on a thread of their own,
+    /// so closing never waits on the program.
     pub fn close(&mut self) -> Result<(), String> {
         if self.closing.swap(true, Ordering::AcqRel) {
             return Ok(());
@@ -396,19 +409,33 @@ impl Pty {
                 .map_err(|e| e.to_string())?;
             let _ = close.join();
         }
-        if let Some(thread) = self.reader.take() {
-            let _ = thread.join();
-        }
-        // The program ends in its own time; a thread of its own waits for
-        // it, so closing never waits on it.
-        let Some(waiter) = self.waiter.take() else {
+        // The program ends in its own time, and may outlive the close: the
+        // console host stays while a program is attached, holding the output
+        // pipe open, so the reader's end of stream waits on the program too.
+        // A thread of their own joins both, so closing never waits on it.
+        let (reader, waiter, slot) = (self.reader.take(), self.waiter.take(), self.slot.take());
+        if reader.is_none() && waiter.is_none() {
             return Ok(());
-        };
+        }
+        let program = duplicate(self.process.as_raw_handle())?;
         thread::Builder::new()
             .name("gui-conpty-reap".into())
             .stack_size(STACK)
             .spawn(move || {
-                let _ = waiter.join();
+                // SAFETY: `program` is an owned, open process handle.
+                let waited =
+                    unsafe { WaitForSingleObject(program.as_raw_handle(), CLOSE_GRACE_MS) };
+                if waited == WAIT_TIMEOUT {
+                    // SAFETY: as above.
+                    unsafe { TerminateProcess(program.as_raw_handle(), 1) };
+                }
+                if let Some(waiter) = waiter {
+                    let _ = waiter.join();
+                }
+                if let Some(reader) = reader {
+                    let _ = reader.join();
+                }
+                drop(slot);
             })
             .map(|_| ())
             .map_err(|e| e.to_string())
@@ -508,5 +535,82 @@ mod tests {
             drop(pty);
             assert_eq!(budget.usage().0, 0);
         }
+    }
+
+    // Run by `closing_never_waits_for_a_program_that_holds_its_console_and_ends_it_after_the_grace` as
+    // the program in its pseudo-console: it holds the console's close event,
+    // so it outlives the close.
+    #[test]
+    #[ignore]
+    fn console_close_holder() {
+        use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+        unsafe extern "system" fn hold(_event: u32) -> i32 {
+            std::thread::sleep(std::time::Duration::from_secs(120));
+            1
+        }
+        if std::env::var_os("GUI_CONPTY_HOLD").is_none() {
+            return;
+        }
+        // SAFETY: `hold` is a handler of the signature the call expects, and
+        // lives for the whole process.
+        unsafe { SetConsoleCtrlHandler(Some(hold), 1) };
+        println!("holding");
+        std::thread::sleep(std::time::Duration::from_secs(120));
+    }
+
+    #[test]
+    fn closing_never_waits_for_a_program_that_holds_its_console_and_ends_it_after_the_grace() {
+        let budget = Budget::new(8 * 1024 * 1024);
+        let (send, receive) = std::sync::mpsc::channel();
+        let command = Command {
+            program: std::env::current_exe()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            args: vec![
+                "--exact".into(),
+                "terminal::conpty::tests::console_close_holder".into(),
+                "--ignored".into(),
+                "--nocapture".into(),
+            ],
+            env: vec![("GUI_CONPTY_HOLD".into(), "1".into())],
+            ..Command::default()
+        };
+        let kept = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let into = kept.clone();
+        let mut pty = Pty::spawn(
+            &command,
+            24,
+            80,
+            (0, 0),
+            &budget,
+            Arc::new(move || {
+                let _ = send.send(());
+            }),
+            Box::new(move |bytes: &[u8]| into.lock().extend_from_slice(bytes)),
+        )
+        .unwrap();
+        let mut answered = 0;
+        loop {
+            pty.drain();
+            let text = String::from_utf8_lossy(&kept.lock()).into_owned();
+            let asked = text.matches("\x1b[6n").count();
+            for _ in answered..asked {
+                pty.write(b"\x1b[1;1R").unwrap();
+            }
+            answered = asked;
+            if text.contains("holding") {
+                break;
+            }
+            receive.recv().unwrap();
+        }
+        pty.close().unwrap();
+        // SAFETY: `process` is the program's live process handle.
+        let state = unsafe { WaitForSingleObject(pty.process.as_raw_handle(), 0) };
+        assert_eq!(state, WAIT_TIMEOUT, "closing waited for the program to end");
+        // It would hold its close for two minutes; the grace ends it first.
+        assert_eq!(wait_for_exit(&pty.process), Ok(1));
+        drop(pty);
+        assert_eq!(budget.usage().0, 0);
     }
 }

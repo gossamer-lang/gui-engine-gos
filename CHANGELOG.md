@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.1 - Closing a terminal on Windows never hangs
+
+- Closing a terminal on Windows no longer hangs when its program keeps running after the console closes.
+- A program that ignores its console closing is ended after five seconds, as Windows does for console windows, so it no longer runs on in the background.
+
 ## 0.3.0 - Version numbers that mean what they say
 
 - 0.2.8 through 0.2.25 should have been minor releases, not patches: they raised the minimum Gossamer (0.78 in 0.2.8, 0.79 in 0.2.22), changed behavior, and 0.2.22 added fields to `TextStyle` and `terminal::ViewOptions` and replaced the text stack. From now on, any release that can break a build bumps the minor version.

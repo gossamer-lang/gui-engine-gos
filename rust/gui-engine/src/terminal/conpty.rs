@@ -608,8 +608,11 @@ mod tests {
         // SAFETY: `process` is the program's live process handle.
         let state = unsafe { WaitForSingleObject(pty.process.as_raw_handle(), 0) };
         assert_eq!(state, WAIT_TIMEOUT, "closing waited for the program to end");
-        // It would hold its close for two minutes; the grace ends it first.
-        assert_eq!(wait_for_exit(&pty.process), Ok(1));
+        // Left alone it would end by itself, with 0, after two minutes. The
+        // system ends it on the close (STATUS_CONTROL_C_EXIT) or the grace
+        // does (1), whichever comes first.
+        let code = wait_for_exit(&pty.process).unwrap();
+        assert_ne!(code, 0, "the program ran to its own end");
         drop(pty);
         assert_eq!(budget.usage().0, 0);
     }

@@ -1,8 +1,8 @@
 # Changelog
 
-## 0.4.1 - windowing-gos 0.2.1
+## 0.5.0 - Gossamer 0.81.1
 
-- Builds on windowing-gos 0.2.1, whose macOS core passes Clippy.
+- Requires Gossamer 0.81.1 and windowing-gos 0.3.0.
 
 ## 0.4.0 - Gossamer 0.81, table headings line up
 

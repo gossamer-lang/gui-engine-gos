@@ -691,7 +691,7 @@ dependencies = [
 
 [[package]]
 name = "gos-windowing"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "block2",
  "getrandom 0.4.3",
@@ -721,7 +721,7 @@ dependencies = [
 
 [[package]]
 name = "gui-engine"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

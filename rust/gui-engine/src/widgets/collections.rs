@@ -737,29 +737,45 @@ pub fn paint_collection(c: &Collection, node: &Node, cx: &mut PaintCx) {
         cx.canvas
             .rect(abs.x, abs.y, abs.width, header, theme.surface_alt);
         let mut x = abs.x - s.scroll_x;
+        let isz = theme.px(theme.shape.small_icon);
         for (col, w) in &cols {
-            let l = layout::layout(
-                &col.title,
-                &body.with_bold(true),
-                LayoutOptions::single_line(),
-            );
+            // A title lines up with its column's cells, which keep px(10) on
+            // each side. The sort mark takes the side the title leaves free:
+            // the start of an end-aligned column, the end of any other.
+            let sorted = c.sort.0 == col.key;
+            let trailing = !matches!(col.align, TextAlign::End | TextAlign::Right);
+            let mark = if sorted { isz + theme.px(4) } else { 0 };
+            let room = (w - theme.px(20) - mark).max(1);
+            let bold = body.with_bold(true);
+            let l = layout::layout(&col.title, &bold, LayoutOptions::elided(room as f64));
+            let slack = (room - l.width.ceil() as i64).max(0);
+            let start = x + theme.px(10) + if trailing { 0 } else { mark };
+            let tx = start
+                + match col.align {
+                    TextAlign::Center => slack / 2,
+                    TextAlign::End | TextAlign::Right => slack,
+                    _ => 0,
+                };
             layout::draw(
                 &mut cx.canvas,
                 &l,
-                (x + theme.px(10)) as f64,
+                tx as f64,
                 (abs.y + (header - l.height.ceil() as i64) / 2) as f64,
-                &body.with_bold(true),
+                &bold,
                 theme.text,
             );
-            if c.sort.0 == col.key {
-                let isz = theme.px(theme.shape.small_icon);
+            if sorted {
                 cx.icon(
                     if c.sort.1 {
                         &Icon::SortAsc
                     } else {
                         &Icon::SortDesc
                     },
-                    x + w - isz - theme.px(8),
+                    if trailing {
+                        x + w - isz - theme.px(8)
+                    } else {
+                        x + theme.px(8)
+                    },
                     abs.y + (header - isz) / 2,
                     isz,
                     theme.text_muted,

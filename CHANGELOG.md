@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.0 - Gossamer 0.81, table headings line up
+
+- Requires Gossamer 0.81.0 and windowing-gos 0.2.0.
+- A table's column headings follow their column's alignment, so headings over right-aligned numbers sit over the numbers.
+- A heading too long for its column is cut short instead of running into the next one.
+- An end-aligned column shows its sort arrow at its start, clear of the heading.
+
 ## 0.3.1 - Closing a terminal on Windows never hangs
 
 - Closing a terminal on Windows no longer hangs when its program keeps running after the console closes.

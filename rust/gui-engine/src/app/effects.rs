@@ -25,6 +25,24 @@ pub enum Edge {
     Right,
 }
 
+/// How `Effect::Arrange` lays windows out over a display.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum Arrangement {
+    /// Rows of this many equal cells; 0 makes the grid as even as it can.
+    /// A last row with fewer windows shares its whole width among them.
+    Grid(i64),
+    /// Every window side by side, full height.
+    Columns,
+    /// Every window stacked, full width.
+    Rows,
+    /// The first window along an edge, this fraction of the way across; the
+    /// rest share the remainder evenly.
+    Main(Edge, f64),
+    /// The first window in the middle, this fraction of the width; the rest
+    /// alternate into stacks on its left and right.
+    Centered(f64),
+}
+
 #[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Effect {
     /// Runs revisioned file IO, analysis or completion on the bounded worker.
@@ -75,6 +93,16 @@ pub enum Effect {
     /// on: it spans `length` of that edge, centered along it, and reaches
     /// `depth` of the way across, both fractions.
     Dock(String, Edge, f64, f64),
+    /// Lays the windows named out side by side over the usable area of the
+    /// display the first is on, in order, `gap` units apart. A window that
+    /// is minimized, on another virtual desktop or docked keeps its place;
+    /// a maximized or fullscreen one returns to a frame first. Wayland
+    /// places windows itself, so there nothing moves.
+    Arrange {
+        windows: Vec<String>,
+        arrangement: Arrangement,
+        gap: i64,
+    },
     /// Asks the desktop to deliver a shortcut (`Shortcut::parse` text) as
     /// `UiMsg::Hotkey(id)` while any application has focus; `description`
     /// names it where the desktop lists shortcuts. A refusal answers

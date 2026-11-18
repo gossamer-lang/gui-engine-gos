@@ -722,7 +722,7 @@ dependencies = [
 
 [[package]]
 name = "gos-windowing"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "block2",
  "getrandom 0.4.3",
@@ -777,7 +777,7 @@ dependencies = [
 
 [[package]]
 name = "gui-engine"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -820,7 +820,7 @@ dependencies = [
 
 [[package]]
 name = "gui-engine-binding"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "gos-windowing",
  "gossamer-binding",

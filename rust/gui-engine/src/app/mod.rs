@@ -1,3 +1,4 @@
+pub mod arrange;
 pub mod effects;
 pub mod mailbox;
 
@@ -30,7 +31,7 @@ use windowing;
 use windowing::{Key, Mods, MouseButton};
 
 use crate::accessibility::AccessNode;
-use crate::app::effects::{Edge, Effect};
+use crate::app::effects::{Arrangement, Edge, Effect};
 use crate::app::mailbox::{Inbox, Mailbox};
 use crate::commands;
 use crate::commands::{Command, CommandTable, KeyResult};
@@ -1039,6 +1040,46 @@ impl Session {
         }
         self.invalidate(w, "window docked");
         Ok(())
+    }
+
+    // Lays out the windows `keys` names that are shown here and now; see
+    // `Effect::Arrange`. A window the platform refuses to move is logged and
+    // the rest still move.
+    fn arrange(&mut self, keys: &[String], arrangement: Arrangement, gap: i64) {
+        if windowing::video_driver() == "wayland" {
+            self.log_line("arranging windows unavailable: Wayland places windows itself");
+            return;
+        }
+        let placed: Vec<usize> = keys
+            .iter()
+            .map(|key| self.find(key))
+            .filter(|&w| w >= 0)
+            .map(|w| w as usize)
+            .filter(|&w| {
+                let native = self.windows[w].native;
+                self.windows[w].docked.is_none()
+                    && native.is_visible()
+                    && !native.is_minimized()
+                    && native.on_current_desktop()
+            })
+            .collect();
+        let Some(&first) = placed.first() else {
+            return;
+        };
+        let area = match self.windows[first].native.display() {
+            Ok(display) => display.usable,
+            Err(e) => {
+                self.log_line(&format!("arranging windows unavailable: {}", e));
+                return;
+            }
+        };
+        let cells = arrange::cells(area, placed.len(), arrangement, gap);
+        for (&w, cell) in placed.iter().zip(cells) {
+            if let Err(e) = self.windows[w].native.set_frame(cell) {
+                self.log_line(&format!("window placement: {}", e))
+            }
+            self.invalidate(w as i64, "window arranged");
+        }
     }
 
     // A docked window the user resized reports the share of its display it
@@ -2124,6 +2165,15 @@ impl Session {
                     self.windows[w as usize].caret_on = true;
                     self.windows[w as usize].dirty = true;
                     self.update_caret_timer(w)
+                }
+            }
+            windowing::Event::EnteredFullscreen { window }
+            | windowing::Event::LeftFullscreen { window } => {
+                let w = self.find_native(*window);
+                if w >= 0 {
+                    let key = self.windows[w as usize].key.clone();
+                    let on = matches!(e, windowing::Event::EnteredFullscreen { .. });
+                    self.pending.push(UiMsg::WindowFullscreenChanged(key, on));
                 }
             }
             windowing::Event::FocusLost { window } => {
@@ -4306,6 +4356,11 @@ impl Session {
                 Effect::Dock(window, edge, length, depth) => {
                     self.dock(&window, edge, length, depth)?
                 }
+                Effect::Arrange {
+                    windows,
+                    arrangement,
+                    gap,
+                } => self.arrange(&windows, arrangement, gap),
                 Effect::RegisterHotkey {
                     id,
                     shortcut,
@@ -8895,6 +8950,73 @@ mod window_command_tests {
     }
 
     #[test]
+    // The test driver resizes windows but never moves them, so the cells'
+    // places are `arrange::cells`'s to show.
+    fn arranged_windows_take_their_cells_and_a_hidden_or_docked_one_keeps_its_size() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _cleanup = scopeguard::guard((), |_| crate::services::remove_test_config(&config));
+            let mut s = start("Arranged", "dev.gossamer.arranged").unwrap();
+            s.set_shell(|_| {}, Widget::label, |_| Vec::new());
+            for key in ["a", "b", "c", "d"] {
+                s.open_window(key, key, 320, 200).unwrap();
+            }
+            let a = s.windows[0].native.display().unwrap().usable;
+            let keys: Vec<String> = ["a", "b", "c", "d"].map(String::from).to_vec();
+            effects::perform(Effect::Arrange {
+                windows: keys.clone(),
+                arrangement: Arrangement::Columns,
+                gap: 0,
+            });
+            s.flush().unwrap();
+            let expected = arrange::cells(a, 4, Arrangement::Columns, 0);
+            for (w, cell) in expected.iter().enumerate() {
+                let native = s.windows[w].native;
+                let b = native.borders();
+                assert_eq!(
+                    native.size(),
+                    (
+                        cell.width - b.left - b.right,
+                        cell.height - b.top - b.bottom
+                    ),
+                    "window {w}"
+                );
+            }
+            // The test driver cannot minimize, so a hidden window stands for
+            // one the user cannot see.
+            effects::perform(Effect::SetWindowVisible("b".into(), false));
+            effects::perform(Effect::Dock("c".into(), Edge::Top, 0.5, 0.25));
+            s.flush().unwrap();
+            let kept = (s.windows[1].native.size(), s.windows[2].native.size());
+            effects::perform(Effect::Arrange {
+                windows: keys,
+                arrangement: Arrangement::Rows,
+                gap: 0,
+            });
+            s.flush().unwrap();
+            let rows = arrange::cells(a, 2, Arrangement::Rows, 0);
+            for (w, cell) in [(0, rows[0]), (3, rows[1])] {
+                let native = s.windows[w].native;
+                let b = native.borders();
+                assert_eq!(
+                    native.size(),
+                    (
+                        cell.width - b.left - b.right,
+                        cell.height - b.top - b.bottom
+                    ),
+                    "window {w}"
+                );
+            }
+            assert_eq!(
+                (s.windows[1].native.size(), s.windows[2].native.size()),
+                kept,
+                "a hidden or docked window was arranged"
+            );
+            s.shutdown()
+        })
+    }
+
+    #[test]
     fn a_window_docks_along_each_edge_spanning_its_length_and_reaching_its_depth() {
         crate::testing::on_ui_thread(|| {
             let config = crate::services::private_test_config();
@@ -8972,6 +9094,37 @@ mod window_command_tests {
             effects::perform(Effect::SetFullscreen("second".into(), false));
             s.flush().unwrap();
             assert!(!s.windows[1].native.is_fullscreen());
+            s.shutdown()
+        })
+    }
+
+    #[test]
+    fn the_app_hears_when_a_window_enters_or_leaves_fullscreen() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _cleanup = scopeguard::guard((), |_| crate::services::remove_test_config(&config));
+            let mut s = start("Fullscreen", "dev.gossamer.fullscreen-heard").unwrap();
+            let heard = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let log = heard.clone();
+            s.set_shell(
+                move |m| {
+                    if let UiMsg::WindowFullscreenChanged(key, on) = m {
+                        log.borrow_mut().push((key, on))
+                    }
+                },
+                Widget::label,
+                |_| Vec::new(),
+            );
+            s.open_window("main", "Main", 320, 200).unwrap();
+            let window = s.windows[0].native.id();
+            s.inject(&windowing::Event::EnteredFullscreen { window })
+                .unwrap();
+            s.inject(&windowing::Event::LeftFullscreen { window })
+                .unwrap();
+            assert_eq!(
+                *heard.borrow(),
+                vec![("main".to_string(), true), ("main".to_string(), false)]
+            );
             s.shutdown()
         })
     }

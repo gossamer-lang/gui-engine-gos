@@ -341,6 +341,9 @@ pub enum UiMsg {
     CloseRequested(String),
     /// The window gained (true) or lost keyboard focus.
     WindowFocusChanged(String, bool),
+    /// The window entered (true) or left fullscreen, at the application's
+    /// request or the desktop's.
+    WindowFullscreenChanged(String, bool),
     /// The user resized a window docked with `Effect::DockTop`: its width
     /// and height as fractions of its display's usable area.
     DockResized(String, f64, f64),

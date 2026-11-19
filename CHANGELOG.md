@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.0 - Arranged windows
+
+- `Effect::Arrange` lays windows out side by side over a display: in a grid, columns, rows, or with a main window along an edge or in the middle.
+- Arranged windows leave out minimized windows, docked windows and windows on another virtual desktop, and a maximized or fullscreen one gets its frame back first.
+- Arranged windows come to the front together while the user is in one of them, and that one keeps the focus.
+- A dialog stays centred over the window it belongs to, and on the display, when that window is arranged.
+- A window docked before it first shows opens docked, with no jump from where it opened.
+- A docked window moves and resizes in one step on X11.
+- `UiMsg::WindowFullscreenChanged` tells the application when a window enters or leaves fullscreen, whether it asked or the desktop did.
+- Requires Gossamer 0.82.0 and windowing-gos 0.4.0.
+
 ## 0.5.0 - Gossamer 0.81.1
 
 - Requires Gossamer 0.81.1 and windowing-gos 0.3.0.

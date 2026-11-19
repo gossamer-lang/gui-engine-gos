@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.6.1 - Docked and fullscreen windows
+
+- A window docked before it first shows is laid out at its docked size from the start, so a terminal in it starts its program at that size (macOS).
+- Arranging windows from a fullscreen window takes it out of fullscreen first, so it is laid out together with the windows on the desktop it returns to (macOS Spaces).
+
 ## 0.6.0 - Arranged windows
 
 - `Effect::Arrange` lays windows out side by side over a display: in a grid, columns, rows, or with a main window along an edge or in the middle.

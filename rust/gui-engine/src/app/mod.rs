@@ -895,8 +895,27 @@ impl Session {
         self.refresh_commands(w as i64);
         self.mark_tree(w as i64);
         self.frame_theme(w as i64);
+        // A dock asked for already sizes the window before its first
+        // layout, so a terminal in it starts at the docked size.
+        self.dock_hidden(w, key)?;
         self.render(w as i64)?;
         self.a11y.window_opened(key, title, self.windows[w].native);
+        Ok(())
+    }
+
+    // Applies the docks queued for hidden window `w` (`key`): the window
+    // system draws a window where it first maps it.
+    fn dock_hidden(&mut self, w: usize, key: &str) -> Result<(), errors::Error> {
+        if self.windows[w].native.is_visible() {
+            return Ok(());
+        }
+        let docks = effects::take_leased_where(|e| match e {
+            Effect::Dock(window, ..) | Effect::DockTop(window, ..) => window == key,
+            _ => false,
+        });
+        for (e, _lease) in docks {
+            self.apply_effect(e)?;
+        }
         Ok(())
     }
 
@@ -906,17 +925,8 @@ impl Session {
         if w < 0 {
             return Ok(());
         };
-        // The window system draws a window where it first maps it, so a dock
-        // asked for before then places it first.
-        if !self.windows[w as usize].native.is_visible() {
-            let docks = effects::take_leased_where(|e| match e {
-                Effect::Dock(window, ..) | Effect::DockTop(window, ..) => window == key,
-                _ => false,
-            });
-            for (e, _lease) in docks {
-                self.apply_effect(e)?
-            }
-        }
+        // A dock asked for since the window opened places it before it shows.
+        self.dock_hidden(w as usize, key)?;
         if self.windows[w as usize].dirty || self.windows[w as usize].layout_dirty {
             self.render(w)?
         };
@@ -1066,6 +1076,21 @@ impl Session {
         if windowing::video_driver() == "wayland" {
             self.log_line("arranging windows unavailable: Wayland places windows itself");
             return;
+        }
+        // A fullscreen window the user is in can have a desktop of its own
+        // (a macOS Space): it leaves fullscreen first, so the windows on the
+        // desktop it returns to are arranged with it.
+        let lead = keys
+            .iter()
+            .map(|key| self.find(key))
+            .filter(|&w| w >= 0)
+            .map(|w| w as usize)
+            .find(|&w| self.windows[w].active && self.windows[w].native.is_fullscreen());
+        if let Some(w) = lead {
+            let native = self.windows[w].native;
+            if let Err(e) = native.set_fullscreen(false).and_then(|()| native.sync()) {
+                self.log_line(&format!("leaving fullscreen to arrange: {}", e))
+            }
         }
         let placed: Vec<usize> = keys
             .iter()

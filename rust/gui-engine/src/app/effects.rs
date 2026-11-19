@@ -318,6 +318,24 @@ pub(crate) fn take_leased() -> Vec<(Effect, crate::memory::Lease)> {
     })
 }
 
+/// Takes the queued effects `wanted` picks, oldest first, and leaves the
+/// rest queued in their order.
+pub(crate) fn take_leased_where(
+    wanted: impl Fn(&Effect) -> bool,
+) -> Vec<(Effect, crate::memory::Lease)> {
+    QUEUE.with_borrow_mut(|queue| {
+        let (taken, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut queue.items)
+            .into_iter()
+            .partition(|item| wanted(&item.effect));
+        queue.items = kept;
+        queue.bytes -= taken.iter().map(|item| item.bytes).sum::<usize>();
+        taken
+            .into_iter()
+            .map(|item| (item.effect, item.lease))
+            .collect()
+    })
+}
+
 pub fn take() -> Vec<Effect> {
     take_leased()
         .into_iter()

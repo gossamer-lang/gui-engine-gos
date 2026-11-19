@@ -906,6 +906,17 @@ impl Session {
         if w < 0 {
             return Ok(());
         };
+        // The window system draws a window where it first maps it, so a dock
+        // asked for before then places it first.
+        if !self.windows[w as usize].native.is_visible() {
+            let docks = effects::take_leased_where(|e| match e {
+                Effect::Dock(window, ..) | Effect::DockTop(window, ..) => window == key,
+                _ => false,
+            });
+            for (e, _lease) in docks {
+                self.apply_effect(e)?
+            }
+        }
         if self.windows[w as usize].dirty || self.windows[w as usize].layout_dirty {
             self.render(w)?
         };
@@ -994,8 +1005,9 @@ impl Session {
         Ok(())
     }
 
-    // Places window `key` along the top edge of its display's usable area,
-    // `width` and `height` fractions of that area.
+    // Places window `key` along `edge` of its display's usable area,
+    // `length` along that edge and `depth` out from it, as fractions of
+    // that area.
     fn dock(
         &mut self,
         key: &str,
@@ -1012,7 +1024,6 @@ impl Session {
         let (length, depth) = (length.clamp(0.1, 1.0), depth.clamp(0.1, 1.0));
         let (wide, tall) = docked_size(area, edge, length, depth);
         self.windows[w as usize].docked = Some((edge, length, depth));
-        native.set_size(wide, tall)?;
         // A docked window has no frame, so the edge facing the rest of the
         // display resizes it.
         let size = DockGrip(Arc::new((AtomicI64::new(wide), AtomicI64::new(tall))));
@@ -1032,10 +1043,16 @@ impl Session {
         }
         self.windows[w as usize].grip = Some(size);
         let (x, y) = docked_place(area, edge, wide, tall);
-        // Wayland places windows itself; elsewhere a driver may refuse the move.
-        if windowing::video_driver() != "wayland"
-            && let Err(e) = native.set_position(x, y)
-        {
+        // Wayland places windows itself; elsewhere a driver may refuse the
+        // move. A docked window has no frame, so its frame is its content.
+        if windowing::video_driver() == "wayland" {
+            native.set_size(wide, tall)?
+        } else if let Err(e) = native.set_frame(windowing::Rect {
+            x,
+            y,
+            width: wide,
+            height: tall,
+        }) {
             self.log_line(&format!("window placement unavailable: {}", e))
         }
         self.invalidate(w, "window docked");
@@ -1074,11 +1091,52 @@ impl Session {
             }
         };
         let cells = arrange::cells(area, placed.len(), arrangement, gap);
-        for (&w, cell) in placed.iter().zip(cells) {
+        for (&w, &cell) in placed.iter().zip(&cells) {
             if let Err(e) = self.windows[w].native.set_frame(cell) {
                 self.log_line(&format!("window placement: {}", e))
             }
             self.invalidate(w as i64, "window arranged");
+        }
+        // A dialog window stays centred over the cell of the window it belongs
+        // to and on the display; AppKit otherwise carries a child window
+        // along by the distance its parent moved.
+        for d in 0..self.windows.len() {
+            let owner = self.find(&self.windows[d].owner);
+            if let Some(at) = placed.iter().position(|&w| w as i64 == owner) {
+                self.center_over(d, cells[at], area)
+            }
+        }
+        // The arranged windows come to the front together while the user is
+        // in one of them, which ends on top and keeps the focus; a layout
+        // that follows a window closing behind another application leaves
+        // that application in front.
+        let Some(at) = placed.iter().position(|&w| self.windows[w].active) else {
+            return;
+        };
+        let last = placed[at];
+        for &w in placed.iter().filter(|&&w| w != last).chain([&last]) {
+            if let Err(e) = self.windows[w].native.raise() {
+                self.log_line(&format!("raising an arranged window: {}", e))
+            }
+        }
+    }
+
+    // Puts window `d`'s frame over the middle of `over`, inside `area`.
+    fn center_over(&mut self, d: usize, over: windowing::Rect, area: windowing::Rect) {
+        let native = self.windows[d].native;
+        // A dialog the window manager has not framed yet reads no borders.
+        if let Err(e) = native.sync() {
+            self.log_line(&format!("dialog placement: {}", e))
+        }
+        let b = native.borders();
+        let (w, h) = native.size();
+        let (fw, fh) = (w + b.left + b.right, h + b.top + b.bottom);
+        let x =
+            (over.x + (over.width - fw) / 2).clamp(area.x, (area.x + area.width - fw).max(area.x));
+        let y = (over.y + (over.height - fh) / 2)
+            .clamp(area.y, (area.y + area.height - fh).max(area.y));
+        if let Err(e) = native.set_position(x + b.left, y + b.top) {
+            self.log_line(&format!("dialog placement: {}", e))
         }
     }
 
@@ -4219,441 +4277,443 @@ impl Session {
 
     fn apply_effects(&mut self) -> Result<(), errors::Error> {
         for (e, _lease) in effects::take_leased() {
-            match e {
-                Effect::OpenDialog(req) => {
-                    if !self.windows.is_empty() {
-                        self.open_dialog_in(0, &req)
-                    }
+            self.apply_effect(e)?
+        }
+        Ok(())
+    }
+
+    fn apply_effect(&mut self, e: Effect) -> Result<(), errors::Error> {
+        match e {
+            Effect::OpenDialog(req) => {
+                if !self.windows.is_empty() {
+                    self.open_dialog_in(0, &req)
                 }
-                Effect::OpenDialogIn(key, req) => {
+            }
+            Effect::OpenDialogIn(key, req) => {
+                let w = self.find(&key);
+                if w >= 0 {
+                    self.open_dialog_in(w, &req)
+                } else {
+                    self.pending
+                        .push(UiMsg::Dialog(req.id(), Outcome::Disposed))
+                }
+            }
+            Effect::OpenDialogWith(key, req, modality) => {
+                let w = if key.is_empty() {
+                    if self.windows.is_empty() { -1 } else { 0 }
+                } else {
+                    self.find(&key)
+                };
+                if w >= 0 {
+                    self.open_dialog_as(w, &req, modality)
+                } else {
+                    self.pending
+                        .push(UiMsg::Dialog(req.id(), Outcome::Disposed))
+                }
+            }
+            Effect::OpenWindow {
+                key,
+                title,
+                width,
+                height,
+            } => {
+                let policy = if self.windows.is_empty() {
+                    ClosePolicy::Close
+                } else {
+                    self.windows[0].close_policy
+                };
+                self.open_window(&key, &title, width, height)?;
+                // A window answering a forwarded launch takes focus as
+                // the launch's own.
+                if let Some(activation) = self.launch_activation.take() {
                     let w = self.find(&key);
-                    if w >= 0 {
-                        self.open_dialog_in(w, &req)
-                    } else {
-                        self.pending
-                            .push(UiMsg::Dialog(req.id(), Outcome::Disposed))
-                    }
-                }
-                Effect::OpenDialogWith(key, req, modality) => {
-                    let w = if key.is_empty() {
-                        if self.windows.is_empty() { -1 } else { 0 }
-                    } else {
-                        self.find(&key)
-                    };
-                    if w >= 0 {
-                        self.open_dialog_as(w, &req, modality)
-                    } else {
-                        self.pending
-                            .push(UiMsg::Dialog(req.id(), Outcome::Disposed))
-                    }
-                }
-                Effect::OpenWindow {
-                    key,
-                    title,
-                    width,
-                    height,
-                } => {
-                    let policy = if self.windows.is_empty() {
-                        ClosePolicy::Close
-                    } else {
-                        self.windows[0].close_policy
-                    };
-                    self.open_window(&key, &title, width, height)?;
-                    // A window answering a forwarded launch takes focus as
-                    // the launch's own.
-                    if let Some(activation) = self.launch_activation.take() {
-                        let w = self.find(&key);
-                        if w >= 0
-                            && let Err(e) = self.windows[w as usize]
-                                .native
-                                .focus_with_context(&activation)
-                        {
-                            self.log_line(&format!("focusing the launched window failed: {}", e))
-                        }
-                    }
-                    self.set_close_policy(&key, policy)
-                }
-                Effect::CloseWindow(key) => {
-                    let w = self.find(&key);
-                    if w >= 0 {
-                        self.close_window(w)
-                    }
-                }
-                Effect::Quit => self.quit = true,
-                Effect::SetWindowPosition(window, x, y) => {
-                    let w = self.find(&window);
                     if w >= 0
-                        && windowing::video_driver() != "wayland"
-                        && let Err(e) = self.windows[w as usize].native.set_position(x, y)
-                    {
-                        self.log_line(&format!("window placement unavailable: {}", e))
-                    }
-                }
-                Effect::SetMinSize(window, width, height) => {
-                    self.set_min_size(&window, width, height)?
-                }
-                Effect::SetWindowSize(window, width, height) => {
-                    self.set_window_size(&window, width, height)?
-                }
-                Effect::SetTransparent(transparent) => self.set_transparent(transparent),
-                Effect::RequestAttention(window) => {
-                    let w = self.find(&window);
-                    if w >= 0
-                        && !self.windows[w as usize].native.has_focus()
                         && let Err(e) = self.windows[w as usize]
                             .native
-                            .request_attention(windowing::Attention::UntilFocused)
+                            .focus_with_context(&activation)
                     {
-                        self.log_line(&format!("window attention unavailable: {}", e))
+                        self.log_line(&format!("focusing the launched window failed: {}", e))
                     }
                 }
-                Effect::SetWindowVisible(window, shown) => {
-                    let w = self.find(&window);
-                    if w >= 0 {
-                        let native = self.windows[w as usize].native;
-                        // A window shown in answer to a forwarded launch takes
-                        // focus as the launch's own.
-                        let activation = if shown {
-                            self.launch_activation.take()
-                        } else {
-                            None
-                        };
-                        let changed = if shown {
-                            native.show().and_then(|()| match &activation {
-                                Some(activation) => native.focus_with_context(activation),
-                                None => native.focus(),
-                            })
-                        } else {
-                            native.hide()
-                        };
-                        if let Err(e) = changed {
-                            self.log_line(&format!("window visibility unavailable: {}", e))
-                        }
-                    }
+                self.set_close_policy(&key, policy)
+            }
+            Effect::CloseWindow(key) => {
+                let w = self.find(&key);
+                if w >= 0 {
+                    self.close_window(w)
                 }
-                Effect::SetAlwaysOnTop(window, on) => {
-                    let w = self.find(&window);
-                    if w >= 0
-                        && let Err(e) = self.windows[w as usize].native.set_always_on_top(on)
-                    {
-                        self.log_line(&format!("keeping a window on top unavailable: {}", e))
-                    }
+            }
+            Effect::Quit => self.quit = true,
+            Effect::SetWindowPosition(window, x, y) => {
+                let w = self.find(&window);
+                if w >= 0
+                    && windowing::video_driver() != "wayland"
+                    && let Err(e) = self.windows[w as usize].native.set_position(x, y)
+                {
+                    self.log_line(&format!("window placement unavailable: {}", e))
                 }
-                Effect::SetOnAllDesktops(window, on) => {
-                    let w = self.find(&window);
-                    if w >= 0
-                        && let Err(e) = self.windows[w as usize].native.set_on_all_desktops(on)
-                    {
-                        self.log_line(&format!(
-                            "keeping a window on every desktop unavailable: {}",
-                            e
-                        ))
-                    }
+            }
+            Effect::SetMinSize(window, width, height) => {
+                self.set_min_size(&window, width, height)?
+            }
+            Effect::SetWindowSize(window, width, height) => {
+                self.set_window_size(&window, width, height)?
+            }
+            Effect::SetTransparent(transparent) => self.set_transparent(transparent),
+            Effect::RequestAttention(window) => {
+                let w = self.find(&window);
+                if w >= 0
+                    && !self.windows[w as usize].native.has_focus()
+                    && let Err(e) = self.windows[w as usize]
+                        .native
+                        .request_attention(windowing::Attention::UntilFocused)
+                {
+                    self.log_line(&format!("window attention unavailable: {}", e))
                 }
-                Effect::DockTop(window, width, height) => {
-                    self.dock(&window, Edge::Top, width, height)?
-                }
-                Effect::Dock(window, edge, length, depth) => {
-                    self.dock(&window, edge, length, depth)?
-                }
-                Effect::Arrange {
-                    windows,
-                    arrangement,
-                    gap,
-                } => self.arrange(&windows, arrangement, gap),
-                Effect::RegisterHotkey {
-                    id,
-                    shortcut,
-                    description,
-                } => self.register_hotkey(id, &shortcut, &description),
-                Effect::UnregisterHotkey(id) => self.unregister_hotkey(&id),
-                Effect::SetFullscreen(window, on) => {
-                    let w = self.find(&window);
-                    if w >= 0
-                        && let Err(e) = self.windows[w as usize].native.set_fullscreen(on)
-                    {
-                        self.log_line(&format!("fullscreen unavailable: {}", e))
-                    }
-                }
-                Effect::FocusInWindow(window, id) => {
-                    let w = self.find(&window);
-                    if w >= 0 {
-                        self.layout(w);
-                        self.set_focus(w, &id)
-                    }
-                }
-                Effect::Focus(id) => {
-                    if !self.windows.is_empty() {
-                        self.settle_layout(0)?;
-                        self.set_focus(0, &id)
-                    }
-                }
-                Effect::SetTitle(key, title) => {
-                    let w = self.find(&key);
-                    if w >= 0 {
-                        let _ = self.windows[w as usize].native.set_title(&title);
-                        self.windows[w as usize].title = title;
-                    }
-                }
-                Effect::StartTimer(tag, delay, repeat) => {
-                    self.timers = self
-                        .timers
-                        .iter()
-                        .filter(|t| !(t.window.is_empty() && t.owner.is_empty() && t.tag == tag))
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    self.timers.push(Timer {
-                        deadline: self.now() + delay.max(0),
-                        window: "".to_string(),
-                        owner: "".to_string(),
-                        tag,
-                        repeat: if repeat { delay.max(1) } else { 0 },
-                    })
-                }
-                Effect::CancelTimer(tag) => {
-                    self.timers = self
-                        .timers
-                        .iter()
-                        .filter(|t| !(t.window.is_empty() && t.owner.is_empty() && t.tag == tag))
-                        .cloned()
-                        .collect::<Vec<_>>()
-                }
-                Effect::WatchFolder { id, path } => {
-                    self.folders.remove(&id);
-                    match crate::services::folders::watch(id.clone(), &path, self.mailbox()) {
-                        Ok(watch) => {
-                            self.folders.insert(id.clone(), watch);
-                            // What changed before the watch began is read now.
-                            self.pending.push(UiMsg::FolderChanged(id));
-                        }
-                        Err(e) => self.log_line(&format!("folder {path} unwatched: {e}")),
-                    }
-                }
-                Effect::UnwatchFolder(id) => {
-                    self.folders.remove(&id);
-                }
-                Effect::AnswerCompletion(owner, request, items, error) => {
-                    let mut w = 0;
-                    while w < self.windows.len() {
-                        let mut st = self.take_states(w as i64);
-                        let ok = textinput::deliver(&mut st, &owner, request, &items, &error);
-                        self.windows[w].states = st;
-                        if ok {
-                            self.windows[w].dirty = true;
-                            self.resize_completion(w as i64, &owner)
-                        }
-                        w += 1;
-                    }
-                }
-                Effect::Announce(text) => self.speak(&text),
-                Effect::ShowToast(toast) => {
-                    if !self.windows.is_empty() {
-                        self.close_toast(0, &toast.id);
-                        self.windows[0].toasts.push(toast.clone());
-                        let key = &self.windows[0].key;
-                        self.timers.push(Timer {
-                            deadline: self.now() + toast.duration.max(0),
-                            window: key.to_string(),
-                            owner: "".to_string(),
-                            tag: format!("gui:toast:{}", toast.id),
-                            repeat: 0,
-                        });
-                        self.speak(&toast.text);
-                        self.rebuild(0)
-                    }
-                }
-                Effect::DismissToast(id) => {
-                    let mut w = 0;
-                    while w < self.windows.len() {
-                        if self.close_toast(w as i64, &id) {
-                            self.rebuild(w as i64)
-                        };
-                        w += 1;
-                    }
-                }
-                Effect::AnswerDialogCheck(id, request, error) => {
-                    self.dialog_checked(&id, request, &error)
-                }
-                Effect::StartWork(work) => self.run_job(&crate::services::jobs::Job::Work(work)),
-                Effect::CancelWork(owner) => {
-                    if let Some(worker) = &self.jobs {
-                        worker.cancel_owner(&owner);
-                    }
-                    self.held_jobs.retain(|(job, _)| job.owner() != owner);
-                }
-                Effect::ListDirectory(req) => self.run_job(&crate::services::jobs::Job::List(req)),
-                Effect::LoadFonts(owner) => self.run_job(&crate::services::jobs::Job::Fonts(owner)),
-                Effect::LoadApps(owner) => self.run_job(&crate::services::jobs::Job::Apps(owner)),
-                Effect::LaunchApp(owner, entry, files) => {
-                    self.run_job(&crate::services::jobs::Job::Launch(owner, entry, files))
-                }
-                Effect::Emit(message) => self.pending.push(message),
-                Effect::SetClipboard(text) => crate::services::clipboard::set_text(&text),
-                Effect::SetPrimarySelection(text) => {
-                    crate::services::clipboard::set_primary_text(&text)
-                }
-                Effect::OpenUrl(url) => {
-                    if let Err(err) = services::open_url(&url) {
-                        self.log_line(&format!("open url failed: {}", err))
-                    }
-                }
-                Effect::RevealFile(path) => {
-                    if let Err(err) = services::reveal(&path) {
-                        self.log_line(&format!("reveal failed: {}", err))
-                    }
-                }
-                Effect::SetTheme(kind) => {
-                    self.follow_system = false;
-                    self.set_theme_kind(kind)
-                }
-                Effect::FollowSystemTheme => {
-                    self.follow_system = true;
-                    self.apply_system_preferences()
-                }
-                Effect::SetTextScale(s) => {
-                    self.explicit_text_scale = true;
-                    self.base_theme.text_scale = s.clamp(0.5, 3.0);
-                    self.retheme()
-                }
-                Effect::SetDisplayScale(scale) => {
-                    self.scale_override = scale;
-                    let mut w = 0;
-                    while w < self.windows.len() {
-                        self.windows[w].theme.scale = scale
-                            .unwrap_or(self.windows[w].native.scale())
-                            .clamp(0.5, 4.0);
-                        self.invalidate(w as i64, "display scale set");
-                        self.close_all_popups(w as i64);
-                        w += 1;
-                    }
-                }
-                Effect::SetReducedMotion(reduced) => {
-                    self.explicit_motion = true;
-                    self.base_theme.reduced_motion = reduced;
-                    self.retheme()
-                }
-                Effect::SetDensity(d) => {
-                    self.base_theme.density = d;
-                    self.retheme()
-                }
-                Effect::SetThemeTokens(tokens) => {
-                    self.base_theme = self.base_theme.with_tokens(&tokens);
-                    self.retheme();
-                    // The tokens carry a whole type ramp; the desktop's menu
-                    // size goes back over it.
-                    self.apply_system_preferences()
-                }
-                Effect::SetLocale(catalog) => {
-                    self.base_theme.rtl = catalog.rtl();
-                    crate::localization::install(&catalog);
-                    self.retheme();
-                    // Views translate as they are built, so every window is built again.
-                    let mut w = 0;
-                    while w < self.windows.len() {
-                        self.rebuild(w as i64);
-                        w += 1;
-                    }
-                }
-                Effect::SetRtl(r) => {
-                    self.base_theme.rtl = r;
-                    self.retheme()
-                }
-                Effect::SetCommands(cmds) => {
-                    self.extra_commands = cmds;
-                    let mut w = 0;
-                    while w < self.windows.len() {
-                        self.refresh_commands(w as i64);
-                        w += 1;
-                    }
-                }
-                Effect::ScrollTo(id) => {
-                    if !self.windows.is_empty() {
-                        self.settle_layout(0)?;
-                        self.reveal(0, &id)
-                    }
-                }
-                Effect::Notify {
-                    id,
-                    title,
-                    body,
-                    urgency,
-                } => {
-                    let mailbox = self.mailbox();
-                    services::desktop::notify(&self.app, &title, &body, urgency, move |sent| {
-                        let outcome = match sent {
-                            Ok(()) => crate::widgets::cx::TaskOutcome::Done(String::new()),
-                            Err(e) => crate::widgets::cx::TaskOutcome::Failed(e.to_string()),
-                        };
-                        mailbox.post(&UiMsg::Task(id, outcome))
-                    })
-                }
-                Effect::SetTray {
-                    id,
-                    icon,
-                    tooltip,
-                    items,
-                } => {
-                    if let Some(ref old) = self.tray {
-                        old.close()
+            }
+            Effect::SetWindowVisible(window, shown) => {
+                let w = self.find(&window);
+                if w >= 0 {
+                    let native = self.windows[w as usize].native;
+                    // A window shown in answer to a forwarded launch takes
+                    // focus as the launch's own.
+                    let activation = if shown {
+                        self.launch_activation.take()
+                    } else {
+                        None
                     };
-                    self.tray = None;
-                    match services::desktop::TrayHost::open(
-                        self.app.clone(),
-                        icon,
-                        &tooltip,
-                        &items,
-                        &self.registry(),
-                    ) {
-                        Ok(host) => self.tray = Some(host),
-                        Err(e) => self.pending.push(UiMsg::Task(
-                            id,
-                            crate::widgets::cx::TaskOutcome::Failed(format!("{}", e)),
-                        )),
-                    }
-                }
-                Effect::CloseTray => {
-                    if let Some(ref old) = self.tray {
-                        old.close()
+                    let changed = if shown {
+                        native.show().and_then(|()| match &activation {
+                            Some(activation) => native.focus_with_context(activation),
+                            None => native.focus(),
+                        })
+                    } else {
+                        native.hide()
                     };
-                    self.tray = None;
-                }
-                Effect::StartDrag {
-                    window,
-                    id,
-                    items,
-                    operation,
-                } => self.start_drag(self.find(&window), &id, &items, operation),
-                Effect::SelectText {
-                    window,
-                    id,
-                    anchor,
-                    caret,
-                } => {
-                    let w = self.find(&window);
-                    if w >= 0 {
-                        self.settle_layout(w)?;
-                        self.send_to(w, &id, &Event::SetSelection { anchor, caret });
-                        self.reveal(w, &id)
-                    }
-                }
-                Effect::ReplaceText {
-                    window,
-                    id,
-                    start,
-                    end,
-                    text,
-                } => {
-                    let w = self.find(&window);
-                    if w >= 0 {
-                        self.settle_layout(w)?;
-                        self.send_to(w, &id, &Event::ReplaceRange { start, end, text });
-                        self.reveal(w, &id)
+                    if let Err(e) = changed {
+                        self.log_line(&format!("window visibility unavailable: {}", e))
                     }
                 }
             }
-            self.sync_auxiliary()?;
+            Effect::SetAlwaysOnTop(window, on) => {
+                let w = self.find(&window);
+                if w >= 0
+                    && let Err(e) = self.windows[w as usize].native.set_always_on_top(on)
+                {
+                    self.log_line(&format!("keeping a window on top unavailable: {}", e))
+                }
+            }
+            Effect::SetOnAllDesktops(window, on) => {
+                let w = self.find(&window);
+                if w >= 0
+                    && let Err(e) = self.windows[w as usize].native.set_on_all_desktops(on)
+                {
+                    self.log_line(&format!(
+                        "keeping a window on every desktop unavailable: {}",
+                        e
+                    ))
+                }
+            }
+            Effect::DockTop(window, width, height) => {
+                self.dock(&window, Edge::Top, width, height)?
+            }
+            Effect::Dock(window, edge, length, depth) => self.dock(&window, edge, length, depth)?,
+            Effect::Arrange {
+                windows,
+                arrangement,
+                gap,
+            } => self.arrange(&windows, arrangement, gap),
+            Effect::RegisterHotkey {
+                id,
+                shortcut,
+                description,
+            } => self.register_hotkey(id, &shortcut, &description),
+            Effect::UnregisterHotkey(id) => self.unregister_hotkey(&id),
+            Effect::SetFullscreen(window, on) => {
+                let w = self.find(&window);
+                if w >= 0
+                    && let Err(e) = self.windows[w as usize].native.set_fullscreen(on)
+                {
+                    self.log_line(&format!("fullscreen unavailable: {}", e))
+                }
+            }
+            Effect::FocusInWindow(window, id) => {
+                let w = self.find(&window);
+                if w >= 0 {
+                    self.layout(w);
+                    self.set_focus(w, &id)
+                }
+            }
+            Effect::Focus(id) => {
+                if !self.windows.is_empty() {
+                    self.settle_layout(0)?;
+                    self.set_focus(0, &id)
+                }
+            }
+            Effect::SetTitle(key, title) => {
+                let w = self.find(&key);
+                if w >= 0 {
+                    let _ = self.windows[w as usize].native.set_title(&title);
+                    self.windows[w as usize].title = title;
+                }
+            }
+            Effect::StartTimer(tag, delay, repeat) => {
+                self.timers = self
+                    .timers
+                    .iter()
+                    .filter(|t| !(t.window.is_empty() && t.owner.is_empty() && t.tag == tag))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                self.timers.push(Timer {
+                    deadline: self.now() + delay.max(0),
+                    window: "".to_string(),
+                    owner: "".to_string(),
+                    tag,
+                    repeat: if repeat { delay.max(1) } else { 0 },
+                })
+            }
+            Effect::CancelTimer(tag) => {
+                self.timers = self
+                    .timers
+                    .iter()
+                    .filter(|t| !(t.window.is_empty() && t.owner.is_empty() && t.tag == tag))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            }
+            Effect::WatchFolder { id, path } => {
+                self.folders.remove(&id);
+                match crate::services::folders::watch(id.clone(), &path, self.mailbox()) {
+                    Ok(watch) => {
+                        self.folders.insert(id.clone(), watch);
+                        // What changed before the watch began is read now.
+                        self.pending.push(UiMsg::FolderChanged(id));
+                    }
+                    Err(e) => self.log_line(&format!("folder {path} unwatched: {e}")),
+                }
+            }
+            Effect::UnwatchFolder(id) => {
+                self.folders.remove(&id);
+            }
+            Effect::AnswerCompletion(owner, request, items, error) => {
+                let mut w = 0;
+                while w < self.windows.len() {
+                    let mut st = self.take_states(w as i64);
+                    let ok = textinput::deliver(&mut st, &owner, request, &items, &error);
+                    self.windows[w].states = st;
+                    if ok {
+                        self.windows[w].dirty = true;
+                        self.resize_completion(w as i64, &owner)
+                    }
+                    w += 1;
+                }
+            }
+            Effect::Announce(text) => self.speak(&text),
+            Effect::ShowToast(toast) => {
+                if !self.windows.is_empty() {
+                    self.close_toast(0, &toast.id);
+                    self.windows[0].toasts.push(toast.clone());
+                    let key = &self.windows[0].key;
+                    self.timers.push(Timer {
+                        deadline: self.now() + toast.duration.max(0),
+                        window: key.to_string(),
+                        owner: "".to_string(),
+                        tag: format!("gui:toast:{}", toast.id),
+                        repeat: 0,
+                    });
+                    self.speak(&toast.text);
+                    self.rebuild(0)
+                }
+            }
+            Effect::DismissToast(id) => {
+                let mut w = 0;
+                while w < self.windows.len() {
+                    if self.close_toast(w as i64, &id) {
+                        self.rebuild(w as i64)
+                    };
+                    w += 1;
+                }
+            }
+            Effect::AnswerDialogCheck(id, request, error) => {
+                self.dialog_checked(&id, request, &error)
+            }
+            Effect::StartWork(work) => self.run_job(&crate::services::jobs::Job::Work(work)),
+            Effect::CancelWork(owner) => {
+                if let Some(worker) = &self.jobs {
+                    worker.cancel_owner(&owner);
+                }
+                self.held_jobs.retain(|(job, _)| job.owner() != owner);
+            }
+            Effect::ListDirectory(req) => self.run_job(&crate::services::jobs::Job::List(req)),
+            Effect::LoadFonts(owner) => self.run_job(&crate::services::jobs::Job::Fonts(owner)),
+            Effect::LoadApps(owner) => self.run_job(&crate::services::jobs::Job::Apps(owner)),
+            Effect::LaunchApp(owner, entry, files) => {
+                self.run_job(&crate::services::jobs::Job::Launch(owner, entry, files))
+            }
+            Effect::Emit(message) => self.pending.push(message),
+            Effect::SetClipboard(text) => crate::services::clipboard::set_text(&text),
+            Effect::SetPrimarySelection(text) => {
+                crate::services::clipboard::set_primary_text(&text)
+            }
+            Effect::OpenUrl(url) => {
+                if let Err(err) = services::open_url(&url) {
+                    self.log_line(&format!("open url failed: {}", err))
+                }
+            }
+            Effect::RevealFile(path) => {
+                if let Err(err) = services::reveal(&path) {
+                    self.log_line(&format!("reveal failed: {}", err))
+                }
+            }
+            Effect::SetTheme(kind) => {
+                self.follow_system = false;
+                self.set_theme_kind(kind)
+            }
+            Effect::FollowSystemTheme => {
+                self.follow_system = true;
+                self.apply_system_preferences()
+            }
+            Effect::SetTextScale(s) => {
+                self.explicit_text_scale = true;
+                self.base_theme.text_scale = s.clamp(0.5, 3.0);
+                self.retheme()
+            }
+            Effect::SetDisplayScale(scale) => {
+                self.scale_override = scale;
+                let mut w = 0;
+                while w < self.windows.len() {
+                    self.windows[w].theme.scale = scale
+                        .unwrap_or(self.windows[w].native.scale())
+                        .clamp(0.5, 4.0);
+                    self.invalidate(w as i64, "display scale set");
+                    self.close_all_popups(w as i64);
+                    w += 1;
+                }
+            }
+            Effect::SetReducedMotion(reduced) => {
+                self.explicit_motion = true;
+                self.base_theme.reduced_motion = reduced;
+                self.retheme()
+            }
+            Effect::SetDensity(d) => {
+                self.base_theme.density = d;
+                self.retheme()
+            }
+            Effect::SetThemeTokens(tokens) => {
+                self.base_theme = self.base_theme.with_tokens(&tokens);
+                self.retheme();
+                // The tokens carry a whole type ramp; the desktop's menu
+                // size goes back over it.
+                self.apply_system_preferences()
+            }
+            Effect::SetLocale(catalog) => {
+                self.base_theme.rtl = catalog.rtl();
+                crate::localization::install(&catalog);
+                self.retheme();
+                // Views translate as they are built, so every window is built again.
+                let mut w = 0;
+                while w < self.windows.len() {
+                    self.rebuild(w as i64);
+                    w += 1;
+                }
+            }
+            Effect::SetRtl(r) => {
+                self.base_theme.rtl = r;
+                self.retheme()
+            }
+            Effect::SetCommands(cmds) => {
+                self.extra_commands = cmds;
+                let mut w = 0;
+                while w < self.windows.len() {
+                    self.refresh_commands(w as i64);
+                    w += 1;
+                }
+            }
+            Effect::ScrollTo(id) => {
+                if !self.windows.is_empty() {
+                    self.settle_layout(0)?;
+                    self.reveal(0, &id)
+                }
+            }
+            Effect::Notify {
+                id,
+                title,
+                body,
+                urgency,
+            } => {
+                let mailbox = self.mailbox();
+                services::desktop::notify(&self.app, &title, &body, urgency, move |sent| {
+                    let outcome = match sent {
+                        Ok(()) => crate::widgets::cx::TaskOutcome::Done(String::new()),
+                        Err(e) => crate::widgets::cx::TaskOutcome::Failed(e.to_string()),
+                    };
+                    mailbox.post(&UiMsg::Task(id, outcome))
+                })
+            }
+            Effect::SetTray {
+                id,
+                icon,
+                tooltip,
+                items,
+            } => {
+                if let Some(ref old) = self.tray {
+                    old.close()
+                };
+                self.tray = None;
+                match services::desktop::TrayHost::open(
+                    self.app.clone(),
+                    icon,
+                    &tooltip,
+                    &items,
+                    &self.registry(),
+                ) {
+                    Ok(host) => self.tray = Some(host),
+                    Err(e) => self.pending.push(UiMsg::Task(
+                        id,
+                        crate::widgets::cx::TaskOutcome::Failed(format!("{}", e)),
+                    )),
+                }
+            }
+            Effect::CloseTray => {
+                if let Some(ref old) = self.tray {
+                    old.close()
+                };
+                self.tray = None;
+            }
+            Effect::StartDrag {
+                window,
+                id,
+                items,
+                operation,
+            } => self.start_drag(self.find(&window), &id, &items, operation),
+            Effect::SelectText {
+                window,
+                id,
+                anchor,
+                caret,
+            } => {
+                let w = self.find(&window);
+                if w >= 0 {
+                    self.settle_layout(w)?;
+                    self.send_to(w, &id, &Event::SetSelection { anchor, caret });
+                    self.reveal(w, &id)
+                }
+            }
+            Effect::ReplaceText {
+                window,
+                id,
+                start,
+                end,
+                text,
+            } => {
+                let w = self.find(&window);
+                if w >= 0 {
+                    self.settle_layout(w)?;
+                    self.send_to(w, &id, &Event::ReplaceRange { start, end, text });
+                    self.reveal(w, &id)
+                }
+            }
         }
-        Ok(())
+        self.sync_auxiliary()
     }
 
     // Convert each window's pixels through its own logical extent before comparing displays.
@@ -9038,6 +9098,35 @@ mod window_command_tests {
                 assert_eq!(s.windows[0].native.size(), size, "{edge:?}");
                 assert_eq!(s.windows[0].docked, Some((edge, 0.5, 0.25)));
             }
+            s.shutdown()
+        })
+    }
+
+    #[test]
+    fn a_dock_asked_for_before_a_window_first_shows_places_it_first() {
+        crate::testing::on_ui_thread(|| {
+            let config = crate::services::private_test_config();
+            let _cleanup = scopeguard::guard((), |_| crate::services::remove_test_config(&config));
+            let mut s = start("Docked first", "dev.gossamer.docked-first").unwrap();
+            s.set_shell(|_| {}, Widget::label, |_| Vec::new());
+            s.prepare_window("main", "Main", 320, 200).unwrap();
+            effects::perform(Effect::SetAlwaysOnTop("main".into(), true));
+            effects::perform(Effect::Dock("main".into(), Edge::Top, 0.5, 0.25));
+            effects::perform(Effect::Dock("other".into(), Edge::Top, 0.5, 0.25));
+            effects::perform(Effect::SetOnAllDesktops("main".into(), true));
+            s.show_window("main").unwrap();
+            let a = s.windows[0].native.display().unwrap().usable;
+            assert_eq!(s.windows[0].native.size(), (a.width / 2, a.height / 4));
+            assert_eq!(s.windows[0].docked, Some((Edge::Top, 0.5, 0.25)));
+            assert_eq!(
+                effects::take(),
+                vec![
+                    Effect::SetAlwaysOnTop("main".into(), true),
+                    Effect::Dock("other".into(), Edge::Top, 0.5, 0.25),
+                    Effect::SetOnAllDesktops("main".into(), true),
+                ],
+                "the rest stay queued in order"
+            );
             s.shutdown()
         })
     }

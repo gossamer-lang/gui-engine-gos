@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.2 - Gossamer 0.82.2
+
+- Builds on windowing-gos 0.4.2, whose event words, handles, and float bits keep their exact bits under Gossamer 0.82.2's checked `as`; with 0.4.0 a negative coordinate or a high handle stopped the program. Requires Gossamer 0.82.2.
+
 ## 0.6.1 - Docked and fullscreen windows
 
 - A window docked before it first shows is laid out at its docked size from the start, so a terminal in it starts its program at that size (macOS).
